@@ -12,7 +12,7 @@
         <div>
           <p class="eyebrow">IMMUNE REACTION</p>
           <h1>开发任务看板</h1>
-          <p class="subtitle">数据直接来自 <code>docs/task_tracker.csv</code>。反馈会写回同一份 CSV，随后等待 Agent 评估。</p>
+          <p class="subtitle">数据直接来自当前实例的 <code>tracker/task_tracker.csv</code>。反馈会写回同一份 CSV，随后等待 Agent 评估。</p>
         </div>
         <button id="refresh-button" class="secondary-button" type="button">刷新数据</button>
       </header>
@@ -45,18 +45,27 @@
         </div>
       </section>
 
-      <section class="table-section">
+      <section class="milestone-section" aria-labelledby="milestone-heading">
         <div class="section-heading">
-          <div><p class="eyebrow">TRACKER</p><h2>全部任务</h2></div>
+          <div><p class="eyebrow">MILESTONES</p><h2 id="milestone-heading">按 Milestone 查看任务</h2></div>
           <label class="search-label">搜索 <input id="task-search" type="search" placeholder="ID、任务、状态或 blocker"></label>
         </div>
+        <p class="section-note">每组默认展示状态摘要；含 owner 待办或 Agent 进行中任务的组会自动展开。其余组可按需展开，避免平铺任务淹没当前状态。</p>
+        <div id="milestone-groups" class="milestone-list"></div>
+      </section>
+
+      <details class="table-section all-task-section">
+        <summary>
+          <span><span class="eyebrow">AUDIT TABLE</span><strong>全部任务（平铺）</strong></span>
+          <span class="summary-hint">默认收起 · 用于逐条审计</span>
+        </summary>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Task ID</th><th>Milestone</th><th>任务</th><th>状态</th><th>依赖</th><th>更新时间</th></tr></thead>
             <tbody id="task-table-body"></tbody>
           </table>
         </div>
-      </section>
+      </details>
     </main>
 
     <dialog id="task-dialog">

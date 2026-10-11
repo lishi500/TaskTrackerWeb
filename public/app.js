@@ -1,5 +1,12 @@
-const state = { records: [], summary: null, selectedTaskId: null };
+const state = { records: [], summary: null, selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
 const ownerStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation']);
+const activeMilestoneStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation', 'In Progress', 'In Review']);
+const statusOrder = ['In Progress', 'In Review', 'Awaiting Agent Evaluation', 'Awaiting Owner', 'Awaiting Owner Gate', 'Ready', 'Blocked', 'Done', 'Deferred', 'Backlog'];
+const statusLabels = {
+  'In Progress': '进行中', 'In Review': '待审查', 'Awaiting Agent Evaluation': '待 Agent 评估',
+  'Awaiting Owner': '待 Owner', 'Awaiting Owner Gate': '待 Owner Gate', 'Ready': '可领取',
+  'Blocked': '受阻', 'Done': '已完成', 'Deferred': '已延期', 'Backlog': '待排期',
+};
 
 const element = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -80,6 +87,77 @@ function renderTaskLink(task) {
   return button;
 }
 
+function filteredTasks() {
+  const query = document.querySelector('#task-search').value.trim().toLowerCase();
+  if (!query) return state.records;
+  return state.records.filter((task) => [task.TaskID, task.Task, task.Status, task.Blocker, task.Milestone].join(' ').toLowerCase().includes(query));
+}
+
+function milestoneCompare(left, right) {
+  const parse = (value) => /^M(\d+)$/.exec(value || '');
+  const leftMatch = parse(left); const rightMatch = parse(right);
+  if (leftMatch && rightMatch) return Number(leftMatch[1]) - Number(rightMatch[1]);
+  if (leftMatch) return -1;
+  if (rightMatch) return 1;
+  return (left || '').localeCompare(right || '', 'zh-CN');
+}
+
+function milestoneStatusSummary(tasks) {
+  const target = element('div', 'milestone-status-summary');
+  target.append(element('span', 'milestone-total', `总计 ${tasks.length}`));
+  const counts = new Map();
+  for (const task of tasks) counts.set(task.Status, (counts.get(task.Status) || 0) + 1);
+  const ordered = [...statusOrder, ...[...counts.keys()].filter((status) => !statusOrder.includes(status)).sort()];
+  for (const status of ordered) {
+    const count = counts.get(status) || 0;
+    if (!count) continue;
+    target.append(element('span', `milestone-status-count status-${status.toLowerCase().replaceAll(/[^a-z]+/g, '-')}`, `${statusLabels[status] || status} ${count}`));
+  }
+  return target;
+}
+
+function renderMilestoneTask(task) {
+  const row = element('article', 'milestone-task');
+  const heading = element('div', 'milestone-task-heading');
+  heading.append(renderTaskLink(task)); heading.append(statusBadge(task.Status)); row.append(heading);
+  const metadata = [];
+  if (task.Priority) metadata.push(task.Priority);
+  if (task.DependsOn) metadata.push(`依赖 ${task.DependsOn.split(';').filter(Boolean).length} 项`);
+  if (task.Updated) metadata.push(`更新 ${task.Updated}`);
+  if (metadata.length) row.append(element('p', 'milestone-task-meta', metadata.join(' · ')));
+  if (task.Blocker) row.append(element('p', 'muted milestone-task-blocker', task.Blocker));
+  row.addEventListener('click', (event) => { if (!event.target.closest('button')) openTask(task.TaskID); });
+  return row;
+}
+
+function renderMilestones() {
+  const target = document.querySelector('#milestone-groups'); target.replaceChildren();
+  const tasks = filteredTasks();
+  if (!tasks.length) { target.append(element('p', 'empty-state', '没有与搜索条件匹配的任务。')); return; }
+  const groups = new Map();
+  for (const task of tasks) {
+    const milestone = task.Milestone || '未归属';
+    if (!groups.has(milestone)) groups.set(milestone, []);
+    groups.get(milestone).push(task);
+  }
+  const queryActive = Boolean(document.querySelector('#task-search').value.trim());
+  for (const [milestone, groupTasks] of [...groups.entries()].sort(([left], [right]) => milestoneCompare(left, right))) {
+    const section = element('details', 'milestone-group');
+    const hasActiveTask = groupTasks.some((task) => activeMilestoneStatuses.has(task.Status));
+    section.open = queryActive || state.openMilestones.has(milestone) || (!state.milestoneViewInitialized && hasActiveTask);
+    const summary = element('summary', 'milestone-summary');
+    const title = element('div', 'milestone-title');
+    title.append(element('span', 'milestone-name', milestone)); title.append(element('span', 'milestone-caption', '任务状态'));
+    summary.append(title); summary.append(milestoneStatusSummary(groupTasks)); section.append(summary);
+    const body = element('div', 'milestone-task-list');
+    for (const task of [...groupTasks].sort((left, right) => (left.Priority || '').localeCompare(right.Priority || '') || left.TaskID.localeCompare(right.TaskID))) body.append(renderMilestoneTask(task));
+    section.append(body);
+    section.addEventListener('toggle', () => { if (section.open) state.openMilestones.add(milestone); else state.openMilestones.delete(milestone); });
+    target.append(section);
+  }
+  state.milestoneViewInitialized = true;
+}
+
 function renderOwnerActions() {
   const target = document.querySelector('#owner-actions'); target.replaceChildren();
   if (!state.summary.ownerActions.length) {
@@ -106,10 +184,8 @@ function renderCompactList(selector, tasks, emptyText) {
 }
 
 function renderTable() {
-  const query = document.querySelector('#task-search').value.trim().toLowerCase();
   const target = document.querySelector('#task-table-body'); target.replaceChildren();
-  const filtered = state.records.filter((task) => !query || [task.TaskID, task.Task, task.Status, task.Blocker, task.Milestone].join(' ').toLowerCase().includes(query));
-  for (const task of filtered) {
+  for (const task of filteredTasks()) {
     const row = document.createElement('tr');
     const cells = [task.TaskID, task.Milestone, task.Task, task.Status, task.DependsOn || '—', task.Updated || '—'];
     cells.forEach((value, index) => {
@@ -131,6 +207,7 @@ function render() {
   renderOwnerActions();
   renderCompactList('#current-work', state.summary.currentWork, '当前没有 Agent 正在处理的任务。');
   renderCompactList('#blockers', state.summary.blockers, '当前没有受阻任务。');
+  renderMilestones();
   renderTable();
 }
 
@@ -146,5 +223,5 @@ async function load() {
 }
 
 document.querySelector('#refresh-button').addEventListener('click', load);
-document.querySelector('#task-search').addEventListener('input', renderTable);
+document.querySelector('#task-search').addEventListener('input', () => { renderMilestones(); renderTable(); });
 load();
