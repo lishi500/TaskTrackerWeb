@@ -1,4 +1,4 @@
-const state = { records: [], summary: null, selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
+const state = { records: [], summary: null, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
 const ownerStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation']);
 const activeMilestoneStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation', 'In Progress', 'In Review']);
 const statusOrder = ['In Progress', 'In Review', 'Awaiting Agent Evaluation', 'Awaiting Owner', 'Awaiting Owner Gate', 'Ready', 'Blocked', 'Done', 'Deferred', 'Backlog'];
@@ -27,6 +27,81 @@ function statusBadge(status) {
 
 function findTask(taskId) { return state.records.find((record) => record.TaskID === taskId); }
 
+function runLabel(run) {
+  if (!run) return '暂无执行记录';
+  const outcome = run.outcome ? ` · ${run.outcome}` : '';
+  return `${run.runId} · ${run.status}${outcome}`;
+}
+
+function artifactUrl(taskId, runId, name) {
+  const artifactPath = name.split('/').map(encodeURIComponent).join('/');
+  return `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/artifacts/${artifactPath}`;
+}
+
+function renderRunSummary(task) {
+  const summary = task.RunSummary;
+  if (!summary) return null;
+  const note = element('p', 'run-summary');
+  const focus = summary.current || summary.latest;
+  note.textContent = `Agent 执行 ${summary.count} 次 · ${runLabel(focus)}`;
+  return note;
+}
+
+async function renderRunPanel(task, target) {
+  target.replaceChildren(element('p', 'muted', '正在读取 Agent 执行记录…'));
+  try {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(task.TaskID)}/runs`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '无法读取执行记录。');
+    target.replaceChildren();
+    target.append(element('h3', null, `Agent 执行记录（${payload.runs.length}）`));
+    if (!payload.runs.length) {
+      target.append(element('p', 'muted', '尚未为此任务分配 Agent Run。'));
+      return;
+    }
+    for (const run of payload.runs) {
+      const item = document.createElement('details');
+      item.className = 'run-record';
+      const summary = element('summary', null, runLabel(run));
+      item.append(summary);
+      const body = element('div', 'run-record-body');
+      body.append(element('p', 'muted', `Profile: ${run.verificationProfile || '未记录'} · Agent: ${run.agent || '未记录'}`));
+      if (run.summary) body.append(element('p', null, run.summary));
+      if (run.blocker) body.append(element('p', 'run-blocker', `阻塞：${run.blocker}`));
+      const meta = element('p', 'muted', `开始：${run.startedAt || '—'} · 结束：${run.closedAt || '进行中'}`);
+      body.append(meta);
+      const artifactList = element('div', 'run-artifacts');
+      if (run.artifacts?.length) {
+        artifactList.append(element('strong', null, '证据文件'));
+        for (const artifact of run.artifacts) {
+          const link = document.createElement('a');
+          link.href = artifactUrl(task.TaskID, run.runId, artifact.name);
+          link.target = '_blank'; link.rel = 'noopener'; link.textContent = artifact.name;
+          artifactList.append(link);
+        }
+      }
+      const eventsButton = element('button', 'secondary-button run-events-button', '查看执行事件');
+      eventsButton.type = 'button';
+      const events = element('pre', 'run-events'); events.hidden = true;
+      eventsButton.addEventListener('click', async () => {
+        eventsButton.disabled = true;
+        try {
+          const detailResponse = await fetch(`/api/tasks/${encodeURIComponent(task.TaskID)}/runs/${encodeURIComponent(run.runId)}`);
+          const detail = await detailResponse.json();
+          if (!detailResponse.ok) throw new Error(detail.error || '无法读取执行事件。');
+          events.textContent = detail.events.map((event) => JSON.stringify(event)).join('\n');
+          events.hidden = false;
+        } catch (error) { events.textContent = error.message; events.hidden = false; }
+        finally { eventsButton.disabled = false; }
+      });
+      body.append(artifactList, eventsButton, events);
+      item.append(body); target.append(item);
+    }
+  } catch (error) {
+    target.replaceChildren(element('p', 'run-blocker', error.message));
+  }
+}
+
 function openTask(taskId) {
   state.selectedTaskId = taskId;
   const task = findTask(taskId);
@@ -47,6 +122,9 @@ function openTask(taskId) {
     details.append(element('dd', null, value));
   }
   target.append(details);
+  const runPanel = element('section', 'run-panel');
+  target.append(runPanel);
+  void renderRunPanel(task, runPanel);
   if (ownerStatuses.has(task.Status)) target.append(feedbackForm(task));
   document.querySelector('#task-dialog').showModal();
 }
@@ -67,7 +145,7 @@ function feedbackForm(task) {
     button.disabled = true;
     setMessage('正在写入反馈…');
     try {
-      const response = await fetch('/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId: task.TaskID, feedback: textarea.value }) });
+      const response = await fetch('/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId: task.TaskID, feedback: textarea.value, trackerRevision: state.trackerRevision }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '提交失败。');
       document.querySelector('#task-dialog').close();
@@ -126,6 +204,7 @@ function renderMilestoneTask(task) {
   if (task.Updated) metadata.push(`更新 ${task.Updated}`);
   if (metadata.length) row.append(element('p', 'milestone-task-meta', metadata.join(' · ')));
   if (task.Blocker) row.append(element('p', 'muted milestone-task-blocker', task.Blocker));
+  const runSummary = renderRunSummary(task); if (runSummary) row.append(runSummary);
   row.addEventListener('click', (event) => { if (!event.target.closest('button')) openTask(task.TaskID); });
   return row;
 }
@@ -187,7 +266,8 @@ function renderTable() {
   const target = document.querySelector('#task-table-body'); target.replaceChildren();
   for (const task of filteredTasks()) {
     const row = document.createElement('tr');
-    const cells = [task.TaskID, task.Milestone, task.Task, task.Status, task.DependsOn || '—', task.Updated || '—'];
+    const latestRun = task.RunSummary?.current || task.RunSummary?.latest;
+    const cells = [task.TaskID, task.Milestone, task.Task, task.Status, runLabel(latestRun), task.DependsOn || '—', task.Updated || '—'];
     cells.forEach((value, index) => {
       const cell = document.createElement('td');
       if (index === 0) cell.append(renderTaskLink(task));
@@ -217,7 +297,7 @@ async function load() {
     const tracker = await trackerResponse.json(); const summary = await summaryResponse.json();
     if (!trackerResponse.ok) throw new Error(tracker.error || '无法读取任务数据。');
     if (!summaryResponse.ok) throw new Error(summary.error || '无法读取任务概况。');
-    state.records = tracker.records; state.summary = summary; render();
+    state.records = tracker.records; state.summary = summary; state.trackerRevision = tracker.revision; render();
     if (!document.querySelector('#load-message').classList.contains('error')) setMessage(`已读取 ${summary.generatedAt.replace('T', ' ').replace('Z', ' UTC')} 的 CSV 数据。`);
   } catch (error) { setMessage(error.message, true); }
 }

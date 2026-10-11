@@ -12,7 +12,7 @@
         <div>
           <p class="eyebrow">IMMUNE REACTION</p>
           <h1>开发任务看板</h1>
-          <p class="subtitle">数据直接来自当前实例的 <code>tracker/task_tracker.csv</code>。反馈会写回同一份 CSV，随后等待 Agent 评估。</p>
+          <p class="subtitle">任务状态来自当前实例的 <code>tracker/task_tracker.csv</code>；Agent Run、日志和验证证据位于受 Hub 管理的 <code>tracker/task-records/</code>。</p>
         </div>
         <button id="refresh-button" class="secondary-button" type="button">刷新数据</button>
       </header>
@@ -61,7 +61,7 @@
         </summary>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Task ID</th><th>Milestone</th><th>任务</th><th>状态</th><th>依赖</th><th>更新时间</th></tr></thead>
+            <thead><tr><th>Task ID</th><th>Milestone</th><th>任务</th><th>状态</th><th>最近执行</th><th>依赖</th><th>更新时间</th></tr></thead>
             <tbody id="task-table-body"></tbody>
           </table>
         </div>

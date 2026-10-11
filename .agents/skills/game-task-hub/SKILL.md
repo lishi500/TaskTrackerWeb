@@ -1,11 +1,11 @@
 ---
 name: game-task-hub
-description: "Set up and operate a local single-game TaskTrackerWeb instance, including its CSV skeleton, owner feedback workflow, Agent Skill link, and managed-CSV safety rules."
+description: "Operate a local single-game TaskTrackerWeb instance as the sole task-state authority, including task packets, owner feedback, managed Agent Runs, durable evidence, and CSV safety rules."
 ---
 
 # Game Task Hub
 
-Use this skill when a request concerns a local TaskTrackerWeb instance, its task CSV, owner feedback workflow, Agent handoff, or its connection to one game repository.
+Use this skill when a request concerns a local TaskTrackerWeb instance, its task CSV, owner feedback workflow, Agent handoff, managed Agent Runs, or its connection to one game repository.
 
 ## What this tool is
 
@@ -14,12 +14,12 @@ TaskTrackerWeb is a lightweight, local task-management companion for **one game 
 ```text
 <Game>/                         game code, assets, game-specific AGENTS.md
 <Game>-Tracker/                 task state, evidence and TaskTrackerWeb
-  tracker/task_tracker.csv      current task-state source of truth
-  tracker/task_events.jsonl     append-only audit export
-  tracker/task-records/         longer evidence and file/link references
+  tracker/task_tracker.csv      only current task-state source of truth
+  tracker/task_events.jsonl     append-only task-state audit export
+  tracker/task-records/         longer evidence and Agent Run records
 ```
 
-Do not combine several games into one Tracker instance, and do not embed TaskTrackerWeb inside the game code repository. Updating the TaskTracker template is a separate Git update for each Tracker instance.
+Do not combine several games into one Tracker instance, and do not embed TaskTrackerWeb inside the game code repository. A Run is execution evidence under one task, not an independent task workflow; never maintain a second task status in the game repository, chat, or a Unity-specific tracker.
 
 ## Create a new Tracker instance
 
@@ -44,7 +44,7 @@ This creates a symbolic link, so future updates to this instance's Skill apply i
 
 ## First read
 
-1. When working on the game, read that game's `AGENTS.md`, selected task row, SpecRef and dependency evidence.
+1. When working on the game, read that game's `AGENTS.md`, then retrieve `GET /api/tasks/<TaskID>/packet`.
 2. When working on TaskTrackerWeb itself, read [README.md](../../../README.md) and [task_hub_product_spec.md](../../../task_hub_product_spec.md).
 3. Treat `tracker/task_tracker.csv` in the current Tracker instance as the current-state authority. Never use a copied browser view, chat summary, or another game's CSV as task truth.
 
@@ -54,15 +54,32 @@ This creates a symbolic link, so future updates to this instance's Skill apply i
 - Read task dependencies and reverse dependencies before changing a task. Preserve historical Evidence and use the project's review-independence rules.
 - Backlog capture is not a claimable task. It needs explicit triage before it can become `Ready`.
 - A task reference may be an HTTPS URL or repository-relative path. Do not upload external/binary material or expose the loopback service without explicit authorization.
-- The currently shipped UI/API supports tracker reading, summary and owner feedback. Future health, task-packet, link and backlog commands must not be claimed as available until implemented and tested.
+- Use the Hub API to allocate Run IDs, append events/artifacts and close technical outcomes. Never edit `task_tracker.csv`, `manifest.json` or `events.jsonl` directly while the Hub is running.
 - If CSV structure is invalid, stop mutations and report the named structural issue. Do not silently repair historical task meaning.
 
-## Agent handoff
+## Managed Agent Run
 
-For implementation, request or assemble a task packet containing: goal/non-goals, Acceptance, SpecRef, dependency evidence, current blocker, state/availability, and required verification. If any of those is absent or contradictory, mark the work blocked rather than guessing. Owner feedback remains raw evidence until an authorized Agent evaluates it under the game's decision, Human Prep, or Gate process.
+The task packet contains task scope, dependencies, existing Runs and `trackerRevision`. Check that the task is `Ready` or an explicitly resumable `In Progress` task. If goal/non-goals, Acceptance, SpecRef, dependency evidence, current blocker, state/availability, or required verification are absent or contradictory, do not start a Run; report the gap or use the project's authorized workflow to mark it blocked.
+
+Use the Hub's loopback API only after reading the packet. All writes need `Content-Type: application/json` and `Origin: http://127.0.0.1:<port>`.
+
+1. `POST /api/runs/start` with `taskId`, packet `trackerRevision`, `agent`, `verificationProfile`, and concise scope/expected-behavior fields. The Hub atomically assigns `TaskID-R0001`, creates its record and changes `Ready` only to `In Progress`.
+2. Append an event at every material boundary through `POST /api/tasks/<TaskID>/runs/<RunID>/events`: preflight, baseline, change, verify, diagnose, repair, or escalation. Include a result and an evidence-based message; do not add repetitive no-information events.
+3. Store bounded UTF-8 evidence through `.../artifacts`: `logs/editor.log`, `test-results.xml`, `evidence.md`, or a concise command/result log. For screenshots, builds or larger/binary data, write a repository-relative or HTTPS reference into `evidence.md` instead of uploading it.
+4. Close through `.../close` with the latest `trackerRevision`, a summary and exactly one outcome:
+   - `verified`: Hub moves the task to `In Review`, never `Done`.
+   - `awaiting-human`: Hub moves it to `Awaiting Owner Gate`.
+   - `blocked`: requires a concrete blocker and moves it to `Blocked`.
+   - `incomplete`: leaves it `In Progress` and records the verification gap.
+
+If a revision is stale, reload the packet and reconcile the newer owner/reviewer update; do not retry with the old revision. If another Run is active, do not compete for the task.
+
+## Diagnostic logging
+
+Prefer official Unity test, Console, runtime-state and build evidence. Use temporary in-game diagnostic logs only when they reveal a state that those mechanisms cannot expose. Every such log must be `Debug.LogWarning` with `[CyberBudda]`, Task ID, Run ID, expected/actual state and a specific check name. Copy the relevant output into the Run artifact, then remove the instrumentation before production delivery. A trace that merely says a method ran is not functional proof.
 
 ## References
 
 - [README.md](../../../README.md): instance creation, launch and Skill linking.
-- [task_hub_product_spec.md](../../../task_hub_product_spec.md): V1 product boundaries and future acceptance targets.
+- [task_hub_product_spec.md](../../../task_hub_product_spec.md): V1.1 task and Agent Run boundaries.
 - [task_tracker.skeleton.csv](../../../templates/task_tracker.skeleton.csv): the 18-column task schema and illustrative workflow rows.
