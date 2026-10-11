@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Immune Reaction Task Tracker</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">IMMUNE REACTION</p>
+          <h1>开发任务看板</h1>
+          <p class="subtitle">数据直接来自 <code>docs/task_tracker.csv</code>。反馈会写回同一份 CSV，随后等待 Agent 评估。</p>
+        </div>
+        <button id="refresh-button" class="secondary-button" type="button">刷新数据</button>
+      </header>
+
+      <p id="load-message" class="load-message" aria-live="polite"></p>
+
+      <section class="summary-grid" aria-label="任务概况">
+        <article><span>全部任务</span><strong id="total-count">—</strong></article>
+        <article><span>等待你处理</span><strong id="owner-count">—</strong></article>
+        <article><span>Agent 处理中</span><strong id="work-count">—</strong></article>
+        <article><span>受阻任务</span><strong id="blocked-count">—</strong></article>
+      </section>
+
+      <section class="highlight-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">ACTION REQUIRED</p><h2>需要你处理</h2></div>
+          <p>提交后不会直接完成任务或解锁依赖。</p>
+        </div>
+        <div id="owner-actions" class="card-grid"></div>
+      </section>
+
+      <section class="two-column-section">
+        <div class="panel">
+          <div class="section-heading"><div><p class="eyebrow">ACTIVE</p><h2>当前 Agent 工作</h2></div></div>
+          <div id="current-work" class="compact-list"></div>
+        </div>
+        <div class="panel">
+          <div class="section-heading"><div><p class="eyebrow">BLOCKERS</p><h2>阻塞链</h2></div></div>
+          <div id="blockers" class="compact-list"></div>
+        </div>
+      </section>
+
+      <section class="table-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">TRACKER</p><h2>全部任务</h2></div>
+          <label class="search-label">搜索 <input id="task-search" type="search" placeholder="ID、任务、状态或 blocker"></label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Task ID</th><th>Milestone</th><th>任务</th><th>状态</th><th>依赖</th><th>更新时间</th></tr></thead>
+            <tbody id="task-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="task-dialog">
+      <form method="dialog" class="dialog-shell">
+        <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        <div id="task-detail"></div>
+      </form>
+    </dialog>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

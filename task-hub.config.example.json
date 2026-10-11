@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "instance": {
+    "projectId": "my-game",
+    "projectName": "My Game",
+    "tracker": "tracker/task_tracker.csv",
+    "mode": "managed-csv"
+  }
+}

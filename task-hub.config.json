@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "instance": {
+    "projectId": "uninitialized",
+    "projectName": "Uninitialized tracker instance",
+    "tracker": "tracker/task_tracker.csv",
+    "mode": "managed-csv"
+  }
+}
