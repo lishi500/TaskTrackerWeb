@@ -23,8 +23,9 @@ const dependencyUnblockRow = ['TEST-007', '', 'M0', 'Test', 'Dependency unblock 
 const zeroDependencyBlockedRow = ['TEST-008', '', 'M0', 'Test', 'Zero dependency unblock rejection', 'README.md', '', 'Agent', 'Blocked', 'P0', 'Must not be dependency-unblocked', 'Yes', 'Manual blocker', '', '', '', '', ''];
 const unfinishedDependencyBlockedRow = ['TEST-009', '', 'M0', 'Test', 'Unfinished dependency unblock rejection', 'README.md', 'TEST-002', 'Agent', 'Blocked', 'P0', 'Must retain blocker while dependency remains unfinished', 'Yes', 'TEST-002 incomplete', '', '', '', '', ''];
 const ownerWaitRow = ['TEST-010', '', 'M0', 'Test', 'Generic owner-wait close lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Moves only to an explicit owner status', 'Yes', '', '', '', '', '', ''];
+const closedBlockRecoveryRow = ['TEST-011', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'Yes', '', '', '', '', '', ''];
 await mkdir(recordsPath, { recursive: true });
-await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n`, 'utf8');
+await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n`, 'utf8');
 
 const child = spawn(process.execPath, ['server.mjs'], {
   cwd: root,
@@ -327,6 +328,33 @@ try {
   }));
   assert.equal(ownerWaitClose.response.status, 200);
   assert.equal(ownerWaitClose.body.task.Status, 'Awaiting Owner');
+  const closedBlockPacket = await request('/api/tasks/TEST-011/packet');
+  const closedBlockStart = await request('/api/runs/start', mutation({
+    taskId: 'TEST-011',
+    trackerRevision: closedBlockPacket.body.trackerRevision,
+    agent: 'test-agent',
+    verificationProfile: 'A-Design',
+    scope: 'Closed blocked Run recovery test',
+    expectedBehavior: 'A completed blocked Run must not permanently prevent generic dependency-unblock.',
+  }));
+  assert.equal(closedBlockStart.response.status, 201);
+  const closedBlockClose = await request(`/api/tasks/TEST-011/runs/${closedBlockStart.body.run.runId}/close`, mutation({
+    trackerRevision: closedBlockStart.body.trackerRevision,
+    outcome: 'blocked',
+    blocker: 'Awaiting independent contract remediation.',
+    summary: 'The Run closed with a concrete blocker and retained its historical Implementer attribution.',
+  }));
+  assert.equal(closedBlockClose.response.status, 200);
+  assert.equal(closedBlockClose.body.task.Status, 'Blocked');
+  assert.equal(closedBlockClose.body.task.Implementer, 'test-agent');
+  const closedBlockUnblock = await request('/api/tasks/TEST-011/unblock', mutation({
+    trackerRevision: closedBlockClose.body.trackerRevision,
+    agent: 'scheduler-agent',
+    reason: 'The independent blocker is resolved and TEST-001 remains Done.',
+  }));
+  assert.equal(closedBlockUnblock.response.status, 200);
+  assert.equal(closedBlockUnblock.body.task.Status, 'Ready');
+  assert.equal(closedBlockUnblock.body.task.Implementer, '');
   console.log(`managed-run test passed: recovered ${runId}, normal ${normalStart.body.run.runId}, non-reused claims TEST-004-R0002 and TEST-005-R0002`);
 } finally {
   child.kill('SIGTERM');

@@ -1141,15 +1141,22 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
-        if (record.Status !== 'Blocked' || record.Implementer || record.ReviewClaim) {
+        if (record.Status !== 'Blocked' || record.ReviewClaim) {
           const error = new Error(`Only an unclaimed ordinary Blocked task may be dependency-unblocked. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' still has active Run '${activeRun.runId}' and cannot be dependency-unblocked.`); error.statusCode = 409; throw error;
         }
         const dependencies = taskDependencies(record);
         if (!dependencies.length) { const error = new Error(`Cannot dependency-unblock ${taskId}; it has no dependencies.`); error.statusCode = 409; throw error; }
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) { const error = new Error(`Cannot unblock ${taskId}; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error; }
         const timestamp = new Date().toISOString();
-        record.Status = 'Ready'; record.Blocker = ''; record.Updated = timestamp;
+        // A completed blocked Run may retain Implementer for historical attribution.
+        // Its Run is no longer an active claim; successful maintenance clears that
+        // stale attribution before exposing the task as a fresh Ready claim.
+        record.Status = 'Ready'; record.Blocker = ''; record.Implementer = ''; record.Updated = timestamp;
         const line = `UNBLOCKED: ${dependencies.join(';') || 'no dependencies'}; ${timestamp}; ${agent}; ${reason}`;
         record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
         await replaceTracker(header, records);

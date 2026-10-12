@@ -38,7 +38,7 @@ Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用
 
 独立审查使用 `POST /api/tasks/<TaskID>/review`：reviewer 先 `action: "claim"`，再提交 `action: "decision"` 及 `approved`、`rejected` 或 `blocked`。reviewer 必须不同于 `Implementer`；批准才会进入 `Done`，可修复的拒绝回到 `Ready`，阻断审查需要具体 blocker。这个 API 不解释 owner 文字，也不解锁下游。
 
-对于未领取的 `Ready` packet，Agent 可用 `POST /api/tasks/<TaskID>/block` 记录发现的矛盾或缺失条件，不创建 Run。通用 `POST /api/tasks/<TaskID>/unblock` 仅验证任务未被领取、所有直接依赖均为 `Done`、并记录理由；它不理解任何游戏特有的 Gate、Release 或产品决策规则。调用方必须先按该游戏自己的流程确认该状态转换被允许。
+对于未领取的 `Ready` packet，Agent 可用 `POST /api/tasks/<TaskID>/block` 记录发现的矛盾或缺失条件，不创建 Run。通用 `POST /api/tasks/<TaskID>/unblock` 仅验证没有活跃 Run、所有直接依赖均为 `Done`、并记录理由；已经结束的 blocked Run 保留的历史 `Implementer` 不视为活跃 claim，成功解锁时会清空该陈旧字段。它不理解任何游戏特有的 Gate、Release 或产品决策规则。调用方必须先按该游戏自己的流程确认该状态转换被允许。
 
 Owner 反馈仍只作为原始 Evidence 写入，并转为 `Awaiting Agent Evaluation`；它不会自动完成任务、批准 Gate、评审实现或解锁依赖。
 

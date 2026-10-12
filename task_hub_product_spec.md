@@ -30,7 +30,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - `awaiting-human` requires the caller to explicitly name either `Awaiting Owner` or `Awaiting Owner Gate`. The template never infers workflow semantics from a task-ID prefix.
 - Only the explicit review decision endpoint may set `Done`, and only after a distinct reviewer has claimed the In Review task. It does not unlock dependents.
 - An interrupted pre-CSV claim is terminally `Abandoned` and reserves its Run ID. A close-intent is reconciled before later Run/review work so an `In Review` task with an unresolved active Run cannot be approved.
-- The generic unblock endpoint proves only dependency completion plus absence of an active claim. A project coordinator remains responsible for its own Gate/release/decision policy before invoking it.
+- The generic unblock endpoint proves only dependency completion plus absence of an active claim. A completed blocked Run may retain its historical `Implementer`; it is not an active claim, and a successful unblock clears that stale attribution before returning `Ready`. A project coordinator remains responsible for its own Gate/release/decision policy before invoking it.
 - The Hub refuses malformed CSV row widths and binds to loopback. LAN exposure, authentication, remote databases and binary uploads are out of scope.
 
 ## Acceptance
