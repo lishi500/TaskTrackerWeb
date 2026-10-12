@@ -1,6 +1,6 @@
 ---
 name: game-task-hub
-description: "Operate a local single-game TaskTrackerWeb instance as the sole task-state authority, including task packets, owner feedback, managed Agent Runs, durable evidence, and CSV safety rules."
+description: "Operate a local single-game TaskTrackerWeb instance as the sole task-state authority, including task packets, owner feedback, managed Agent Runs, independent review, durable evidence, and CSV safety rules."
 ---
 
 # Game Task Hub
@@ -54,12 +54,12 @@ This creates a symbolic link, so future updates to this instance's Skill apply i
 - Read task dependencies and reverse dependencies before changing a task. Preserve historical Evidence and use the project's review-independence rules.
 - Backlog capture is not a claimable task. It needs explicit triage before it can become `Ready`.
 - A task reference may be an HTTPS URL or repository-relative path. Do not upload external/binary material or expose the loopback service without explicit authorization.
-- Use the Hub API to allocate Run IDs, append events/artifacts and close technical outcomes. Never edit `task_tracker.csv`, `manifest.json` or `events.jsonl` directly while the Hub is running.
+- Use the Hub API to allocate Run IDs, append events/artifacts, close technical outcomes and record independent review. Never edit `task_tracker.csv`, `run.json` or `events.jsonl` directly while the Hub is running.
 - If CSV structure is invalid, stop mutations and report the named structural issue. Do not silently repair historical task meaning.
 
 ## Managed Agent Run
 
-The task packet contains task scope, dependencies, existing Runs and `trackerRevision`. Check that the task is `Ready` or an explicitly resumable `In Progress` task. If goal/non-goals, Acceptance, SpecRef, dependency evidence, current blocker, state/availability, or required verification are absent or contradictory, do not start a Run; report the gap or use the project's authorized workflow to mark it blocked.
+The task packet contains task scope, dependencies, existing Runs and `trackerRevision`. Only a `Ready` task can start a new Run. If goal/non-goals, Acceptance, SpecRef, dependency evidence, current blocker, state/availability, or required verification are absent or contradictory, do not start a Run; report the gap or use the project's authorized workflow to mark it blocked.
 
 Use the Hub's loopback API only after reading the packet. All writes need `Content-Type: application/json` and `Origin: http://127.0.0.1:<port>`.
 
@@ -68,11 +68,17 @@ Use the Hub's loopback API only after reading the packet. All writes need `Conte
 3. Store bounded UTF-8 evidence through `.../artifacts`: `logs/editor.log`, `test-results.xml`, `evidence.md`, or a concise command/result log. For screenshots, builds or larger/binary data, write a repository-relative or HTTPS reference into `evidence.md` instead of uploading it.
 4. Close through `.../close` with the latest `trackerRevision`, a summary and exactly one outcome:
    - `verified`: Hub moves the task to `In Review`, never `Done`.
-   - `awaiting-human`: Hub moves it to `Awaiting Owner Gate`.
+   - `awaiting-human`: include `ownerStatus` exactly equal to `Awaiting Owner` or `Awaiting Owner Gate`; the Hub does not infer it from a task ID.
    - `blocked`: requires a concrete blocker and moves it to `Blocked`.
    - `incomplete`: leaves it `In Progress` and records the verification gap.
 
 If a revision is stale, reload the packet and reconcile the newer owner/reviewer update; do not retry with the old revision. If another Run is active, do not compete for the task.
+
+## Independent review and state maintenance
+
+An independent reviewer, different from the CSV `Implementer`, reviews only an `In Review` task. First call `POST /api/tasks/<TaskID>/review` with `action: "claim"` and `reviewer`; then use the new revision to call it with `action: "decision"`, the same reviewer, `approved`, `rejected` or `blocked`, and review notes. A blocked decision also requires a concrete blocker. The Hub rejects self-review, unclaimed decisions and review while an active Run remains. Approval is the only route to `Done`; rejection returns the task to `Ready` while retaining review evidence.
+
+For a contradictory/incomplete unclaimed Ready packet, use `POST /api/tasks/<TaskID>/block` with the current revision, agent, concrete blocker and evidence. It creates no Run. `POST /api/tasks/<TaskID>/unblock` is only a generic dependency transition: it requires an unclaimed Blocked task, all direct dependencies Done, an agent and a reason. Before calling it, enforce the current game's Gate, release and product-decision rules; the generic Hub intentionally has no task-ID-specific workflow policy.
 
 ## Diagnostic logging
 

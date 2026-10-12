@@ -15,6 +15,7 @@ const trackerPath = process.env.TRACKER_CSV
   ? resolve(process.env.TRACKER_CSV)
   : instance.tracker ? resolve(toolDir, instance.tracker) : undefined;
 const publicDir = join(toolDir, 'public');
+const taskRecordsDir = trackerPath ? join(dirname(trackerPath), 'task-records') : undefined;
 const port = Number(process.env.PORT ?? 4173);
 const host = process.env.HOST ?? '127.0.0.1';
 let activePort = port;
@@ -23,10 +24,6 @@ const ownerInputStatuses = new Set([
   'Awaiting Owner Gate',
   'Awaiting Agent Evaluation',
 ]);
-const runStartStatuses = new Set(['Ready', 'In Progress']);
-const runOutcomes = new Set(['verified', 'awaiting-human', 'blocked', 'incomplete']);
-const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const artifactNamePattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/;
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -37,6 +34,19 @@ const mimeTypes = {
   '.txt': 'text/plain; charset=utf-8',
   '.xml': 'application/xml; charset=utf-8',
 };
+const maxArtifactBytes = 131_072;
+const maxArtifactBytesPerRun = 524_288;
+const maxArtifactCountPerRun = 32;
+// This fault hook is deliberately reachable only from the isolated Node test
+// process. It exercises recovery after the CSV commit but before run finalization.
+let testCloseFailureRemaining = process.env.NODE_ENV === 'test'
+  && process.env.TASK_HUB_TEST_FAIL_CLOSE_AFTER_TRACKER === '1' ? 1 : 0;
+let testClaimFailureRemaining = process.env.NODE_ENV === 'test'
+  && process.env.TASK_HUB_TEST_FAIL_CLAIM_BEFORE_TRACKER === '1' ? 1 : 0;
+const testClaimFailureTask = process.env.TASK_HUB_TEST_FAIL_CLAIM_TASK ?? '';
+let testClaimAfterTrackerFailureRemaining = process.env.NODE_ENV === 'test'
+  && process.env.TASK_HUB_TEST_FAIL_CLAIM_AFTER_TRACKER === '1' ? 1 : 0;
+const testClaimAfterTrackerFailureTask = process.env.TASK_HUB_TEST_FAIL_CLAIM_AFTER_TRACKER_TASK ?? '';
 
 function parseCsv(source) {
   const rows = [];
@@ -81,47 +91,6 @@ function parseCsv(source) {
   return rows.filter((record) => record.some((value) => value !== ''));
 }
 
-function trackerRevision(source) {
-  return createHash('sha256').update(source).digest('hex');
-}
-
-function taskRecordsRoot() {
-  if (!trackerPath) throw new Error('No tracker is configured.');
-  return join(dirname(trackerPath), 'task-records');
-}
-
-function assertTaskId(taskId) {
-  if (!taskIdPattern.test(taskId)) {
-    const error = new Error('Task ID must contain only letters, digits, underscores, or hyphens.');
-    error.statusCode = 400;
-    throw error;
-  }
-}
-
-function assertRunId(taskId, runId) {
-  assertTaskId(taskId);
-  if (!new RegExp(`^${taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-R\\d{4,}$`).test(runId)) {
-    const error = new Error(`Run ID must use the ${taskId}-R0001 format.`);
-    error.statusCode = 400;
-    throw error;
-  }
-}
-
-function safeArtifactPath(runDirectory, artifactName) {
-  if (!artifactNamePattern.test(artifactName) || artifactName.includes('..') || artifactName.startsWith('/')) {
-    const error = new Error('Artifact name must be a relative safe path.');
-    error.statusCode = 400;
-    throw error;
-  }
-  const artifactPath = resolve(runDirectory, artifactName);
-  if (relative(runDirectory, artifactPath).startsWith('..')) {
-    const error = new Error('Artifact path escapes its run directory.');
-    error.statusCode = 400;
-    throw error;
-  }
-  return artifactPath;
-}
-
 function encodeCsv(rows) {
   return `${rows.map((row) => row.map((value) => {
     const text = String(value ?? '');
@@ -152,7 +121,11 @@ async function readTracker() {
     throw error;
   }
   const records = body.map((values) => Object.fromEntries(header.map((name, index) => [name, values[index]])));
-  return { header, records, revision: trackerRevision(source) };
+  return {
+    header,
+    records,
+    trackerRevision: createHash('sha256').update(source).digest('hex'),
+  };
 }
 
 async function replaceTracker(header, records) {
@@ -189,85 +162,26 @@ async function withTrackerLock(action) {
   }
 }
 
-function requireTrackerRevision(actualRevision, expectedRevision) {
-  if (!expectedRevision || expectedRevision !== actualRevision) {
-    const error = new Error('Tracker revision is stale. Reload task data before changing task execution state.');
-    error.statusCode = 409;
-    throw error;
-  }
-}
-
-function runDirectory(taskId, runId) {
-  assertRunId(taskId, runId);
-  return join(taskRecordsRoot(), taskId, runId);
-}
-
-async function readJsonFile(path, fallback) {
+async function withRunLock(taskId, runId, action) {
+  const directory = recordDirectory(taskId, runId);
+  const lockPath = join(directory, '.run.lock');
+  let lock;
   try {
-    return JSON.parse(await readFile(path, 'utf8'));
+    lock = await open(lockPath, 'wx');
   } catch (error) {
-    if (error?.code === 'ENOENT') return fallback;
+    if (error?.code === 'EEXIST') {
+      const conflict = new Error(`Run '${runId}' is being updated by another request. Reload and try again.`);
+      conflict.statusCode = 409;
+      throw conflict;
+    }
     throw error;
   }
-}
-
-async function readRun(taskId, runId) {
-  const directory = runDirectory(taskId, runId);
-  const manifest = await readJsonFile(join(directory, 'manifest.json'), null);
-  if (!manifest) {
-    const error = new Error(`Run '${runId}' was not found for task '${taskId}'.`);
-    error.statusCode = 404;
-    throw error;
+  try {
+    return await action();
+  } finally {
+    await lock.close().catch(() => {});
+    await unlink(lockPath).catch(() => {});
   }
-  const eventSource = await readFile(join(directory, 'events.jsonl'), 'utf8').catch((error) => {
-    if (error?.code === 'ENOENT') return '';
-    throw error;
-  });
-  const events = eventSource.split('\n').filter(Boolean).map((line) => JSON.parse(line));
-  return { directory, manifest, events };
-}
-
-async function listRuns(taskId) {
-  assertTaskId(taskId);
-  const taskDirectory = join(taskRecordsRoot(), taskId);
-  const entries = await readdir(taskDirectory, { withFileTypes: true }).catch((error) => {
-    if (error?.code === 'ENOENT') return [];
-    throw error;
-  });
-  const manifests = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const manifest = await readJsonFile(join(taskDirectory, entry.name, 'manifest.json'), null);
-    if (manifest?.taskId === taskId && manifest?.runId === entry.name) manifests.push(manifest);
-  }
-  return manifests.sort((left, right) => right.sequence - left.sequence);
-}
-
-async function taskRunSummaries(records) {
-  const summaries = new Map();
-  for (const record of records) {
-    if (!taskIdPattern.test(record.TaskID || '')) continue;
-    const runs = await listRuns(record.TaskID);
-    if (!runs.length) continue;
-    summaries.set(record.TaskID, {
-      count: runs.length,
-      current: runs.find((run) => run.status === 'running') ?? null,
-      latest: runs[0],
-    });
-  }
-  return summaries;
-}
-
-function runEvidenceLine(timestamp, run, message) {
-  return `[AGENT RUN ${timestamp}] ${run.runId} ${message} (tracker/task-records/${run.taskId}/${run.runId}/)`;
-}
-
-async function writeRunManifest(directory, manifest) {
-  await writeFile(join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-}
-
-async function appendRunEvent(directory, event) {
-  await appendFile(join(directory, 'events.jsonl'), `${JSON.stringify(event)}\n`, 'utf8');
 }
 
 function summarize(records) {
@@ -295,28 +209,28 @@ function sendJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function verifyFeedbackRequest(request) {
+function verifyMutationRequest(request) {
   const contentType = request.headers['content-type'] ?? '';
   if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
-    const error = new Error('Feedback requests must use Content-Type: application/json.');
+    const error = new Error('Mutation requests must use Content-Type: application/json.');
     error.statusCode = 415;
     throw error;
   }
   const expectedOrigin = `http://${host}:${activePort}`;
   if (request.headers.origin !== expectedOrigin) {
-    const error = new Error('Feedback requests must come from this local tracker page.');
+    const error = new Error('Mutation requests must come from this local tracker page.');
     error.statusCode = 403;
     throw error;
   }
 }
 
-async function readJson(request, maxBytes = 16_384) {
+async function readJson(request) {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of request) {
     bytes += chunk.length;
-    if (bytes > maxBytes) {
-      const error = new Error(`Request body is limited to ${Math.floor(maxBytes / 1024)} KB.`);
+    if (bytes > 196_608) {
+      const error = new Error('Request body is limited to 192 KB.');
       error.statusCode = 413;
       throw error;
     }
@@ -331,41 +245,415 @@ async function readJson(request, maxBytes = 16_384) {
   }
 }
 
-function requiredText(value, name, maxLength = 4_000) {
+function taskDependencies(record) {
+  return String(record.DependsOn ?? '').split(';').map((value) => value.trim()).filter(Boolean);
+}
+
+function safePathSegment(value, label) {
   const normalized = String(value ?? '').trim();
-  if (!normalized) {
-    const error = new Error(`${name} is required.`);
-    error.statusCode = 400;
-    throw error;
-  }
-  if (normalized.length > maxLength) {
-    const error = new Error(`${name} is limited to ${maxLength} characters.`);
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(normalized)) {
+    const error = new Error(`${label} must use only letters, digits, dot, underscore or hyphen.`);
     error.statusCode = 400;
     throw error;
   }
   return normalized;
 }
 
-function optionalText(value, name, maxLength = 4_000) {
-  if (value === undefined || value === null || value === '') return '';
-  return requiredText(value, name, maxLength);
+function artifactPath(taskId, runId, value) {
+  const name = String(value ?? '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(name) || name.includes('..') || name.startsWith('/') || name.endsWith('/')) {
+    const error = new Error('Artifact name must be a safe relative path using letters, digits, dot, underscore, hyphen or slash.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const artifactDir = join(recordDirectory(taskId, runId), 'artifacts');
+  const path = resolve(artifactDir, name);
+  if (relative(artifactDir, path).startsWith('..')) {
+    const error = new Error('Artifact path escapes its Run artifact directory.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return { name, artifactDir, path };
 }
 
-function taskIdFromPath(requestPath, suffix) {
-  const prefix = '/api/tasks/';
-  if (!requestPath.startsWith(prefix) || !requestPath.endsWith(suffix)) return null;
-  const taskId = decodeURIComponent(requestPath.slice(prefix.length, -suffix.length));
-  assertTaskId(taskId);
-  return taskId;
+function recordDirectory(taskId, runId) {
+  return join(taskRecordsDir, safePathSegment(taskId, 'Task ID'), safePathSegment(runId, 'Run ID'));
 }
 
-function runPathParts(requestPath, tail = '') {
-  const match = new RegExp(`^/api/tasks/([^/]+)/runs/([^/]+)${tail}$`).exec(requestPath);
-  if (!match) return null;
-  const taskId = decodeURIComponent(match[1]);
-  const runId = decodeURIComponent(match[2]);
-  assertRunId(taskId, runId);
-  return { taskId, runId };
+function taskRecordDirectory(taskId) {
+  return join(taskRecordsDir, safePathSegment(taskId, 'Task ID'));
+}
+
+async function listTaskRuns(taskId) {
+  if (!taskRecordsDir) return [];
+  const taskDir = join(taskRecordsDir, safePathSegment(taskId, 'Task ID'));
+  let entries;
+  try {
+    entries = await readdir(taskDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  const runs = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const run = JSON.parse(await readFile(join(taskDir, entry.name, 'run.json'), 'utf8'));
+      runs.push(run);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return runs.sort((left, right) => String(left.runId).localeCompare(String(right.runId)));
+}
+
+async function listRunArtifacts(taskId, runId) {
+  const artifactDir = join(recordDirectory(taskId, runId), 'artifacts');
+  async function visit(directory, prefix = '') {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') return [];
+      throw error;
+    }
+    const files = [];
+    for (const entry of entries) {
+      const name = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) files.push(...await visit(join(directory, entry.name), name));
+      else if (entry.isFile()) files.push({ name, bytes: (await stat(join(directory, entry.name))).size });
+    }
+    return files;
+  }
+  return (await visit(artifactDir)).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function runForDisplay(run) {
+  return { ...run, artifacts: await listRunArtifacts(run.taskId, run.runId) };
+}
+
+async function taskRunSummaries(records) {
+  const summaries = new Map();
+  for (const record of records) {
+    const runs = await listTaskRuns(record.TaskID);
+    if (!runs.length) continue;
+    summaries.set(record.TaskID, {
+      count: runs.length,
+      current: runs.find((run) => run.status === 'In Progress') ?? null,
+      latest: runs.at(-1),
+    });
+  }
+  return summaries;
+}
+
+async function readRunEvents(taskId, runId) {
+  const eventsPath = join(recordDirectory(taskId, runId), 'events.jsonl');
+  let source;
+  try {
+    source = await readFile(eventsPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  return source.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+async function writeRun(run) {
+  const directory = recordDirectory(run.taskId, run.runId);
+  await mkdir(directory, { recursive: true });
+  const path = join(directory, 'run.json');
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+    await rename(temporaryPath, path);
+  } finally {
+    await unlink(temporaryPath).catch(() => {});
+  }
+}
+
+async function readRun(taskId, runId) {
+  const run = JSON.parse(await readFile(join(recordDirectory(taskId, runId), 'run.json'), 'utf8'));
+  if (run.taskId !== taskId || run.runId !== runId) {
+    const error = new Error('Run record identity does not match the requested task/run path.');
+    error.statusCode = 409;
+    throw error;
+  }
+  return run;
+}
+
+async function appendRunEvent(taskId, runId, event) {
+  const directory = recordDirectory(taskId, runId);
+  await stat(join(directory, 'run.json'));
+  await appendFile(join(directory, 'events.jsonl'), `${JSON.stringify(event)}\n`, 'utf8');
+}
+
+function recordsMatch(left, right, header) {
+  return header.every((name) => String(left?.[name] ?? '') === String(right?.[name] ?? ''));
+}
+
+async function writeCloseIntent(taskId, runId, intent) {
+  const directory = recordDirectory(taskId, runId);
+  const path = join(directory, 'close-intent.json');
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(intent, null, 2)}\n`, 'utf8');
+    await rename(temporaryPath, path);
+  } finally {
+    await unlink(temporaryPath).catch(() => {});
+  }
+}
+
+async function readCloseIntent(taskId, runId) {
+  try {
+    return JSON.parse(await readFile(join(recordDirectory(taskId, runId), 'close-intent.json'), 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+async function writeClaimIntent(taskId, runId, intent) {
+  const directory = taskRecordDirectory(taskId);
+  await mkdir(directory, { recursive: true });
+  const path = join(directory, `.claim-intent-${safePathSegment(runId, 'Run ID')}.json`);
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(intent, null, 2)}\n`, 'utf8');
+    await rename(temporaryPath, path);
+  } finally {
+    await unlink(temporaryPath).catch(() => {});
+  }
+}
+
+async function listClaimIntents(taskId) {
+  const directory = taskRecordDirectory(taskId);
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  const intents = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith('.claim-intent-') || !entry.name.endsWith('.json')) continue;
+    intents.push({ path: join(directory, entry.name), value: JSON.parse(await readFile(join(directory, entry.name), 'utf8')) });
+  }
+  return intents;
+}
+
+async function recoverPendingClaims(taskId, header, records) {
+  const intents = await listClaimIntents(taskId);
+  if (!intents.length) return;
+  const record = records.find(({ TaskID }) => TaskID === taskId);
+  if (!record) {
+    const error = new Error(`Task '${taskId}' disappeared while recovering a pending claim.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  for (const { path, value: intent } of intents) {
+    if (intent.taskId !== taskId || !intent.runId || !intent.run || !intent.beforeRecord || !intent.afterRecord) {
+      const error = new Error(`Task '${taskId}' has an invalid claim recovery record; manual repair is required.`);
+      error.statusCode = 409;
+      throw error;
+    }
+    let run;
+    try {
+      run = await readRun(taskId, intent.runId);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (recordsMatch(record, intent.afterRecord, header)) {
+      if (!run) {
+        await writeRun(intent.run);
+        await appendRunEvent(taskId, intent.runId, {
+          timestamp: intent.timestamp,
+          type: 'claim-recovery',
+          result: 'reconstructed',
+          message: 'CSV claim committed before the Run record was finalized.',
+        });
+      } else if (run.status !== 'In Progress') {
+        const error = new Error(`Run '${intent.runId}' conflicts with its pending claim recovery record.`);
+        error.statusCode = 409;
+        throw error;
+      }
+      await unlink(path);
+      continue;
+    }
+    if (recordsMatch(record, intent.beforeRecord, header)) {
+      let run;
+      try {
+        run = await readRun(taskId, intent.runId);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      const abandonedRun = {
+        ...(run ?? intent.run),
+        status: 'Abandoned',
+        abandonedAt: new Date().toISOString(),
+        abandonmentReason: 'Claim transaction did not commit to the tracker CSV.',
+      };
+      await writeRun(abandonedRun);
+      await appendRunEvent(taskId, intent.runId, {
+        timestamp: abandonedRun.abandonedAt,
+        type: 'claim-recovery',
+        result: 'abandoned',
+        message: 'Run reserved but CSV claim did not commit; identifier will not be reused.',
+      });
+      await unlink(path);
+      continue;
+    }
+    if (run && run.status !== 'In Progress') {
+      // CSV ownership moved beyond the claim state (for example verified then
+      // independently rejected). The stale claim intent is no longer a live
+      // transaction and must not block a fresh Ready claim.
+      await unlink(path);
+      continue;
+    }
+    const error = new Error(`Task '${taskId}' changed outside pending Run '${intent.runId}' claim recovery; manual reconciliation is required.`);
+    error.statusCode = 409;
+    throw error;
+  }
+}
+
+async function appendCloseEventOnce(taskId, runId, intent) {
+  const eventsPath = join(recordDirectory(taskId, runId), 'events.jsonl');
+  let existing = '';
+  try {
+    existing = await readFile(eventsPath, 'utf8');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const alreadyRecorded = existing.split('\n').filter(Boolean).some((line) => {
+    try {
+      return JSON.parse(line).transactionId === intent.transactionId;
+    } catch {
+      return false;
+    }
+  });
+  if (!alreadyRecorded) {
+    await appendRunEvent(taskId, runId, {
+      timestamp: intent.closedAt,
+      type: 'close',
+      result: intent.outcome,
+      message: intent.summary,
+      transactionId: intent.transactionId,
+    });
+  }
+}
+
+async function recoverPendingClose(taskId, runId) {
+  const intent = await readCloseIntent(taskId, runId);
+  if (!intent) return false;
+  if (intent.taskId !== taskId || intent.runId !== runId || !intent.transactionId
+    || !intent.beforeRecord || !intent.afterRecord || !intent.runClosure) {
+    const error = new Error(`Run '${runId}' has an invalid close recovery record; manual repair is required.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  return withTrackerLock(async () => {
+    const current = await readTracker();
+    const currentRecord = current.records.find(({ TaskID }) => TaskID === taskId);
+    if (!currentRecord) {
+      const error = new Error(`Task '${taskId}' disappeared while recovering Run '${runId}'.`);
+      error.statusCode = 409;
+      throw error;
+    }
+    const intentPath = join(recordDirectory(taskId, runId), 'close-intent.json');
+    if (recordsMatch(currentRecord, intent.afterRecord, current.header)) {
+      const run = await readRun(taskId, runId);
+      if (run.status !== 'In Progress' && run.status !== intent.runClosure.status) {
+        const error = new Error(`Run '${runId}' conflicts with its pending close recovery record.`);
+        error.statusCode = 409;
+        throw error;
+      }
+      await appendCloseEventOnce(taskId, runId, intent);
+      await writeRun({ ...run, ...intent.runClosure });
+      await unlink(intentPath);
+      return true;
+    }
+    if (recordsMatch(currentRecord, intent.beforeRecord, current.header)) {
+      // Atomic CSV replacement did not commit. It is safe to discard the intent
+      // and let the caller retry against the unchanged revision.
+      await unlink(intentPath);
+      return false;
+    }
+    const error = new Error(`Task '${taskId}' changed outside pending Run '${runId}' close recovery; manual reconciliation is required.`);
+    error.statusCode = 409;
+    throw error;
+  });
+}
+
+async function recoverTaskPendingCloses(taskId) {
+  const runs = await listTaskRuns(taskId);
+  for (const run of runs) {
+    if (run.status !== 'In Progress') continue;
+    await withRunLock(taskId, run.runId, async () => recoverPendingClose(taskId, run.runId));
+  }
+}
+
+async function artifactUsage(taskId, runId) {
+  const files = await listRunArtifacts(taskId, runId);
+  return { count: files.length, bytes: files.reduce((total, file) => total + file.bytes, 0) };
+}
+
+function requireRevision(body, trackerRevision) {
+  const requested = String(body?.trackerRevision ?? '').trim();
+  if (!requested || requested !== trackerRevision) {
+    const error = new Error('Tracker revision is stale. Reload the task packet and try again.');
+    error.statusCode = 409;
+    throw error;
+  }
+}
+
+function packetFor(record, records, runs, trackerRevision) {
+  const dependencies = taskDependencies(record).map((taskId) => {
+    const dependency = records.find(({ TaskID }) => TaskID === taskId);
+    return dependency ? {
+      taskId,
+      status: dependency.Status,
+      acceptance: dependency.Acceptance,
+      evidence: dependency.Evidence,
+      specRef: dependency.SpecRef,
+    } : { taskId, missing: true };
+  });
+  const reverseDependencies = records
+    .filter((candidate) => taskDependencies(candidate).includes(record.TaskID))
+    .map((candidate) => ({ taskId: candidate.TaskID, status: candidate.Status, task: candidate.Task }));
+  return {
+    trackerRevision,
+    task: record,
+    packet: {
+      goal: record.Task,
+      nonGoals: 'Only the CSV Task Scope, explicit Acceptance, necessary verification and required evidence.',
+      acceptance: record.Acceptance,
+      specRef: record.SpecRef,
+      blocker: record.Blocker,
+      availability: record.Status,
+      dependencies,
+      reverseDependencies,
+      existingRuns: runs,
+    },
+  };
+}
+
+function parseRunPath(requestPath) {
+  const match = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/(events|artifacts|close)$/.exec(requestPath);
+  return match ? {
+    taskId: decodeURIComponent(match[1]),
+    runId: decodeURIComponent(match[2]),
+    operation: match[3],
+  } : undefined;
+}
+
+function reviewerIdentity(value) {
+  const reviewer = String(value ?? '').trim();
+  if (!reviewer || reviewer.length > 256 || /[\r\n]/.test(reviewer)) {
+    const error = new Error('reviewer is required, must be at most 256 characters and cannot contain a line break.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return reviewer;
 }
 
 async function serveStatic(request, response) {
@@ -385,287 +673,495 @@ async function serveStatic(request, response) {
   }
 }
 
-async function startRun(body) {
-  const taskId = requiredText(body.taskId, 'taskId', 128);
-  assertTaskId(taskId);
-  const agent = optionalText(body.agent, 'agent', 256) || 'unspecified-agent';
-  const verificationProfile = requiredText(body.verificationProfile, 'verificationProfile', 128);
-  const gitRevision = optionalText(body.gitRevision, 'gitRevision', 256);
-  const unityVersion = optionalText(body.unityVersion, 'unityVersion', 256);
-  const scopeSummary = optionalText(body.scopeSummary, 'scopeSummary', 4_000);
-  const expectedBehavior = optionalText(body.expectedBehavior, 'expectedBehavior', 4_000);
-  const timestamp = new Date().toISOString();
-
-  return withTrackerLock(async () => {
-    const { header, records, revision } = await readTracker();
-    requireTrackerRevision(revision, body.trackerRevision);
-    const record = records.find(({ TaskID }) => TaskID === taskId);
-    if (!record) {
-      const error = new Error(`Task '${taskId}' was not found.`);
-      error.statusCode = 404;
-      throw error;
-    }
-    if (!runStartStatuses.has(record.Status)) {
-      const error = new Error(`Task '${taskId}' is '${record.Status}' and cannot start an Agent run.`);
-      error.statusCode = 409;
-      throw error;
-    }
-    const runs = await listRuns(taskId);
-    const activeRun = runs.find((run) => run.status === 'running');
-    if (activeRun) {
-      const error = new Error(`Task '${taskId}' already has active run '${activeRun.runId}'. Close or escalate it before starting another run.`);
-      error.statusCode = 409;
-      throw error;
-    }
-    const sequence = Math.max(0, ...runs.map((run) => Number(run.sequence) || 0)) + 1;
-    const runId = `${taskId}-R${String(sequence).padStart(4, '0')}`;
-    const directory = runDirectory(taskId, runId);
-    const manifest = {
-      schemaVersion: 1,
-      taskId,
-      runId,
-      sequence,
-      status: 'running',
-      phase: 'PREFLIGHT',
-      outcome: null,
-      agent,
-      verificationProfile,
-      gitRevision,
-      unityVersion,
-      scopeSummary,
-      expectedBehavior,
-      startedAt: timestamp,
-      closedAt: null,
-      artifacts: [],
-    };
-    await mkdir(directory, { recursive: true });
-    await writeRunManifest(directory, manifest);
-    await appendRunEvent(directory, {
-      seq: 1,
-      time: timestamp,
-      phase: 'PREFLIGHT',
-      kind: 'run-started',
-      result: 'ok',
-      message: `Started by ${agent} using ${verificationProfile}.`,
-    });
-    record.Status = 'In Progress';
-    record.Blocker = '';
-    record.Evidence = record.Evidence
-      ? `${record.Evidence}\n${runEvidenceLine(timestamp, manifest, `started with profile ${verificationProfile}`)}`
-      : runEvidenceLine(timestamp, manifest, `started with profile ${verificationProfile}`);
-    record.Updated = timestamp;
-    await replaceTracker(header, records);
-    const next = await readTracker();
-    return { run: manifest, record, trackerRevision: next.revision };
-  });
-}
-
-async function addRunEvent(taskId, runId, body) {
-  const phase = requiredText(body.phase, 'phase', 64);
-  const kind = requiredText(body.kind, 'kind', 128);
-  const result = optionalText(body.result, 'result', 64);
-  const message = optionalText(body.message, 'message', 8_000);
-  const attempt = optionalText(body.attempt, 'attempt', 64);
-  return withTrackerLock(async () => {
-    const { directory, manifest, events } = await readRun(taskId, runId);
-    if (manifest.status !== 'running') {
-      const error = new Error(`Run '${runId}' is closed and cannot receive new execution events.`);
-      error.statusCode = 409;
-      throw error;
-    }
-    const event = {
-      seq: events.length + 1,
-      time: new Date().toISOString(),
-      phase,
-      kind,
-      result: result || undefined,
-      attempt: attempt || undefined,
-      message: message || undefined,
-    };
-    manifest.phase = phase;
-    await appendRunEvent(directory, event);
-    await writeRunManifest(directory, manifest);
-    return { event, run: manifest };
-  });
-}
-
-async function writeRunArtifact(taskId, runId, body) {
-  const name = requiredText(body.name, 'name', 256);
-  if (typeof body.content !== 'string') {
-    const error = new Error('Artifact content must be a UTF-8 string.');
-    error.statusCode = 400;
-    throw error;
-  }
-  if (Buffer.byteLength(body.content, 'utf8') > 512 * 1024) {
-    const error = new Error('A single text artifact is limited to 512 KB. Store larger or binary evidence externally and record its reference.');
-    error.statusCode = 413;
-    throw error;
-  }
-  return withTrackerLock(async () => {
-    const { directory, manifest, events } = await readRun(taskId, runId);
-    if (manifest.status !== 'running') {
-      const error = new Error(`Run '${runId}' is closed and cannot receive new artifacts.`);
-      error.statusCode = 409;
-      throw error;
-    }
-    const artifactPath = safeArtifactPath(directory, name);
-    await mkdir(dirname(artifactPath), { recursive: true });
-    await writeFile(artifactPath, body.content, 'utf8');
-    const artifact = { name, bytes: Buffer.byteLength(body.content, 'utf8'), writtenAt: new Date().toISOString() };
-    manifest.artifacts = [...(manifest.artifacts ?? []).filter((item) => item.name !== name), artifact];
-    const event = {
-      seq: events.length + 1,
-      time: artifact.writtenAt,
-      phase: manifest.phase,
-      kind: 'artifact-written',
-      result: 'ok',
-      message: `${name} (${artifact.bytes} bytes)`,
-    };
-    await appendRunEvent(directory, event);
-    await writeRunManifest(directory, manifest);
-    return { artifact, run: manifest };
-  });
-}
-
-async function closeRun(taskId, runId, body) {
-  const outcome = requiredText(body.outcome, 'outcome', 64);
-  if (!runOutcomes.has(outcome)) {
-    const error = new Error(`outcome must be one of: ${[...runOutcomes].join(', ')}.`);
-    error.statusCode = 400;
-    throw error;
-  }
-  const summary = requiredText(body.summary, 'summary', 8_000);
-  const blocker = optionalText(body.blocker, 'blocker', 4_000);
-  if (outcome === 'blocked' && !blocker) {
-    const error = new Error('blocked outcome requires a concrete blocker.');
-    error.statusCode = 400;
-    throw error;
-  }
-  return withTrackerLock(async () => {
-    const { header, records, revision } = await readTracker();
-    requireTrackerRevision(revision, body.trackerRevision);
-    const record = records.find(({ TaskID }) => TaskID === taskId);
-    if (!record) {
-      const error = new Error(`Task '${taskId}' was not found.`);
-      error.statusCode = 404;
-      throw error;
-    }
-    const { directory, manifest, events } = await readRun(taskId, runId);
-    if (manifest.status !== 'running') {
-      const error = new Error(`Run '${runId}' is already closed.`);
-      error.statusCode = 409;
-      throw error;
-    }
-    const timestamp = new Date().toISOString();
-    manifest.status = 'closed';
-    manifest.phase = 'CLOSED';
-    manifest.outcome = outcome;
-    manifest.summary = summary;
-    manifest.blocker = blocker;
-    manifest.closedAt = timestamp;
-    await appendRunEvent(directory, {
-      seq: events.length + 1,
-      time: timestamp,
-      phase: 'CLOSED',
-      kind: 'run-closed',
-      result: outcome,
-      message: summary,
-    });
-    await writeRunManifest(directory, manifest);
-
-    if (outcome === 'verified') {
-      record.Status = 'In Review';
-      record.Blocker = 'Technical verification passed; independent review is still required before Done.';
-    } else if (outcome === 'awaiting-human') {
-      record.Status = 'Awaiting Owner Gate';
-      record.Blocker = blocker || 'Technical verification passed; human experience acceptance is required.';
-    } else if (outcome === 'blocked') {
-      record.Status = 'Blocked';
-      record.Blocker = blocker;
-    } else {
-      record.Status = 'In Progress';
-      record.Blocker = blocker || 'Agent run ended without sufficient verification evidence; follow-up is required.';
-    }
-    record.Evidence = record.Evidence
-      ? `${record.Evidence}\n${runEvidenceLine(timestamp, manifest, `closed as ${outcome}: ${summary}`)}`
-      : runEvidenceLine(timestamp, manifest, `closed as ${outcome}: ${summary}`);
-    record.Updated = timestamp;
-    await replaceTracker(header, records);
-    const next = await readTracker();
-    return { run: manifest, record, trackerRevision: next.revision };
-  });
-}
-
 const server = createServer(async (request, response) => {
   try {
     const requestPath = new URL(request.url, `http://${request.headers.host}`).pathname;
     if (request.method === 'GET' && requestPath === '/api/tracker') {
-      const { records, revision } = await readTracker();
+      const { records, trackerRevision } = await readTracker();
       const summaries = await taskRunSummaries(records);
       sendJson(response, 200, {
-        revision,
+        revision: trackerRevision,
         records: records.map((record) => ({ ...record, RunSummary: summaries.get(record.TaskID) ?? null })),
       });
       return;
     }
     if (request.method === 'GET' && requestPath === '/api/summary') {
-      const { records, revision } = await readTracker();
-      sendJson(response, 200, { ...summarize(records), revision });
+      const { records, trackerRevision } = await readTracker();
+      sendJson(response, 200, { ...summarize(records), revision: trackerRevision });
       return;
     }
-    const packetTaskId = request.method === 'GET' ? taskIdFromPath(requestPath, '/packet') : null;
-    if (packetTaskId) {
-      const { records, revision } = await readTracker();
-      const task = records.find(({ TaskID }) => TaskID === packetTaskId);
-      if (!task) {
-        const error = new Error(`Task '${packetTaskId}' was not found.`);
-        error.statusCode = 404;
-        throw error;
+    const packetMatch = /^\/api\/tasks\/([^/]+)\/packet$/.exec(requestPath);
+    if (request.method === 'GET' && packetMatch) {
+      const taskId = decodeURIComponent(packetMatch[1]);
+      const { records, trackerRevision } = await readTracker();
+      const record = records.find(({ TaskID }) => TaskID === taskId);
+      if (!record) {
+        sendJson(response, 404, { error: `Task '${taskId}' was not found.` });
+        return;
       }
-      const dependencies = (task.DependsOn || '').split(/[;,\s]+/).filter(Boolean);
-      const dependents = records.filter((record) => (record.DependsOn || '').split(/[;,\s]+/).includes(packetTaskId));
-      const runs = await listRuns(packetTaskId);
-      sendJson(response, 200, { task, dependencies, dependents, runs, trackerRevision: revision });
+      sendJson(response, 200, packetFor(record, records, await listTaskRuns(taskId), trackerRevision));
       return;
     }
-    const runsTaskId = request.method === 'GET' ? taskIdFromPath(requestPath, '/runs') : null;
-    if (runsTaskId) {
-      sendJson(response, 200, { taskId: runsTaskId, runs: await listRuns(runsTaskId) });
-      return;
-    }
-    const artifactMatch = request.method === 'GET'
-      ? /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/artifacts\/(.+)$/.exec(requestPath)
-      : null;
-    if (artifactMatch) {
-      const taskId = decodeURIComponent(artifactMatch[1]);
-      const runId = decodeURIComponent(artifactMatch[2]);
-      assertRunId(taskId, runId);
-      const directory = runDirectory(taskId, runId);
-      const artifactPath = safeArtifactPath(directory, decodeURIComponent(artifactMatch[3]));
-      const artifactStat = await stat(artifactPath);
-      if (!artifactStat.isFile()) {
-        const error = new Error('Artifact path is not a file.');
-        error.statusCode = 404;
-        throw error;
+    const runsMatch = /^\/api\/tasks\/([^/]+)\/runs$/.exec(requestPath);
+    if (request.method === 'GET' && runsMatch) {
+      const taskId = safePathSegment(decodeURIComponent(runsMatch[1]), 'Task ID');
+      const { records } = await readTracker();
+      if (!records.some(({ TaskID }) => TaskID === taskId)) {
+        sendJson(response, 404, { error: `Task '${taskId}' was not found.` });
+        return;
       }
-      response.writeHead(200, {
-        'Content-Type': mimeTypes[extname(artifactPath)] ?? 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
+      sendJson(response, 200, { taskId, runs: await Promise.all((await listTaskRuns(taskId)).map(runForDisplay)) });
+      return;
+    }
+    const artifactReadMatch = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/artifacts\/(.+)$/.exec(requestPath);
+    if (request.method === 'GET' && artifactReadMatch) {
+      const taskId = safePathSegment(decodeURIComponent(artifactReadMatch[1]), 'Task ID');
+      const runId = safePathSegment(decodeURIComponent(artifactReadMatch[2]), 'Run ID');
+      const artifact = artifactPath(taskId, runId, decodeURIComponent(artifactReadMatch[3]));
+      const artifactInfo = await stat(artifact.path);
+      if (!artifactInfo.isFile()) {
+        sendJson(response, 404, { error: `Artifact '${artifact.name}' was not found.` });
+        return;
+      }
+      response.writeHead(200, { 'Content-Type': mimeTypes[extname(artifact.path)] ?? 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+      createReadStream(artifact.path).pipe(response);
+      return;
+    }
+    const runDetailMatch = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)$/.exec(requestPath);
+    if (request.method === 'GET' && runDetailMatch) {
+      const taskId = safePathSegment(decodeURIComponent(runDetailMatch[1]), 'Task ID');
+      const runId = safePathSegment(decodeURIComponent(runDetailMatch[2]), 'Run ID');
+      const run = await readRun(taskId, runId);
+      sendJson(response, 200, { run: await runForDisplay(run), events: await readRunEvents(taskId, runId) });
+      return;
+    }
+    if (request.method === 'POST' && requestPath === '/api/runs/start') {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(body.taskId, 'Task ID');
+      const agent = String(body.agent ?? '').trim();
+      const verificationProfile = String(body.verificationProfile ?? '').trim();
+      const scope = String(body.scope ?? '').trim();
+      const expectedBehavior = String(body.expectedBehavior ?? '').trim();
+      if (!agent || !verificationProfile || !scope || !expectedBehavior) {
+        sendJson(response, 400, { error: 'agent, verificationProfile, scope and expectedBehavior are required.' });
+        return;
+      }
+      if ([agent, verificationProfile, scope, expectedBehavior].some((value) => value.length > 4_000)) {
+        sendJson(response, 400, { error: 'Run fields are limited to 4,000 characters.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        await recoverPendingClaims(taskId, header, records);
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) {
+          const error = new Error(`Task '${taskId}' was not found.`);
+          error.statusCode = 404;
+          throw error;
+        }
+        if (record.Status !== 'Ready') {
+          const error = new Error(`Only Ready tasks can start a managed Run. ${taskId} is '${record.Status}'.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        const dependencies = taskDependencies(record);
+        const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
+        if (unfinished.length) {
+          const error = new Error(`Task '${taskId}' has unfinished dependencies: ${unfinished.join(', ')}.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        const existingRuns = await listTaskRuns(taskId);
+        if (existingRuns.some((run) => run.status === 'In Progress')) {
+          const error = new Error(`Task '${taskId}' has an active managed Run and cannot be claimed again.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        const nextSequence = Math.max(0, ...existingRuns.map((run) => {
+          const match = new RegExp(`^${taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-R(\\d+)$`).exec(run.runId);
+          return match ? Number(match[1]) : 0;
+        })) + 1;
+        const runId = `${taskId}-R${String(nextSequence).padStart(4, '0')}`;
+        const timestamp = new Date().toISOString();
+        const beforeRecord = Object.fromEntries(header.map((name) => [name, record[name] ?? '']));
+        const run = {
+          runId,
+          taskId,
+          agent,
+          verificationProfile,
+          scope,
+          expectedBehavior,
+          startedAt: timestamp,
+          status: 'In Progress',
+        };
+        record.Status = 'In Progress';
+        record.Implementer = agent;
+        record.Blocker = '';
+        const claimEvidence = `CLAIM: ${agent} ${timestamp}; managed Run ${runId}.`;
+        record.Evidence = record.Evidence ? `${record.Evidence}\n${claimEvidence}` : claimEvidence;
+        record.Updated = timestamp;
+        const claimIntent = {
+          taskId,
+          runId,
+          timestamp,
+          beforeRecord,
+          afterRecord: Object.fromEntries(header.map((name) => [name, record[name] ?? ''])),
+          run,
+        };
+        await writeClaimIntent(taskId, runId, claimIntent);
+        await writeRun(run);
+        await appendRunEvent(taskId, runId, { timestamp, type: 'claim', result: 'started', message: expectedBehavior });
+        if (testClaimFailureRemaining > 0 && (!testClaimFailureTask || testClaimFailureTask === taskId)) {
+          testClaimFailureRemaining -= 1;
+          throw new Error('Injected test-only claim failure before CSV replacement.');
+        }
+        await replaceTracker(header, records);
+        if (testClaimAfterTrackerFailureRemaining > 0
+          && (!testClaimAfterTrackerFailureTask || testClaimAfterTrackerFailureTask === taskId)) {
+          testClaimAfterTrackerFailureRemaining -= 1;
+          throw new Error('Injected test-only claim failure after CSV replacement.');
+        }
+        await unlink(join(taskRecordDirectory(taskId), `.claim-intent-${runId}.json`));
+        const after = await readTracker();
+        return { run, task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
       });
-      createReadStream(artifactPath).pipe(response);
+      sendJson(response, 201, result);
       return;
     }
-    const runDetail = request.method === 'GET' ? runPathParts(requestPath) : null;
-    if (runDetail) {
-      const { manifest, events } = await readRun(runDetail.taskId, runDetail.runId);
-      sendJson(response, 200, { run: manifest, events });
+    const runPath = parseRunPath(requestPath);
+    if (request.method === 'POST' && runPath) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(runPath.taskId, 'Task ID');
+      const runId = safePathSegment(runPath.runId, 'Run ID');
+      if (runPath.operation === 'events') {
+        const type = String(body.type ?? '').trim();
+        const result = String(body.result ?? '').trim();
+        const message = String(body.message ?? '').trim();
+        if (!type || !result || !message || [type, result, message].some((value) => value.length > 8_000)) {
+          sendJson(response, 400, { error: 'type, result and message are required and limited to 8,000 characters.' });
+          return;
+        }
+        const eventResult = await withRunLock(taskId, runId, async () => {
+          await recoverPendingClose(taskId, runId);
+          const { records, trackerRevision } = await readTracker();
+          requireRevision(body, trackerRevision);
+          const record = records.find(({ TaskID }) => TaskID === taskId);
+          const run = await readRun(taskId, runId);
+          if (!record) {
+            const error = new Error(`Task '${taskId}' was not found.`);
+            error.statusCode = 404;
+            throw error;
+          }
+          if (record.Status !== 'In Progress' || record.Implementer !== run.agent || run.status !== 'In Progress') {
+            const error = new Error(`Run '${runId}' is no longer active for task '${taskId}'.`);
+            error.statusCode = 409;
+            throw error;
+          }
+          const event = { timestamp: new Date().toISOString(), type, result, message };
+          await appendRunEvent(taskId, runId, event);
+          return { event, trackerRevision };
+        });
+        sendJson(response, 201, eventResult);
+        return;
+      }
+      if (runPath.operation === 'artifacts') {
+        const requestedName = String(body.name ?? '').trim();
+        const content = String(body.content ?? '');
+        const byteLength = Buffer.byteLength(content, 'utf8');
+        if (!content || byteLength > maxArtifactBytes) {
+          sendJson(response, 400, { error: 'Artifact content is required and limited to 128 KB.' });
+          return;
+        }
+        const artifactResult = await withRunLock(taskId, runId, async () => {
+          await recoverPendingClose(taskId, runId);
+          const { records, trackerRevision } = await readTracker();
+          requireRevision(body, trackerRevision);
+          const record = records.find(({ TaskID }) => TaskID === taskId);
+          const run = await readRun(taskId, runId);
+          if (!record) {
+            const error = new Error(`Task '${taskId}' was not found.`);
+            error.statusCode = 404;
+            throw error;
+          }
+          if (record.Status !== 'In Progress' || record.Implementer !== run.agent || run.status !== 'In Progress') {
+            const error = new Error(`Run '${runId}' is no longer active for task '${taskId}'.`);
+            error.statusCode = 409;
+            throw error;
+          }
+          const artifact = artifactPath(taskId, runId, requestedName);
+          const usage = await artifactUsage(taskId, runId);
+          if (usage.count >= maxArtifactCountPerRun || usage.bytes + byteLength > maxArtifactBytesPerRun) {
+            const error = new Error(`Run '${runId}' reached its artifact limit (${maxArtifactCountPerRun} files / ${maxArtifactBytesPerRun} bytes).`);
+            error.statusCode = 413;
+            throw error;
+          }
+          try {
+            await mkdir(dirname(artifact.path), { recursive: true });
+            await writeFile(artifact.path, content, { encoding: 'utf8', flag: 'wx' });
+          } catch (error) {
+            if (error?.code === 'EEXIST') {
+              const conflict = new Error(`Artifact '${artifact.name}' already exists for Run '${runId}'; artifacts are immutable.`);
+              conflict.statusCode = 409;
+              throw conflict;
+            }
+            throw error;
+          }
+          const event = { timestamp: new Date().toISOString(), type: 'artifact', result: 'stored', message: `artifacts/${artifact.name}` };
+          await appendRunEvent(taskId, runId, event);
+          return { artifact: event.message, trackerRevision };
+        });
+        sendJson(response, 201, artifactResult);
+        return;
+      }
+      const outcome = String(body.outcome ?? '').trim();
+      const summary = String(body.summary ?? '').trim();
+      const blocker = String(body.blocker ?? '').trim();
+      const ownerStatus = String(body.ownerStatus ?? '').trim();
+      if (!['verified', 'blocked', 'awaiting-human', 'incomplete'].includes(outcome) || !summary) {
+        sendJson(response, 400, { error: 'outcome must be verified, blocked, awaiting-human or incomplete; summary is required.' });
+        return;
+      }
+      const closeResult = await withRunLock(taskId, runId, async () => {
+        await recoverPendingClose(taskId, runId);
+        return withTrackerLock(async () => {
+          const current = await readTracker();
+          requireRevision(body, current.trackerRevision);
+          const currentRecord = current.records.find(({ TaskID }) => TaskID === taskId);
+          const currentRun = await readRun(taskId, runId);
+          if (!currentRecord || currentRecord.Status !== 'In Progress' || currentRecord.Implementer !== currentRun.agent || currentRun.status !== 'In Progress') {
+            const error = new Error('Task state, Implementer or Run changed while the Run was active. Reload the packet.');
+            error.statusCode = 409;
+            throw error;
+          }
+          const timestamp = new Date().toISOString();
+          if (outcome === 'incomplete') {
+            await appendRunEvent(taskId, runId, { timestamp, type: 'close-attempt', result: outcome, message: summary });
+            return { run: currentRun, task: currentRecord, trackerRevision: current.trackerRevision };
+          }
+          const beforeRecord = Object.fromEntries(current.header.map((name) => [name, currentRecord[name] ?? '']));
+          if (outcome === 'verified') {
+          currentRecord.Status = 'In Review';
+          currentRecord.Blocker = '';
+        } else if (outcome === 'blocked') {
+          if (!blocker) {
+            const error = new Error('blocked outcome requires a concrete blocker.');
+            error.statusCode = 400;
+            throw error;
+          }
+          currentRecord.Status = 'Blocked';
+          currentRecord.Blocker = blocker;
+        } else if (outcome === 'awaiting-human') {
+          if (!['Awaiting Owner', 'Awaiting Owner Gate'].includes(ownerStatus)) {
+            const error = new Error('awaiting-human requires ownerStatus to be Awaiting Owner or Awaiting Owner Gate.');
+            error.statusCode = 409;
+            throw error;
+          }
+          currentRecord.Status = ownerStatus;
+          currentRecord.Blocker = blocker || 'Human action is required before workflow can continue.';
+        } else {
+          currentRecord.Status = 'In Progress';
+        }
+        currentRecord.Evidence = currentRecord.Evidence ? `${currentRecord.Evidence}\nRUN ${runId} ${outcome}: ${summary}` : `RUN ${runId} ${outcome}: ${summary}`;
+        currentRecord.Updated = timestamp;
+          const runClosure = {
+            status: outcome,
+            closedAt: timestamp,
+            summary,
+            blocker: currentRecord.Blocker,
+          };
+          const intent = {
+            transactionId: randomUUID(),
+            taskId,
+            runId,
+            outcome,
+            summary,
+            closedAt: timestamp,
+            beforeRecord,
+            afterRecord: Object.fromEntries(current.header.map((name) => [name, currentRecord[name] ?? ''])),
+            runClosure,
+          };
+          await writeCloseIntent(taskId, runId, intent);
+          await replaceTracker(current.header, current.records);
+          if (testCloseFailureRemaining > 0) {
+            testCloseFailureRemaining -= 1;
+            throw new Error('Injected test-only close failure after CSV replacement.');
+          }
+          await appendCloseEventOnce(taskId, runId, intent);
+          const closedRun = { ...currentRun, ...runClosure };
+          await writeRun(closedRun);
+          await unlink(join(recordDirectory(taskId, runId), 'close-intent.json'));
+          const after = await readTracker();
+          return { run: closedRun, task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+        });
+      });
+      sendJson(response, 200, closeResult);
+      return;
+    }
+    const reviewMatch = /^\/api\/tasks\/([^/]+)\/review$/.exec(requestPath);
+    if (request.method === 'POST' && reviewMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(reviewMatch[1]), 'Task ID');
+      await recoverTaskPendingCloses(taskId);
+      const action = String(body.action ?? '').trim();
+      const reviewer = reviewerIdentity(body.reviewer);
+      if (!['claim', 'decision'].includes(action)) {
+        sendJson(response, 400, { error: 'action must be claim or decision.' });
+        return;
+      }
+      const decision = String(body.decision ?? '').trim();
+      const notes = String(body.notes ?? '').trim();
+      const reviewBlocker = String(body.blocker ?? '').trim();
+      if (action === 'decision' && (!['approved', 'rejected', 'blocked'].includes(decision) || !notes || notes.length > 8_000)) {
+        sendJson(response, 400, { error: 'decision must be approved, rejected or blocked, with notes limited to 8,000 characters.' });
+        return;
+      }
+      if (action === 'decision' && decision === 'blocked' && (!reviewBlocker || reviewBlocker.length > 4_000)) {
+        sendJson(response, 400, { error: 'A blocked review decision requires a concrete blocker limited to 4,000 characters.' });
+        return;
+      }
+      const reviewResult = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) {
+          const error = new Error(`Task '${taskId}' was not found.`);
+          error.statusCode = 404;
+          throw error;
+        }
+        if (record.Status !== 'In Review') {
+          const error = new Error(`Only In Review tasks can be reviewed. ${taskId} is '${record.Status}'.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' has unresolved active Run '${activeRun.runId}' and cannot be reviewed.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        if (!record.Implementer || record.Implementer === reviewer) {
+          const error = new Error('Reviewer must be distinct from the task Implementer.');
+          error.statusCode = 409;
+          throw error;
+        }
+        const timestamp = new Date().toISOString();
+        if (action === 'claim') {
+          if (record.ReviewClaim) {
+            const error = new Error(`Task '${taskId}' already has a ReviewClaim.`);
+            error.statusCode = 409;
+            throw error;
+          }
+          record.ReviewClaim = `REVIEW-CLAIM: ${reviewer} ${timestamp}`;
+          record.Updated = timestamp;
+          await replaceTracker(header, records);
+          const after = await readTracker();
+          return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+        }
+        const expectedClaimPrefix = `REVIEW-CLAIM: ${reviewer} `;
+        if (!record.ReviewClaim?.startsWith(expectedClaimPrefix)) {
+          const error = new Error(`Reviewer '${reviewer}' has not claimed task '${taskId}'.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        record.Reviewer = `${reviewer} / ${decision} / ${timestamp}`;
+        const evidence = `REVIEW ${decision}: ${reviewer} ${timestamp}; ${notes}`;
+        record.Evidence = record.Evidence ? `${record.Evidence}\n${evidence}` : evidence;
+        record.Updated = timestamp;
+        if (decision === 'approved') {
+          record.Status = 'Done';
+          record.Blocker = '';
+          record.ReviewClaim = '';
+        } else if (decision === 'blocked') {
+          record.Status = 'Blocked';
+          record.Blocker = reviewBlocker;
+          record.ReviewClaim = '';
+        } else {
+          record.Status = 'Ready';
+          record.Implementer = '';
+          record.ReviewClaim = '';
+          record.Blocker = '';
+        }
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, reviewResult);
+      return;
+    }
+    const blockMatch = /^\/api\/tasks\/([^/]+)\/block$/.exec(requestPath);
+    if (request.method === 'POST' && blockMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(blockMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const blocker = String(body.blocker ?? '').trim();
+      const evidence = String(body.evidence ?? '').trim();
+      if (!blocker || blocker.length > 4_000 || !evidence || evidence.length > 8_000) {
+        sendJson(response, 400, { error: 'agent, concrete blocker and evidence are required within their size limits.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) {
+          const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error;
+        }
+        if (record.Status !== 'Ready') {
+          const error = new Error(`Only an unclaimed Ready task can use pre-claim block. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        record.Status = 'Blocked'; record.Blocker = blocker; record.Updated = timestamp;
+        const line = `ESCALATION BLOCKED: ${agent} ${timestamp}; ${evidence}`;
+        record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
+    const unblockMatch = /^\/api\/tasks\/([^/]+)\/unblock$/.exec(requestPath);
+    if (request.method === 'POST' && unblockMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(unblockMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const reason = String(body.reason ?? '').trim();
+      if (!reason || reason.length > 8_000) {
+        sendJson(response, 400, { error: 'A concrete dependency-unblock reason is required within 8,000 characters.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (record.Status !== 'Blocked' || record.Implementer || record.ReviewClaim) {
+          const error = new Error(`Only an unclaimed ordinary Blocked task may be dependency-unblocked. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
+        }
+        const dependencies = taskDependencies(record);
+        if (!dependencies.length) { const error = new Error(`Cannot dependency-unblock ${taskId}; it has no dependencies.`); error.statusCode = 409; throw error; }
+        const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
+        if (unfinished.length) { const error = new Error(`Cannot unblock ${taskId}; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error; }
+        const timestamp = new Date().toISOString();
+        record.Status = 'Ready'; record.Blocker = ''; record.Updated = timestamp;
+        const line = `UNBLOCKED: ${dependencies.join(';') || 'no dependencies'}; ${timestamp}; ${agent}; ${reason}`;
+        record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
       return;
     }
     if (request.method === 'POST' && requestPath === '/api/feedback') {
-      verifyFeedbackRequest(request);
-      const body = await readJson(request);
-      const { taskId, feedback } = body;
+      verifyMutationRequest(request);
+      const { taskId, feedback } = await readJson(request);
       const normalizedTaskId = String(taskId ?? '').trim();
       const normalizedFeedback = String(feedback ?? '').trim();
       if (!normalizedTaskId || !normalizedFeedback) {
@@ -677,8 +1173,8 @@ const server = createServer(async (request, response) => {
         return;
       }
       const result = await withTrackerLock(async () => {
-        const { header, records, revision } = await readTracker();
-        requireTrackerRevision(revision, body.trackerRevision);
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === normalizedTaskId);
         if (!record) {
           const error = new Error(`Task '${normalizedTaskId}' was not found.`);
@@ -697,33 +1193,10 @@ const server = createServer(async (request, response) => {
         record.Blocker = 'Owner feedback submitted; Agent evaluation required before any workflow transition.';
         record.Updated = timestamp;
         await replaceTracker(header, records);
-        const next = await readTracker();
-        return { record, timestamp, trackerRevision: next.revision };
+        const after = await readTracker();
+        return { record, timestamp, trackerRevision: after.trackerRevision };
       });
       sendJson(response, 200, result);
-      return;
-    }
-    if (request.method === 'POST' && requestPath === '/api/runs/start') {
-      verifyFeedbackRequest(request);
-      sendJson(response, 201, await startRun(await readJson(request, 64 * 1024)));
-      return;
-    }
-    const eventRun = request.method === 'POST' ? runPathParts(requestPath, '/events') : null;
-    if (eventRun) {
-      verifyFeedbackRequest(request);
-      sendJson(response, 201, await addRunEvent(eventRun.taskId, eventRun.runId, await readJson(request, 32 * 1024)));
-      return;
-    }
-    const artifactRun = request.method === 'POST' ? runPathParts(requestPath, '/artifacts') : null;
-    if (artifactRun) {
-      verifyFeedbackRequest(request);
-      sendJson(response, 201, await writeRunArtifact(artifactRun.taskId, artifactRun.runId, await readJson(request, 540 * 1024)));
-      return;
-    }
-    const closingRun = request.method === 'POST' ? runPathParts(requestPath, '/close') : null;
-    if (closingRun) {
-      verifyFeedbackRequest(request);
-      sendJson(response, 200, await closeRun(closingRun.taskId, closingRun.runId, await readJson(request, 32 * 1024)));
       return;
     }
     if (request.method === 'GET') {

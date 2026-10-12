@@ -1,45 +1,53 @@
-# Task Tracker Web
+# TaskTrackerWeb
 
-这是可 clone 的**单游戏任务中枢实例**。一份 TaskTrackerWeb Git 项目只管理一个游戏；该实例的 `tracker/task_tracker.csv` 是唯一当前任务状态数据源，网页不保留独立数据库或任务副本。
+这是可 clone 的**单游戏任务中枢模板**。每个游戏使用自己的 `<Game>-Tracker` 实例；实例内的 `tracker/task_tracker.csv` 是唯一的当前任务状态来源，网页与 Agent Run 不保留第二份任务状态数据库。
 
-Agent 的 Unity/代码执行记录不是第二份任务看板。每个任务可拥有多次受 Hub 管理的 Run：`tracker/task-records/<TaskID>/<TaskID>-Rnnnn/`。Run 保存 manifest、事件、日志、测试报告和外部证据引用；CSV 仍然只保存任务在项目流程中的真实状态。
+模板代码与实例状态严格分离：
 
-启动：
+- 将通用功能先合并、验证并提交到本模板；
+- 再把模板的代码、文档、Skill 与测试同步到各实例；
+- 不覆盖实例的 `tracker/`、`task-hub.config.json` 或实例特有的 `.agents/` 链接/配置。
+
+## 新建和启动实例
 
 ```bash
 node scripts/init-instance.mjs --project-id my-game --project-name "My Game"
 node scripts/start.mjs
 ```
 
-启动脚本默认选择空闲端口并打印 URL。可用 `PORT=4300` 固定端口。`TRACKER_CSV` 仅用于迁移/测试时临时覆盖，不是多项目管理机制。
+启动脚本默认只监听 loopback 并选择可用端口。需要稳定 URL 时可用 `PORT=4300 node scripts/start.mjs`；`TRACKER_CSV` 仅用于迁移或隔离测试，不能把一套实例伪装成多项目 Tracker。
 
-## 新游戏的正确用法
+让游戏仓库内的 Agent 使用此实例的当前 Skill：
 
-1. 从此仓库创建一个独立的 `<Game>-Tracker` Git 项目；不要把它嵌入游戏代码仓库。
-2. 在该实例根目录运行初始化命令。它只创建 `tracker/` 下的数据，不会覆盖已有 tracker。新的 CSV 来自 [task skeleton](templates/task_tracker.skeleton.csv)；在把它当作真实项目状态前，先替换四条 `BACKLOG-001`/`DEC-001`/`IMPL-001`/`REV-001` 示例行。
-3. 需要让游戏代码 Agent 发现本实例的 Skill 时，运行 `node scripts/link-game-skill.mjs /absolute/path/to/game-repository`。这会创建一个指向本实例 Skill 的符号链接，因此 Skill 更新会立即生效。
-4. 提交该 Tracker 项目的 `tracker/task_tracker.csv`、`task_events.jsonl` 和 `task-records/`；游戏仓库与 Tracker 仓库保持独立。
-
-网页会顶置三类信息：等待 owner 处理的事项、Agent 正在处理的任务、以及阻塞任务。对 `Awaiting Owner`、`Awaiting Owner Gate` 或已经 `Awaiting Agent Evaluation` 的任务，详情中可以提交反馈。
-
-任务详情还会显示 Agent Run。Run 的技术结果只有固定映射：
-
-- `verified` → `In Review`，绝不自动 `Done`；
-- `awaiting-human` → `Awaiting Owner Gate`；
-- `blocked` → `Blocked`，必须附具体 blocker；
-- `incomplete` → 保持 `In Progress`，明确写出缺少的验证证据。
-
-Hub 在锁内分配同一任务下单调递增的 Run ID，Agent 不得扫描目录后自行决定下一个序号，也不得直接编辑 CSV。Agent 先读取 `GET /api/tasks/<TaskID>/packet` 获得任务和 `trackerRevision`，再通过受同源 JSON 保护的 Run API 写入：
-
-```text
-POST /api/runs/start
-POST /api/tasks/<TaskID>/runs/<RunID>/events
-POST /api/tasks/<TaskID>/runs/<RunID>/artifacts
-POST /api/tasks/<TaskID>/runs/<RunID>/close
+```bash
+node scripts/link-game-skill.mjs /absolute/path/to/game-repository
 ```
 
-文本日志、测试 XML 和 `evidence.md` 可作为 Run artifact 保存。大文件、截图、Build 产物不上传到服务，而是在 `evidence.md` 中记录游戏仓库相对路径或 HTTPS 链接。临时 Unity trace 必须使用 warn 级别、`[CyberBudda]`、Task ID、Run ID 和 expected/actual 值；它是辅助诊断，不能单独当作功能验证，并必须在生产提交前移除。
+## 状态、Run 与审查
 
-提交反馈时，服务会获得一个短暂的同目录独占锁，并先拒绝任何列数不等于 header 的 CSV 行；仅在结构完整时才将 `[OWNER FEEDBACK <UTC>]` 原文追加到该行 `Evidence`，把状态设为 `Awaiting Agent Evaluation`，并以临时文件原子替换 CSV。它不会自动写 `Done`、解锁任何依赖、或将 owner 文本解释为 Gate/产品决定。后续 Agent 必须依照 `AGENTS.md` 和 `docs/handoff_operating_model.md` 评估并完成权威状态转换。
+Agent 先读取 `GET /api/tasks/<TaskID>/packet`。packet 给出任务、依赖/反向依赖、既有 Run 与当前 `trackerRevision`；所有写操作必须使用这个 revision、`Content-Type: application/json` 与同源 `Origin`。
 
-本服务默认仅监听 `127.0.0.1`；没有认证，不应暴露到局域网或公网。写入接口要求同源 `Origin: http://127.0.0.1:<port>` 和 `Content-Type: application/json`，拒绝跨站/simple POST。
+普通实现只可从 `Ready` 使用 `POST /api/runs/start` 领取。Hub 分配单调的 `TaskID-R0001`，使任务进入 `In Progress`，并在 `tracker/task-records/<TaskID>/<RunID>/` 保存 Run、事件与不可覆盖的文本 artifact。Run 关闭具有固定边界：
+
+- `verified` → `In Review`，绝不自动 `Done`；
+- `blocked` → `Blocked`，必须写明 blocker；
+- `incomplete` → 保持 `In Progress`，并记录缺失证据；
+- `awaiting-human` → 调用者必须显式提供 `ownerStatus: "Awaiting Owner"` 或 `"Awaiting Owner Gate"`；模板不会根据 Task ID 猜测项目流程。
+
+Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用的 `Abandoned` Run，CSV 已提交但 Run 未收尾时会在后续操作前恢复。文本 artifact 每份最多 128 KB、每 Run 最多 32 份/512 KB；可用安全相对路径如 `logs/editor.log`、`test-results.xml`、`evidence.md`。二进制、大型构建产物或截图应在 evidence 中记录仓库相对路径或 HTTPS 引用。
+
+独立审查使用 `POST /api/tasks/<TaskID>/review`：reviewer 先 `action: "claim"`，再提交 `action: "decision"` 及 `approved`、`rejected` 或 `blocked`。reviewer 必须不同于 `Implementer`；批准才会进入 `Done`，可修复的拒绝回到 `Ready`，阻断审查需要具体 blocker。这个 API 不解释 owner 文字，也不解锁下游。
+
+对于未领取的 `Ready` packet，Agent 可用 `POST /api/tasks/<TaskID>/block` 记录发现的矛盾或缺失条件，不创建 Run。通用 `POST /api/tasks/<TaskID>/unblock` 仅验证任务未被领取、所有直接依赖均为 `Done`、并记录理由；它不理解任何游戏特有的 Gate、Release 或产品决策规则。调用方必须先按该游戏自己的流程确认该状态转换被允许。
+
+Owner 反馈仍只作为原始 Evidence 写入，并转为 `Awaiting Agent Evaluation`；它不会自动完成任务、批准 Gate、评审实现或解锁依赖。
+
+## 验证
+
+```bash
+node --check server.mjs
+node --check public/app.js
+node scripts/test-managed-runs.mjs
+```
+
+最后一项在临时 CSV 中验证 Ready-only claim、revision/origin/MIME 拒绝、嵌套 artifact 与不可覆盖、claim/close 中断恢复、独立 review、pre-claim block、以及 generic dependency-unblock；不会写当前实例的 Tracker。
