@@ -1370,6 +1370,54 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, reviewResult);
       return;
     }
+    const contractMatch = /^\/api\/tasks\/([^/]+)\/contract$/.exec(requestPath);
+    if (request.method === 'POST' && contractMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(contractMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const reason = String(body.reason ?? '').trim();
+      const requestedContract = {
+        Task: String(body.task ?? '').trim(),
+        SpecRef: String(body.specRef ?? '').trim(),
+        Acceptance: String(body.acceptance ?? '').trim(),
+      };
+      if (!reason || reason.length > 8_000
+        || !requestedContract.Task || requestedContract.Task.length > 4_000
+        || !requestedContract.SpecRef || requestedContract.SpecRef.length > 4_000
+        || !requestedContract.Acceptance || requestedContract.Acceptance.length > 8_000) {
+        sendJson(response, 400, { error: 'agent, reason, task, specRef and acceptance are required within their size limits.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (!['Backlog', 'Ready', 'Blocked'].includes(record.Status) || record.ReviewClaim) {
+          const error = new Error(`Only an unclaimed inactive Backlog, Ready or Blocked task can receive a contract revision. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' has active Run '${activeRun.runId}' and cannot receive a contract revision.`); error.statusCode = 409; throw error;
+        }
+        const changedFields = Object.entries(requestedContract)
+          .filter(([field, value]) => record[field] !== value)
+          .map(([field]) => field);
+        if (!changedFields.length) {
+          const error = new Error(`Task '${taskId}' contract is unchanged.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        Object.assign(record, requestedContract);
+        record.Updated = timestamp;
+        appendEvidence(record, `CONTRACT UPDATED: ${agent} ${timestamp}; fields=${changedFields.join(',')}; ${reason}`);
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
     const blockMatch = /^\/api\/tasks\/([^/]+)\/block$/.exec(requestPath);
     if (request.method === 'POST' && blockMatch) {
       verifyMutationRequest(request);

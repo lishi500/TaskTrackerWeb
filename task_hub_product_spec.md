@@ -26,6 +26,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - Controlled owner-wait activation: an active managed coordinator Run may move one of its direct, unclaimed non-review `Backlog` dependencies to an explicitly named owner-facing status. The Hub verifies the active authority Run and shared Agent identity; it never infers a milestone, task-ID convention, or completion state.
 - Optional serial-lane controller (enabled by default for new instances): one Agent task may be `Ready`/`In Progress`/`In Review`; starting it arms only its unique direct successor, and a completed task advances only one uniquely eligible successor. Ambiguous fan-out remains `Backlog` for explicit coordinator admission.
 - Controlled owner-evaluation endpoint: raw owner feedback remains `Awaiting Agent Evaluation` until an Agent records an auditable resolution for a non-review owner task.
+- Controlled task-contract revision endpoint: an inactive unclaimed planned task may replace its `Task`, `SpecRef` and `Acceptance` together with a named Agent and reason, preserving history without permitting silent post-hoc reinterpretation.
 - Repository-relative text artifact paths such as `logs/editor.log`; binary or large evidence remains a repository/HTTPS reference rather than an upload.
 - Dependency-graph audit endpoint: a deterministic, read-only report catches unknown or duplicate Task IDs, missing references, self/duplicate dependencies and dependency cycles before they become scheduling deadlocks.
 
@@ -41,6 +42,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - `Blocked` is an active execution obstruction with a concrete blocker; `Backlog` is planned but not yet admitted work. Future-milestone gating alone belongs in `Backlog`, not `Blocked`. With `workflow.serialLane=true`, an admitted `Blocked` task must be the unique immediate successor of an `In Progress`/`In Review` predecessor; later chain tasks remain `Backlog`. Park/admit operations require a current revision, a named Agent and reason, reject active Runs/review claims, and preserve an append-only Evidence line. Admission to `Ready` additionally verifies direct dependencies are Done and the lane is empty.
 - The Hub refuses malformed CSV row widths and binds to loopback. LAN exposure, authentication, remote databases and binary uploads are out of scope.
 - Every Hub mutation validates the current dependency graph before it changes workflow state; its shared atomic replacement path also validates the proposed post-mutation graph. This is mandatory for current state mutations and for any future add/delete/DependsOn-edit endpoint. An invalid graph returns `422` without replacing the CSV. `GET /api/dependency-audit` intentionally remains readable and returns `200` with `valid: false` and all detected errors, so external CSV edits can be diagnosed without bypassing the source-of-truth boundary.
+- A task-contract revision is not a workflow shortcut: it accepts only `Backlog`, `Ready` or `Blocked` tasks with no active Run or review claim; it replaces the complete `Task`/`SpecRef`/`Acceptance` trio, requires at least one changed field and appends an auditable Evidence line. It cannot change a task's status, dependency graph, owner role, priority or review history. A completed or actively reviewed contract requires a distinct remediation task instead of revision.
 
 ## Acceptance
 
@@ -54,6 +56,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 8. Serial mode exposes at most one active Agent task and only one armed successor; ambiguous branches and future work remain Backlog.
 9. A dependency audit identifies malformed CSV structure, unknown/self/duplicate dependencies, duplicate Task IDs and deterministic cycle paths; normal reads and mutations reject an invalid graph without modifying it.
 10. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs`, `node scripts/test-serial-lane.mjs` and `node scripts/test-dependency-audit.mjs` verify isolated Run/review, serial-transition and dependency-integrity contracts.
+11. A contract revision rejects incomplete, unchanged, claimed or active-task edits; an allowed revision atomically retains status/history while recording the complete changed contract and reason.
 
 ## API contract
 
@@ -66,6 +69,7 @@ POST /api/tasks/<TaskID>/runs/<RunID>/events
 POST /api/tasks/<TaskID>/runs/<RunID>/artifacts
 POST /api/tasks/<TaskID>/runs/<RunID>/close
 POST /api/tasks/<TaskID>/review
+POST /api/tasks/<TaskID>/contract
 POST /api/tasks/<TaskID>/block
 POST /api/tasks/<TaskID>/unblock
 POST /api/tasks/<TaskID>/park
@@ -78,3 +82,5 @@ POST /api/feedback
 `/close` takes `outcome`, `summary`, current `trackerRevision`, and `blocker` for `blocked`. For `awaiting-human`, it additionally takes `ownerStatus` exactly equal to `Awaiting Owner` or `Awaiting Owner Gate`. `/review` first takes `{ action: "claim", reviewer }`, then `{ action: "decision", reviewer, decision, notes }`; a blocked decision also needs `blocker`. `/unblock` requires `agent` and a concrete `reason`; callers must perform project-specific eligibility checks before using it. `/owner-evaluation` accepts `agent`, `decision` (`approved`, `blocked`, `deferred`, `return-to-owner`) and evidence-bearing `notes`; it is only available after owner feedback for `ReviewRequired=No` tasks.
 
 `/owner-wait` accepts `authorityTaskId`, `agent`, `ownerStatus` (`Awaiting Owner` or `Awaiting Owner Gate`) and an evidence-bearing `reason`. The target must be unclaimed, non-review `Backlog`; the authority must be its direct `In Progress` dependency and have an active Run claimed by the same Agent. It records the explicit transition only and never marks either task Done.
+
+`/contract` accepts the current `trackerRevision`, `agent`, `reason` and a complete replacement `{ task, specRef, acceptance }`. It is allowed only for an inactive unclaimed `Backlog`, `Ready` or `Blocked` task and must change at least one of those three fields. It records which fields changed but preserves task state, dependencies and historical Evidence.

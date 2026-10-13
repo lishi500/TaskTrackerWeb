@@ -69,6 +69,8 @@ Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用
 
 对于未领取的 `Ready` packet，Agent 可用 `POST /api/tasks/<TaskID>/block` 记录发现的矛盾或缺失条件，不创建 Run。通用 `POST /api/tasks/<TaskID>/unblock` 仅验证没有活跃 Run、所有直接依赖均为 `Done`、并记录理由；已经结束的 blocked Run 保留的历史 `Implementer` 不视为活跃 claim，成功解锁时会清空该陈旧字段。`POST /api/tasks/<TaskID>/park` 可把无 claim/active Run 的 `Blocked` 任务收回 `Backlog`；`POST /api/tasks/<TaskID>/admit` 由协调者把 `Backlog` 任务重新纳入近期链并显式设为 `Ready`（全部依赖已 Done 且 lane 空闲）或 `Blocked`（仅当唯一直接前置正在进行/Review，其他依赖 Done）。这些 API 不理解任何游戏特有的 Gate、Release 或产品决策规则。调用方必须先按该游戏自己的流程确认该状态转换被允许。
 
+如果发现任务的 `Task`、`SpecRef` 或 `Acceptance` 与冻结架构相互矛盾，协调 Agent 不得只在 Evidence 中重新解释旧要求，也不得直接编辑 CSV。可在任务没有活跃 Run 或 review claim，且状态为 `Backlog`、`Ready` 或 `Blocked` 时，使用 `POST /api/tasks/<TaskID>/contract` 提交完整替换后的三项字段、当前 revision、Agent 和具体修订理由。Hub 保留旧 Evidence，并追加字段清单、UTC 与理由；它不会改变状态、依赖、OwnerRole 或审查历史。已 `In Progress`/`In Review`/`Done` 的任务必须通过新的补救任务处理，不可回写其完成时的契约。
+
 Owner 反馈仍只作为原始 Evidence 写入，并转为 `Awaiting Agent Evaluation`；它不会自动完成任务、批准 Gate、评审实现或解锁依赖。协调 Agent 核验原文后，只能使用 `POST /api/tasks/<TaskID>/owner-evaluation` 记录 `approved`、`blocked`、`deferred` 或 `return-to-owner`；只有 `ReviewRequired=No` 的 owner task 可用该 API 完成。
 
 当一个已受管的协调 Run 需要在协调任务完成前，将其直接依赖的一项、未领取的非 review `Backlog` 工作暴露给 owner 时，使用 `POST /api/tasks/<TaskID>/owner-wait`。调用必须明确给出 `ownerStatus`（`Awaiting Owner` 或 `Awaiting Owner Gate`）、具体理由、活跃的 `authorityTaskId` 与相同的认领 Agent 身份。Hub 会核验 authority task 是该目标的直接依赖，且该 Agent 拥有其活跃 Run；不会从 Task ID 或 Milestone 推断语义。这让 Human/owner 准备可审计地进入等待，且不会手改 CSV 或提前把协调任务标为 Done。

@@ -90,6 +90,36 @@ try {
   });
   assert.equal(crossOrigin.response.status, 403);
 
+  const contractPacket = await request('/api/tasks/TEST-006/packet');
+  const missingContractField = await request('/api/tasks/TEST-006/contract', mutation({
+    trackerRevision: contractPacket.body.trackerRevision,
+    agent: 'contract-agent',
+    reason: 'This must reject without the complete replacement contract.',
+    task: 'Pre-claim blocker lifecycle',
+    specRef: 'README.md',
+  }));
+  assert.equal(missingContractField.response.status, 400);
+  const revisedContract = await request('/api/tasks/TEST-006/contract', mutation({
+    trackerRevision: contractPacket.body.trackerRevision,
+    agent: 'contract-agent',
+    reason: 'The prior acceptance described an obsolete boundary; this replacement is explicitly auditable.',
+    task: 'Pre-claim blocker lifecycle',
+    specRef: 'README.md',
+    acceptance: 'Records an incomplete packet without changing task status.',
+  }));
+  assert.equal(revisedContract.response.status, 200);
+  assert.equal(revisedContract.body.task.Acceptance, 'Records an incomplete packet without changing task status.');
+  assert.match(revisedContract.body.task.Evidence, /CONTRACT UPDATED: contract-agent/);
+  const unchangedContract = await request('/api/tasks/TEST-006/contract', mutation({
+    trackerRevision: revisedContract.body.trackerRevision,
+    agent: 'contract-agent',
+    reason: 'This must reject because no contract field changes.',
+    task: 'Pre-claim blocker lifecycle',
+    specRef: 'README.md',
+    acceptance: 'Records an incomplete packet without changing task status.',
+  }));
+  assert.equal(unchangedContract.response.status, 409);
+
   const nonReadyPacket = await request('/api/tasks/TEST-002/packet');
   const nonReady = await request('/api/runs/start', mutation({
     taskId: 'TEST-002',
@@ -102,9 +132,10 @@ try {
   }));
   assert.equal(nonReady.response.status, 409);
 
+  const startPacket = await request('/api/tasks/TEST-001/packet');
   const start = await request('/api/runs/start', mutation({
     taskId: 'TEST-001',
-    trackerRevision: packet.body.trackerRevision,
+    trackerRevision: startPacket.body.trackerRevision,
     agent: 'test-agent',
     verificationProfile: 'A-Design',
     scope: 'Managed-run endpoint test only',
