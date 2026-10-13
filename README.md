@@ -71,6 +71,8 @@ Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用
 
 Owner 反馈仍只作为原始 Evidence 写入，并转为 `Awaiting Agent Evaluation`；它不会自动完成任务、批准 Gate、评审实现或解锁依赖。协调 Agent 核验原文后，只能使用 `POST /api/tasks/<TaskID>/owner-evaluation` 记录 `approved`、`blocked`、`deferred` 或 `return-to-owner`；只有 `ReviewRequired=No` 的 owner task 可用该 API 完成。
 
+当一个已受管的协调 Run 需要在协调任务完成前，将其直接依赖的一项、未领取的非 review `Backlog` 工作暴露给 owner 时，使用 `POST /api/tasks/<TaskID>/owner-wait`。调用必须明确给出 `ownerStatus`（`Awaiting Owner` 或 `Awaiting Owner Gate`）、具体理由、活跃的 `authorityTaskId` 与相同的认领 Agent 身份。Hub 会核验 authority task 是该目标的直接依赖，且该 Agent 拥有其活跃 Run；不会从 Task ID 或 Milestone 推断语义。这让 Human/owner 准备可审计地进入等待，且不会手改 CSV 或提前把协调任务标为 Done。
+
 首页在“当前 Agent 工作”和 Milestone 视图之间提供“可领取的 Session”面板。它只列出 CSV 状态为 `Ready` 的任务，方便协调者确认下一项可被 Agent 领取的工作；点击任务可查看依赖、验收与证据。面板不替代领取 API：真正领取时仍由 Hub 使用最新 revision 再次验证 `Ready` 状态和全部直接依赖。
 
 ## 验证

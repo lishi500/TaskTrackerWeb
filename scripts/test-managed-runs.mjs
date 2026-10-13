@@ -24,8 +24,10 @@ const zeroDependencyBlockedRow = ['TEST-008', '', 'M0', 'Test', 'Zero dependency
 const unfinishedDependencyBlockedRow = ['TEST-009', '', 'M0', 'Test', 'Unfinished dependency unblock rejection', 'README.md', 'TEST-002', 'Agent', 'Blocked', 'P0', 'Must retain blocker while dependency remains unfinished', 'Yes', 'TEST-002 incomplete', '', '', '', '', ''];
 const ownerWaitRow = ['TEST-010', '', 'M0', 'Test', 'Generic owner-wait close lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Moves only to an explicit owner status', 'Yes', '', '', '', '', '', ''];
 const closedBlockRecoveryRow = ['TEST-011', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'Yes', '', '', '', '', '', ''];
+const coordinatorRow = ['TEST-012', '', 'M0', 'Test', 'Coordinator authority lifecycle', 'README.md', '', 'Coordinator', 'Ready', 'P0', 'An active coordinator Run can expose a direct owner dependency', 'Yes', '', '', '', '', '', ''];
+const dependentOwnerRow = ['TEST-013', '', 'M0', 'Test', 'Coordinator-owned preparation', 'README.md', 'TEST-012', 'Owner', 'Backlog', 'P0', 'Enters an explicit owner wait only through its active direct coordinator', 'No', '', '', '', '', '', ''];
 await mkdir(recordsPath, { recursive: true });
-await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n`, 'utf8');
+await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n${coordinatorRow.join(',')}\n${dependentOwnerRow.join(',')}\n`, 'utf8');
 
 const child = spawn(process.execPath, ['server.mjs'], {
   cwd: root,
@@ -341,6 +343,34 @@ try {
   }));
   assert.equal(ownerWaitClose.response.status, 200);
   assert.equal(ownerWaitClose.body.task.Status, 'Awaiting Owner');
+  const coordinatorPacket = await request('/api/tasks/TEST-012/packet');
+  const coordinatorStart = await request('/api/runs/start', mutation({
+    taskId: 'TEST-012',
+    trackerRevision: coordinatorPacket.body.trackerRevision,
+    agent: 'coordinator-agent',
+    verificationProfile: 'A-Governance',
+    scope: 'Expose one direct owner dependency under an auditable active coordinator Run.',
+    expectedBehavior: 'Only the claimed coordinator can transition its direct Backlog owner dependency into an explicit owner wait.',
+  }));
+  assert.equal(coordinatorStart.response.status, 201);
+  const prematureOwnerWait = await request('/api/tasks/TEST-013/owner-wait', mutation({
+    trackerRevision: coordinatorStart.body.trackerRevision,
+    authorityTaskId: 'TEST-012',
+    agent: 'wrong-agent',
+    ownerStatus: 'Awaiting Owner',
+    reason: 'This must reject because the authority claim belongs to another agent.',
+  }));
+  assert.equal(prematureOwnerWait.response.status, 409);
+  const ownerWaitActivation = await request('/api/tasks/TEST-013/owner-wait', mutation({
+    trackerRevision: coordinatorStart.body.trackerRevision,
+    authorityTaskId: 'TEST-012',
+    agent: 'coordinator-agent',
+    ownerStatus: 'Awaiting Owner',
+    reason: 'The active coordinator independently verified that this direct owner preparation is now required.',
+  }));
+  assert.equal(ownerWaitActivation.response.status, 200);
+  assert.equal(ownerWaitActivation.body.task.Status, 'Awaiting Owner');
+  assert.match(ownerWaitActivation.body.task.Evidence, /OWNER-WAIT ACTIVATED: TEST-012;/);
   const closedBlockPacket = await request('/api/tasks/TEST-011/packet');
   const closedBlockStart = await request('/api/runs/start', mutation({
     taskId: 'TEST-011',

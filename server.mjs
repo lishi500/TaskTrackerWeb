@@ -1529,6 +1529,52 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, result);
       return;
     }
+    const ownerWaitMatch = /^\/api\/tasks\/([^/]+)\/owner-wait$/.exec(requestPath);
+    if (request.method === 'POST' && ownerWaitMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(ownerWaitMatch[1]), 'Task ID');
+      const authorityTaskId = safePathSegment(body.authorityTaskId, 'Authority task ID');
+      const agent = reviewerIdentity(body.agent);
+      const ownerStatus = String(body.ownerStatus ?? '').trim();
+      const reason = String(body.reason ?? '').trim();
+      if (!['Awaiting Owner', 'Awaiting Owner Gate'].includes(ownerStatus) || !reason || reason.length > 8_000) {
+        sendJson(response, 400, { error: 'ownerStatus must be Awaiting Owner or Awaiting Owner Gate and a concrete reason is required.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        const authority = records.find(({ TaskID }) => TaskID === authorityTaskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (!authority) { const error = new Error(`Authority task '${authorityTaskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (isAgentTask(record) || record.Status !== 'Backlog' || record.ReviewClaim || record.Implementer) {
+          const error = new Error(`Only an unclaimed non-review Backlog task can enter an owner wait. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
+        }
+        if (authority.Status !== 'In Progress' || authority.Implementer !== agent || !taskDependencies(record).includes(authorityTaskId)) {
+          const error = new Error(`Authority task '${authorityTaskId}' must be an In Progress direct dependency claimed by '${agent}'.`); error.statusCode = 409; throw error;
+        }
+        const activeAuthorityRun = (await listTaskRuns(authorityTaskId)).find((run) => run.status === 'In Progress' && run.agent === agent);
+        if (!activeAuthorityRun) {
+          const error = new Error(`Authority task '${authorityTaskId}' has no active Run for '${agent}'.`); error.statusCode = 409; throw error;
+        }
+        const activeTargetRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeTargetRun) {
+          const error = new Error(`Task '${taskId}' has active Run '${activeTargetRun.runId}' and cannot enter an owner wait.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        record.Status = ownerStatus;
+        record.Blocker = 'Owner action is required before this task can continue.';
+        record.Updated = timestamp;
+        appendEvidence(record, `OWNER-WAIT ACTIVATED: ${authorityTaskId}; ${timestamp}; ${agent}; ${reason}`);
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
     const ownerEvaluationMatch = /^\/api\/tasks\/([^/]+)\/owner-evaluation$/.exec(requestPath);
     if (request.method === 'POST' && ownerEvaluationMatch) {
       verifyMutationRequest(request);
