@@ -25,6 +25,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - Optional serial-lane controller (enabled by default for new instances): one Agent task may be `Ready`/`In Progress`/`In Review`; starting it arms only its unique direct successor, and a completed task advances only one uniquely eligible successor. Ambiguous fan-out remains `Backlog` for explicit coordinator admission.
 - Controlled owner-evaluation endpoint: raw owner feedback remains `Awaiting Agent Evaluation` until an Agent records an auditable resolution for a non-review owner task.
 - Repository-relative text artifact paths such as `logs/editor.log`; binary or large evidence remains a repository/HTTPS reference rather than an upload.
+- Dependency-graph audit endpoint: a deterministic, read-only report catches unknown or duplicate Task IDs, missing references, self/duplicate dependencies and dependency cycles before they become scheduling deadlocks.
 
 ## Workflow safety rules
 
@@ -36,6 +37,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - The generic unblock endpoint proves only dependency completion plus absence of an active claim. A completed blocked Run may retain its historical `Implementer`; it is not an active claim, and a successful unblock clears that stale attribution before returning `Ready`. A project coordinator remains responsible for its own Gate/release/decision policy before invoking it.
 - `Blocked` is an active execution obstruction with a concrete blocker; `Backlog` is planned but not yet admitted work. Future-milestone gating alone belongs in `Backlog`, not `Blocked`. With `workflow.serialLane=true`, an admitted `Blocked` task must be the unique immediate successor of an `In Progress`/`In Review` predecessor; later chain tasks remain `Backlog`. Park/admit operations require a current revision, a named Agent and reason, reject active Runs/review claims, and preserve an append-only Evidence line. Admission to `Ready` additionally verifies direct dependencies are Done and the lane is empty.
 - The Hub refuses malformed CSV row widths and binds to loopback. LAN exposure, authentication, remote databases and binary uploads are out of scope.
+- Every Hub mutation validates the current dependency graph before it changes workflow state; its shared atomic replacement path also validates the proposed post-mutation graph. This is mandatory for current state mutations and for any future add/delete/DependsOn-edit endpoint. An invalid graph returns `422` without replacing the CSV. `GET /api/dependency-audit` intentionally remains readable and returns `200` with `valid: false` and all detected errors, so external CSV edits can be diagnosed without bypassing the source-of-truth boundary.
 
 ## Acceptance
 
@@ -47,12 +49,14 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 6. Claim and close interruption recovery is deterministic and never reuses an allocated Run ID.
 7. Generic pre-claim block and dependency-unblock transitions retain evidence but do not silently apply game-specific workflow policy.
 8. Serial mode exposes at most one active Agent task and only one armed successor; ambiguous branches and future work remain Backlog.
-9. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs` and `node scripts/test-serial-lane.mjs` verify isolated Run/review and serial-transition contracts.
+9. A dependency audit identifies malformed CSV structure, unknown/self/duplicate dependencies, duplicate Task IDs and deterministic cycle paths; normal reads and mutations reject an invalid graph without modifying it.
+10. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs`, `node scripts/test-serial-lane.mjs` and `node scripts/test-dependency-audit.mjs` verify isolated Run/review, serial-transition and dependency-integrity contracts.
 
 ## API contract
 
 ```text
 GET  /api/tasks/<TaskID>/packet
+GET  /api/dependency-audit
 POST /api/runs/start
 POST /api/tasks/<TaskID>/runs/<RunID>/events
 POST /api/tasks/<TaskID>/runs/<RunID>/artifacts

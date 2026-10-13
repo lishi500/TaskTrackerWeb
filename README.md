@@ -8,6 +8,20 @@
 - 再把模板的代码、文档、Skill 与测试同步到各实例；
 - 不覆盖实例的 `tracker/`、`task-hub.config.json` 或实例特有的 `.agents/` 链接/配置。
 
+## 依赖图审计与死锁防护
+
+Hub 将 `DependsOn` 视为一个必须无环的任务图，而不是只在 UI 中展示的文本。每一次 Hub 写入都会先读取并校验当前 CSV，原子替换前还会校验拟写入的完整图；因此现有状态操作，以及未来的新增、删除或修改依赖操作，都不能把未知 TaskID、自依赖、重复依赖、重复 TaskID 或依赖环写回 source of truth。校验失败时该操作返回 `422`，CSV 保持不变。
+
+对于通过编辑器或脚本在 Hub 外修改 CSV 的情况，使用只读审计接口：
+
+```bash
+curl http://127.0.0.1:4173/api/dependency-audit
+```
+
+它始终返回 `200` 和结构化报告，即使 CSV 已不合法；`valid: false` 时检查 `csvErrors`、`unknownDependencies`、`selfDependencies`、`duplicateTaskIds`、`duplicateDependencies` 与 `cycles`。每个环会以稳定的 TaskID 路径表示，例如 `CORE-001 -> CORE-002 -> CORE-003 -> CORE-001`。普通 API 读取和所有写入则拒绝这类 CSV，并在 `422` 响应中附同一份 `dependencyAudit`，防止图错误演变为无提示的等待死锁。
+
+CSV 仍应只由 Hub 写入。外部批量迁移或人工维护不可避免时，在开始服务操作前、以及新增/删除任务或修改 `DependsOn` 后各执行一次审计；先修复报告的问题，再继续工作流。
+
 ## 新建和启动实例
 
 ```bash
@@ -53,6 +67,7 @@ node --check server.mjs
 node --check public/app.js
 node scripts/test-managed-runs.mjs
 node scripts/test-serial-lane.mjs
+node scripts/test-dependency-audit.mjs
 ```
 
-两项测试均使用临时 CSV，不会写当前实例的 Tracker；后者验证单线自动 arm/推进、owner feedback evaluation 与跳过中间任务的 admission 拒绝。
+三项测试均使用临时 CSV，不会写当前实例的 Tracker；后两项分别验证单线自动 arm/推进与跳过中间任务 admission 拒绝、依赖图审计和坏图拒绝。

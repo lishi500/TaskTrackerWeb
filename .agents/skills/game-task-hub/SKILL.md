@@ -55,7 +55,8 @@ This creates a symbolic link, so future updates to this instance's Skill apply i
 - `Blocked` is only for a task already admitted to the near-term chain that has a concrete actionable blocker. `Backlog` is planned but not yet admitted work; future-Milestone gating alone is Backlog, never Blocked. With `workflow.serialLane=true`, there may be one Agent task in `Ready`/`In Progress`/`In Review` and at most one armed direct successor in `Blocked`; every later link remains Backlog. Backlog capture is not claimable.
 - A task reference may be an HTTPS URL or repository-relative path. Do not upload external/binary material or expose the loopback service without explicit authorization.
 - Use the Hub API to allocate Run IDs, append events/artifacts, close technical outcomes and record independent review. Never edit `task_tracker.csv`, `run.json` or `events.jsonl` directly while the Hub is running.
-- If CSV structure is invalid, stop mutations and report the named structural issue. Do not silently repair historical task meaning.
+- The Hub validates the complete `DependsOn` graph before every mutation and before it atomically writes a proposed update. It rejects unknown Task IDs, duplicate Task IDs, self/duplicate dependencies and cycles with `422`; do not work around that by directly editing the live CSV.
+- For a planned external CSV migration or immediately after adding/removing tasks or changing `DependsOn` outside Hub APIs, call `GET /api/dependency-audit`. It remains readable for invalid CSV and returns deterministic `cycles` plus all structural defects. Fix the CSV deliberately, then re-run the audit; do not silently repair historical task meaning.
 
 ## Managed Agent Run
 

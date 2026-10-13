@@ -103,38 +103,192 @@ function encodeCsv(rows) {
   }).join(',')).join('\n')}\n`;
 }
 
-async function readTracker() {
+async function readRawTracker() {
   if (!trackerPath) {
     const error = new Error('No tracker is configured. Add a project to task-hub.config.json or set TRACKER_CSV.');
     error.statusCode = 503;
     throw error;
   }
   const source = await readFile(trackerPath, 'utf8');
-  const rows = parseCsv(source);
-  const [header, ...body] = rows;
+  const trackerRevision = createHash('sha256').update(source).digest('hex');
+  let rows;
+  try {
+    rows = parseCsv(source);
+  } catch (error) {
+    return {
+      header: [],
+      records: [],
+      trackerRevision,
+      csvErrors: [{ code: 'csv-parse', message: error.message }],
+    };
+  }
+  const [rawHeader, ...body] = rows;
+  const header = rawHeader ?? [];
+  const csvErrors = [];
   if (!header?.includes('TaskID') || !header.includes('Status')) {
-    throw new Error('task_tracker.csv must contain TaskID and Status columns.');
+    csvErrors.push({ code: 'required-columns', message: 'task_tracker.csv must contain TaskID and Status columns.' });
+  }
+  const duplicateColumns = [...new Set(header.filter((name, index) => header.indexOf(name) !== index))];
+  if (duplicateColumns.length) {
+    csvErrors.push({ code: 'duplicate-columns', columns: duplicateColumns, message: `CSV header has duplicate columns: ${duplicateColumns.join(', ')}.` });
   }
   const taskIdIndex = header.indexOf('TaskID');
-  const malformed = body
-    .map((values, index) => ({ line: index + 2, taskId: values[taskIdIndex] || '<missing TaskID>', fieldCount: values.length }))
-    .filter(({ fieldCount }) => fieldCount !== header.length);
-  if (malformed.length) {
-    const details = malformed.map(({ line, taskId, fieldCount }) => `line ${line} (${taskId}: ${fieldCount}/${header.length} fields)`).join(', ');
-    const error = new Error(`Tracker CSV has inconsistent row widths: ${details}. Refusing to read or rewrite it.`);
-    error.statusCode = 422;
-    throw error;
-  }
-  const records = body.map((values) => Object.fromEntries(header.map((name, index) => [name, values[index]])));
+  const wellFormedRows = [];
+  body.forEach((values, index) => {
+    if (values.length !== header.length) {
+      const taskId = taskIdIndex >= 0 ? values[taskIdIndex] || '<missing TaskID>' : '<unknown TaskID>';
+      csvErrors.push({
+        code: 'row-width',
+        line: index + 2,
+        taskId,
+        fieldCount: values.length,
+        expectedFieldCount: header.length,
+        message: `line ${index + 2} (${taskId}: ${values.length}/${header.length} fields)`,
+      });
+      return;
+    }
+    wellFormedRows.push(values);
+  });
+  const records = wellFormedRows.map((values) => Object.fromEntries(header.map((name, index) => [name, values[index]])));
   return {
     header,
     records,
-    trackerRevision: createHash('sha256').update(source).digest('hex'),
+    trackerRevision,
+    csvErrors,
   };
+}
+
+function canonicalCyclePath(path) {
+  const nodes = path.slice(0, -1);
+  const rotations = nodes.map((_, index) => [...nodes.slice(index), ...nodes.slice(0, index)]);
+  rotations.sort((left, right) => left.join('\u0000').localeCompare(right.join('\u0000')));
+  return [...rotations[0], rotations[0][0]];
+}
+
+function validateDependencyGraph(records) {
+  const normalized = records.map((record, rowIndex) => ({ record, rowIndex, taskId: String(record.TaskID ?? '').trim() }));
+  const missingTaskIds = normalized
+    .filter(({ taskId }) => !taskId)
+    .map(({ rowIndex }) => ({ line: rowIndex + 2 }));
+  const ids = new Map();
+  for (const entry of normalized) {
+    if (!entry.taskId) continue;
+    const entries = ids.get(entry.taskId) ?? [];
+    entries.push(entry);
+    ids.set(entry.taskId, entries);
+  }
+  const duplicateTaskIds = [...ids.entries()]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([taskId, entries]) => ({ taskId, lines: entries.map(({ rowIndex }) => rowIndex + 2) }))
+    .sort((left, right) => left.taskId.localeCompare(right.taskId));
+  const uniqueRecords = new Map([...ids.entries()]
+    .filter(([, entries]) => entries.length === 1)
+    .map(([taskId, [entry]]) => [taskId, entry.record]));
+  const unknownDependencies = [];
+  const selfDependencies = [];
+  const duplicateDependencies = [];
+  let edgeCount = 0;
+
+  for (const taskId of [...uniqueRecords.keys()].sort()) {
+    const dependencies = taskDependencies(uniqueRecords.get(taskId));
+    edgeCount += dependencies.length;
+    const dependencyCounts = new Map();
+    for (const dependencyId of dependencies) dependencyCounts.set(dependencyId, (dependencyCounts.get(dependencyId) ?? 0) + 1);
+    const duplicates = [...dependencyCounts.entries()].filter(([, count]) => count > 1).map(([dependencyId]) => dependencyId).sort();
+    if (duplicates.length) duplicateDependencies.push({ taskId, dependencyIds: duplicates });
+    for (const dependencyId of [...new Set(dependencies)].sort()) {
+      if (dependencyId === taskId) {
+        selfDependencies.push(taskId);
+      } else if (!uniqueRecords.has(dependencyId)) {
+        unknownDependencies.push({ taskId, dependencyId });
+      }
+    }
+  }
+
+  const state = new Map();
+  const stack = [];
+  const cycles = [];
+  const seenCycles = new Set();
+  const visit = (taskId) => {
+    state.set(taskId, 'visiting');
+    stack.push(taskId);
+    const dependencies = [...new Set(taskDependencies(uniqueRecords.get(taskId)))].filter((dependencyId) => uniqueRecords.has(dependencyId)).sort();
+    for (const dependencyId of dependencies) {
+      if (state.get(dependencyId) === 'visiting') {
+        const cycle = canonicalCyclePath([...stack.slice(stack.indexOf(dependencyId)), dependencyId]);
+        const key = cycle.join('\u0000');
+        if (!seenCycles.has(key)) {
+          seenCycles.add(key);
+          cycles.push({ taskIds: cycle, path: cycle.join(' -> ') });
+        }
+      } else if (!state.has(dependencyId)) {
+        visit(dependencyId);
+      }
+    }
+    stack.pop();
+    state.set(taskId, 'visited');
+  };
+  for (const taskId of [...uniqueRecords.keys()].sort()) {
+    if (!state.has(taskId)) visit(taskId);
+  }
+  cycles.sort((left, right) => left.path.localeCompare(right.path));
+  const report = {
+    valid: missingTaskIds.length === 0
+      && duplicateTaskIds.length === 0
+      && unknownDependencies.length === 0
+      && selfDependencies.length === 0
+      && duplicateDependencies.length === 0
+      && cycles.length === 0,
+    taskCount: records.length,
+    edgeCount,
+    missingTaskIds,
+    duplicateTaskIds,
+    unknownDependencies,
+    selfDependencies: [...new Set(selfDependencies)].sort(),
+    duplicateDependencies,
+    cycles,
+  };
+  return report;
+}
+
+function dependencyAudit(raw) {
+  const graph = validateDependencyGraph(raw.records);
+  return {
+    ...graph,
+    valid: raw.csvErrors.length === 0 && graph.valid,
+    csvErrors: raw.csvErrors,
+  };
+}
+
+function dependencyAuditMessage(audit) {
+  const issues = [];
+  if (audit.csvErrors.length) issues.push(`${audit.csvErrors.length} CSV structure error(s)`);
+  if (audit.missingTaskIds.length) issues.push(`${audit.missingTaskIds.length} missing TaskID(s)`);
+  if (audit.duplicateTaskIds.length) issues.push(`duplicate TaskID(s): ${audit.duplicateTaskIds.map(({ taskId }) => taskId).join(', ')}`);
+  if (audit.unknownDependencies.length) issues.push(`unknown dependency reference(s): ${audit.unknownDependencies.map(({ taskId, dependencyId }) => `${taskId} -> ${dependencyId}`).join(', ')}`);
+  if (audit.selfDependencies.length) issues.push(`self dependency: ${audit.selfDependencies.join(', ')}`);
+  if (audit.duplicateDependencies.length) issues.push(`duplicate dependency reference(s) on ${audit.duplicateDependencies.map(({ taskId }) => taskId).join(', ')}`);
+  if (audit.cycles.length) issues.push(`dependency cycle(s): ${audit.cycles.map(({ path }) => path).join('; ')}`);
+  return `Tracker dependency audit failed: ${issues.join('; ')}.`;
+}
+
+function assertValidDependencyAudit(audit) {
+  if (audit.valid) return;
+  const error = new Error(dependencyAuditMessage(audit));
+  error.statusCode = 422;
+  error.dependencyAudit = audit;
+  throw error;
+}
+
+async function readTracker() {
+  const raw = await readRawTracker();
+  assertValidDependencyAudit(dependencyAudit(raw));
+  return raw;
 }
 
 async function replaceTracker(header, records) {
   if (!trackerPath) throw new Error('No tracker is configured.');
+  assertValidDependencyAudit(dependencyAudit({ header, records, csvErrors: [] }));
   const existing = await stat(trackerPath);
   const rows = [header, ...records.map((record) => header.map((name) => record[name] ?? ''))];
   const temporaryPath = `${trackerPath}.${randomUUID()}.tmp`;
@@ -772,6 +926,14 @@ async function serveStatic(request, response) {
 const server = createServer(async (request, response) => {
   try {
     const requestPath = new URL(request.url, `http://${request.headers.host}`).pathname;
+    if (request.method === 'GET' && requestPath === '/api/dependency-audit') {
+      const raw = await readRawTracker();
+      sendJson(response, 200, {
+        revision: raw.trackerRevision,
+        ...dependencyAudit(raw),
+      });
+      return;
+    }
     if (request.method === 'GET' && requestPath === '/api/tracker') {
       const { records, trackerRevision } = await readTracker();
       const summaries = await taskRunSummaries(records);
@@ -1447,7 +1609,10 @@ const server = createServer(async (request, response) => {
     }
     response.writeHead(405, { Allow: 'GET, POST', 'X-Content-Type-Options': 'nosniff' }).end();
   } catch (error) {
-    sendJson(response, error.statusCode ?? 500, { error: error.message ?? 'Unexpected server error.' });
+    sendJson(response, error.statusCode ?? 500, {
+      error: error.message ?? 'Unexpected server error.',
+      ...(error.dependencyAudit ? { dependencyAudit: error.dependencyAudit } : {}),
+    });
   }
 });
 
