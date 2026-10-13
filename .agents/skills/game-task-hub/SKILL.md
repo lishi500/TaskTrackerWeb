@@ -21,6 +21,14 @@ TaskTrackerWeb is a lightweight, local task-management companion for **one game 
 
 Do not combine several games into one Tracker instance, and do not embed TaskTrackerWeb inside the game code repository. A Run is execution evidence under one task, not an independent task workflow; never maintain a second task status in the game repository, chat, or a Unity-specific tracker.
 
+## Template and instance boundary
+
+`TaskTrackerWeb` is the reusable template. Generic workflow, API, UI, validation, documentation, Skill and regression-test changes must be made, reviewed and committed in that template first. An instance may then receive an intentional one-way code/Skill/test sync.
+
+Never copy an instance's `tracker/`, `task-hub.config.json`, task IDs, project name/branding, project-specific workflow policy, task records, evidence or local port into the template. Conversely, a template upgrade must not overwrite those instance-owned paths. If a problem is discovered while operating one game, first extract the smallest project-neutral rule and regression test in the template; keep any remaining game-specific policy in that game's repository or Tracker instance.
+
+For an existing instance, first run `node scripts/sync-template.mjs --target <instance>` from the template to inspect the declared shared paths. Apply only with the explicit `--apply` form, then verify the instance. The synchronizer preserves `tracker/` and `task-hub.config.json` and refuses symlinks; never replace those protections with an ad-hoc bulk copy.
+
 ## Create a new Tracker instance
 
 From a new clone of the TaskTrackerWeb template, run:
@@ -45,7 +53,7 @@ This creates a symbolic link, so future updates to this instance's Skill apply i
 ## First read
 
 1. When working on the game, read that game's `AGENTS.md`, then retrieve `GET /api/tasks/<TaskID>/packet`.
-2. When working on TaskTrackerWeb itself, read [README.md](../../../README.md) and [task_hub_product_spec.md](../../../task_hub_product_spec.md).
+2. When working on TaskTrackerWeb itself, read [README.md](../../../README.md) and [task_hub_product_spec.md](../../../task_hub_product_spec.md), then confirm no instance-specific name, task state, port, task-ID convention or project policy is entering the template.
 3. Treat `tracker/task_tracker.csv` in the current Tracker instance as the current-state authority. Never use a copied browser view, chat summary, or another game's CSV as task truth.
 
 ## Operating boundary

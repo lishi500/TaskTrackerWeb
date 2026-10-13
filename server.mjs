@@ -459,6 +459,14 @@ function sendJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
+function publicInstanceMetadata() {
+  const projectName = String(instance.projectName ?? '').trim() || 'Task Tracker';
+  return {
+    projectId: String(instance.projectId ?? '').trim(),
+    projectName,
+  };
+}
+
 function verifyMutationRequest(request) {
   const contentType = request.headers['content-type'] ?? '';
   if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
@@ -926,6 +934,10 @@ async function serveStatic(request, response) {
 const server = createServer(async (request, response) => {
   try {
     const requestPath = new URL(request.url, `http://${request.headers.host}`).pathname;
+    if (request.method === 'GET' && requestPath === '/api/instance') {
+      sendJson(response, 200, publicInstanceMetadata());
+      return;
+    }
     if (request.method === 'GET' && requestPath === '/api/dependency-audit') {
       const raw = await readRawTracker();
       sendJson(response, 200, {

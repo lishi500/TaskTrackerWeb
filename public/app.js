@@ -1,4 +1,4 @@
-const state = { records: [], summary: null, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
+const state = { records: [], summary: null, instance: { projectName: 'Task Tracker' }, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
 const ownerStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation']);
 const activeMilestoneStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation', 'In Progress', 'In Review']);
 const statusOrder = ['In Progress', 'In Review', 'Awaiting Agent Evaluation', 'Awaiting Owner', 'Awaiting Owner Gate', 'Ready', 'Blocked', 'Done', 'Deferred', 'Backlog'];
@@ -19,6 +19,14 @@ function setMessage(message = '', isError = false) {
   const target = document.querySelector('#load-message');
   target.textContent = message;
   target.classList.toggle('error', isError);
+}
+
+function renderInstanceIdentity() {
+  const projectName = state.instance.projectName || 'Task Tracker';
+  document.title = `${projectName} · Task Tracker`;
+  document.querySelector('#instance-heading').textContent = `${projectName} 开发任务看板`;
+  const projectId = state.instance.projectId ? ` · ${state.instance.projectId}` : '';
+  document.querySelector('#instance-eyebrow').textContent = `TASKTRACKERWEB${projectId}`;
 }
 
 function statusBadge(status) {
@@ -315,11 +323,12 @@ function render() {
 
 async function load() {
   try {
-    const [trackerResponse, summaryResponse] = await Promise.all([fetch('/api/tracker'), fetch('/api/summary')]);
-    const tracker = await trackerResponse.json(); const summary = await summaryResponse.json();
+    const [trackerResponse, summaryResponse, instanceResponse] = await Promise.all([fetch('/api/tracker'), fetch('/api/summary'), fetch('/api/instance')]);
+    const tracker = await trackerResponse.json(); const summary = await summaryResponse.json(); const instance = await instanceResponse.json();
     if (!trackerResponse.ok) throw new Error(tracker.error || '无法读取任务数据。');
     if (!summaryResponse.ok) throw new Error(summary.error || '无法读取任务概况。');
-    state.records = tracker.records; state.summary = summary; state.trackerRevision = tracker.revision; render();
+    if (!instanceResponse.ok) throw new Error(instance.error || '无法读取 Tracker 实例信息。');
+    state.records = tracker.records; state.summary = summary; state.instance = instance; state.trackerRevision = tracker.revision; renderInstanceIdentity(); render();
     if (!document.querySelector('#load-message').classList.contains('error')) setMessage(`已读取 ${summary.generatedAt.replace('T', ' ').replace('Z', ' UTC')} 的 CSV 数据。`);
   } catch (error) { setMessage(error.message, true); }
 }

@@ -15,6 +15,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 ## V1 capabilities
 
 - Dashboard with owner actions, current Agent work, a Ready-only claimable-session panel, blockers, run summaries, collapsible milestone groups and a separate all-task table.
+- Instance metadata endpoint: the dashboard receives only the configured public project ID/name for its title; it does not embed a particular game's branding in the reusable template or expose instance task-state paths.
 - Packet API with a task, dependencies, reverse dependencies, prior Runs and the current `trackerRevision`.
 - Same-origin, revision-checked owner feedback that records raw evidence and moves only owner-facing tasks to `Awaiting Agent Evaluation`.
 - Ready-only managed Run lifecycle with monotonic allocation, bounded immutable UTF-8 artifacts, ordered events and crash-recoverable claim/close intents.
@@ -55,6 +56,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 ## API contract
 
 ```text
+GET  /api/instance
 GET  /api/tasks/<TaskID>/packet
 GET  /api/dependency-audit
 POST /api/runs/start

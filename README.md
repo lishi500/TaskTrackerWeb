@@ -6,7 +6,9 @@
 
 - 将通用功能先合并、验证并提交到本模板；
 - 再把模板的代码、文档、Skill 与测试同步到各实例；
-- 不覆盖实例的 `tracker/`、`task-hub.config.json` 或实例特有的 `.agents/` 链接/配置。
+- 不覆盖实例的 `tracker/`、`task-hub.config.json` 或实例特有的 `.agents/` 链接/配置；实例中的任务、Run、证据和项目规则绝不回流到模板。
+
+模板网页不包含任何特定游戏名称或品牌。实例启动时，网页只从自身 `task-hub.config.json` 的 `instance.projectName`/`projectId` 读取显示名称；不要把项目名、TaskID 前缀、玩法规则或实例端口写回模板。
 
 ## 依赖图审计与死锁防护
 
@@ -18,7 +20,7 @@ Hub 将 `DependsOn` 视为一个必须无环的任务图，而不是只在 UI �
 curl http://127.0.0.1:4173/api/dependency-audit
 ```
 
-它始终返回 `200` 和结构化报告，即使 CSV 已不合法；`valid: false` 时检查 `csvErrors`、`unknownDependencies`、`selfDependencies`、`duplicateTaskIds`、`duplicateDependencies` 与 `cycles`。每个环会以稳定的 TaskID 路径表示，例如 `CORE-001 -> CORE-002 -> CORE-003 -> CORE-001`。普通 API 读取和所有写入则拒绝这类 CSV，并在 `422` 响应中附同一份 `dependencyAudit`，防止图错误演变为无提示的等待死锁。
+它始终返回 `200` 和结构化报告，即使 CSV 已不合法；`valid: false` 时检查 `csvErrors`、`unknownDependencies`、`selfDependencies`、`duplicateTaskIds`、`duplicateDependencies` 与 `cycles`。每个环会以稳定的 TaskID 路径表示，例如 `TASK-001 -> TASK-002 -> TASK-003 -> TASK-001`。普通 API 读取和所有写入则拒绝这类 CSV，并在 `422` 响应中附同一份 `dependencyAudit`，防止图错误演变为无提示的等待死锁。
 
 CSV 仍应只由 Hub 写入。外部批量迁移或人工维护不可避免时，在开始服务操作前、以及新增/删除任务或修改 `DependsOn` 后各执行一次审计；先修复报告的问题，再继续工作流。
 
@@ -36,6 +38,17 @@ node scripts/start.mjs
 ```bash
 node scripts/link-game-skill.mjs /absolute/path/to/game-repository
 ```
+
+## 升级既有实例
+
+模板先完成并验证通用改动后，先对既有实例做无写入检查，再由明确的 `--apply` 同步。同步器只处理声明的模板代码、网页、文档、Skill、测试和 skeleton；它绝不写入 `tracker/` 或 `task-hub.config.json`，遇到目标 symlink 会拒绝操作。
+
+```bash
+node scripts/sync-template.mjs --target /absolute/path/to/existing-game-tracker
+node scripts/sync-template.mjs --target /absolute/path/to/existing-game-tracker --apply
+```
+
+同步后在实例仓库运行其测试，并按需要重启本地服务。实例的 Git 提交策略、任务状态和证据仍由该实例单独管理；不要把它们合入模板仓库。
 
 ## 状态、Run 与审查
 
@@ -68,6 +81,7 @@ node --check public/app.js
 node scripts/test-managed-runs.mjs
 node scripts/test-serial-lane.mjs
 node scripts/test-dependency-audit.mjs
+node scripts/test-template-sync.mjs
 ```
 
 三项测试均使用临时 CSV，不会写当前实例的 Tracker；后两项分别验证单线自动 arm/推进与跳过中间任务 admission 拒绝、依赖图审计和坏图拒绝。

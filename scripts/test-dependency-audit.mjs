@@ -46,6 +46,11 @@ async function request(path, options = {}) {
 }
 
 try {
+  const instance = await request('/api/instance');
+  assert.equal(instance.response.status, 200);
+  assert.equal(typeof instance.body.projectName, 'string');
+  assert.equal(Object.hasOwn(instance.body, 'tracker'), false);
+
   const valid = await request('/api/dependency-audit');
   assert.equal(valid.response.status, 200);
   assert.equal(valid.body.valid, true);
