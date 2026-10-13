@@ -19,6 +19,7 @@ const sharedPaths = [
   'scripts/test-serial-lane.mjs',
   'scripts/test-dependency-audit.mjs',
   'scripts/sync-template.mjs',
+  'scripts/test-template-sync.mjs',
   'templates',
   '.agents/skills/game-task-hub',
 ];
