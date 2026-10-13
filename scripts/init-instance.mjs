@@ -27,7 +27,7 @@ try { await access(trackerPath, constants.F_OK); } catch (error) { if (error.cod
 if (trackerExists) throw new Error(`${trackerPath} already exists; refusing to overwrite an instance.`);
 
 await mkdir(trackerDir, { recursive: true });
-await writeFile(configPath, `${JSON.stringify({ version: 1, instance: { projectId, projectName: projectName.trim(), tracker: 'tracker/task_tracker.csv', mode: 'managed-csv' } }, null, 2)}\n`);
+await writeFile(configPath, `${JSON.stringify({ version: 1, instance: { projectId, projectName: projectName.trim(), tracker: 'tracker/task_tracker.csv', mode: 'managed-csv' }, workflow: { serialLane: true, ownerGateTaskPattern: '^GATE-' } }, null, 2)}\n`);
 await copyFile(templatePath, trackerPath);
 await writeFile(join(trackerDir, 'task_events.jsonl'), '');
 await mkdir(join(trackerDir, 'task-records'), { recursive: true });

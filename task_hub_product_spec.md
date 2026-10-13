@@ -22,6 +22,8 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - Pre-claim block endpoint for a contradictory/incomplete Ready packet; it records evidence but creates no Run.
 - Generic dependency-unblock endpoint for unclaimed Blocked tasks whose direct dependencies are all Done. It does not encode project-specific Gate, release, decision or milestone policy.
 - Generic park/admit endpoints: `Blocked -> Backlog` removes future unscheduled work from active blocker monitoring; `Backlog -> Ready|Blocked` explicitly admits a task into the near-term chain without inferring milestone policy.
+- Optional serial-lane controller (enabled by default for new instances): one Agent task may be `Ready`/`In Progress`/`In Review`; starting it arms only its unique direct successor, and a completed task advances only one uniquely eligible successor. Ambiguous fan-out remains `Backlog` for explicit coordinator admission.
+- Controlled owner-evaluation endpoint: raw owner feedback remains `Awaiting Agent Evaluation` until an Agent records an auditable resolution for a non-review owner task.
 - Repository-relative text artifact paths such as `logs/editor.log`; binary or large evidence remains a repository/HTTPS reference rather than an upload.
 
 ## Workflow safety rules
@@ -32,7 +34,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - Only the explicit review decision endpoint may set `Done`, and only after a distinct reviewer has claimed the In Review task. It does not unlock dependents.
 - An interrupted pre-CSV claim is terminally `Abandoned` and reserves its Run ID. A close-intent is reconciled before later Run/review work so an `In Review` task with an unresolved active Run cannot be approved.
 - The generic unblock endpoint proves only dependency completion plus absence of an active claim. A completed blocked Run may retain its historical `Implementer`; it is not an active claim, and a successful unblock clears that stale attribution before returning `Ready`. A project coordinator remains responsible for its own Gate/release/decision policy before invoking it.
-- `Blocked` is an active execution obstruction with a concrete blocker; `Backlog` is planned but not yet admitted work. Future-milestone gating alone belongs in `Backlog`, not `Blocked`. Park/admit operations require a current revision, a named Agent and reason, reject active Runs/review claims, and preserve an append-only Evidence line. Admission to `Ready` additionally verifies direct dependencies are Done; admission to `Blocked` requires a concrete blocker.
+- `Blocked` is an active execution obstruction with a concrete blocker; `Backlog` is planned but not yet admitted work. Future-milestone gating alone belongs in `Backlog`, not `Blocked`. With `workflow.serialLane=true`, an admitted `Blocked` task must be the unique immediate successor of an `In Progress`/`In Review` predecessor; later chain tasks remain `Backlog`. Park/admit operations require a current revision, a named Agent and reason, reject active Runs/review claims, and preserve an append-only Evidence line. Admission to `Ready` additionally verifies direct dependencies are Done and the lane is empty.
 - The Hub refuses malformed CSV row widths and binds to loopback. LAN exposure, authentication, remote databases and binary uploads are out of scope.
 
 ## Acceptance
@@ -44,7 +46,8 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 5. A verified Run becomes `In Review`; a self-review or review with an active Run is rejected; only a claimed independent review can approve to `Done`.
 6. Claim and close interruption recovery is deterministic and never reuses an allocated Run ID.
 7. Generic pre-claim block and dependency-unblock transitions retain evidence but do not silently apply game-specific workflow policy.
-8. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs` verifies the Run/review/unblock contract in an isolated temporary Tracker.
+8. Serial mode exposes at most one active Agent task and only one armed successor; ambiguous branches and future work remain Backlog.
+9. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs` and `node scripts/test-serial-lane.mjs` verify isolated Run/review and serial-transition contracts.
 
 ## API contract
 
@@ -59,7 +62,8 @@ POST /api/tasks/<TaskID>/block
 POST /api/tasks/<TaskID>/unblock
 POST /api/tasks/<TaskID>/park
 POST /api/tasks/<TaskID>/admit
+POST /api/tasks/<TaskID>/owner-evaluation
 POST /api/feedback
 ```
 
-`/close` takes `outcome`, `summary`, current `trackerRevision`, and `blocker` for `blocked`. For `awaiting-human`, it additionally takes `ownerStatus` exactly equal to `Awaiting Owner` or `Awaiting Owner Gate`. `/review` first takes `{ action: "claim", reviewer }`, then `{ action: "decision", reviewer, decision, notes }`; a blocked decision also needs `blocker`. `/unblock` requires `agent` and a concrete `reason`; callers must perform project-specific eligibility checks before using it.
+`/close` takes `outcome`, `summary`, current `trackerRevision`, and `blocker` for `blocked`. For `awaiting-human`, it additionally takes `ownerStatus` exactly equal to `Awaiting Owner` or `Awaiting Owner Gate`. `/review` first takes `{ action: "claim", reviewer }`, then `{ action: "decision", reviewer, decision, notes }`; a blocked decision also needs `blocker`. `/unblock` requires `agent` and a concrete `reason`; callers must perform project-specific eligibility checks before using it. `/owner-evaluation` accepts `agent`, `decision` (`approved`, `blocked`, `deferred`, `return-to-owner`) and evidence-bearing `notes`; it is only available after owner feedback for `ReviewRequired=No` tasks.

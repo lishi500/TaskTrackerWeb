@@ -5,5 +5,9 @@
     "projectName": "Uninitialized tracker instance",
     "tracker": "tracker/task_tracker.csv",
     "mode": "managed-csv"
+  },
+  "workflow": {
+    "serialLane": true,
+    "ownerGateTaskPattern": "^GATE-"
   }
 }

@@ -19,6 +19,11 @@ const taskRecordsDir = trackerPath ? join(dirname(trackerPath), 'task-records') 
 const port = Number(process.env.PORT ?? 4173);
 const host = process.env.HOST ?? '127.0.0.1';
 let activePort = port;
+const workflow = config.workflow ?? {};
+const serialLaneEnabled = process.env.TASK_HUB_SERIAL_LANE
+  ? process.env.TASK_HUB_SERIAL_LANE === 'true'
+  : workflow.serialLane === true;
+const ownerGateTaskPattern = new RegExp(workflow.ownerGateTaskPattern ?? '^GATE-');
 const ownerInputStatuses = new Set([
   'Awaiting Owner',
   'Awaiting Owner Gate',
@@ -197,6 +202,97 @@ function summarize(records) {
     currentWork,
     blockers,
   };
+}
+
+const serialLaneStatuses = new Set(['Ready', 'In Progress', 'In Review']);
+
+function isAgentTask(record) {
+  return String(record.ReviewRequired ?? '').trim().toLowerCase() === 'yes';
+}
+
+function serialLaneOccupants(records, excludedTaskId = '') {
+  if (!serialLaneEnabled) return [];
+  return records.filter((record) => record.TaskID !== excludedTaskId && isAgentTask(record) && serialLaneStatuses.has(record.Status));
+}
+
+function assertSerialLaneAvailable(records, taskId) {
+  const occupants = serialLaneOccupants(records, taskId);
+  if (!occupants.length) return;
+  const error = new Error(`Serial lane is occupied by ${occupants.map(({ TaskID, Status }) => `${TaskID} (${Status})`).join(', ')}. Finish/review it before admitting or claiming another Agent task.`);
+  error.statusCode = 409;
+  throw error;
+}
+
+function dependenciesOtherThan(record, taskId) {
+  return taskDependencies(record).filter((dependencyId) => dependencyId !== taskId);
+}
+
+function allDependenciesDone(records, record) {
+  return taskDependencies(record).every((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status === 'Done');
+}
+
+function armedMarker(taskId) {
+  return `ARMED: waiting for active predecessor ${taskId};`;
+}
+
+function isArmedBy(record, taskId) {
+  return record.Status === 'Blocked' && record.Evidence?.includes(armedMarker(taskId));
+}
+
+function appendEvidence(record, line) {
+  record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
+}
+
+function armImmediateSuccessor(records, predecessor, timestamp) {
+  if (!serialLaneEnabled || !isAgentTask(predecessor) || !['In Progress', 'In Review'].includes(predecessor.Status)) return [];
+  const candidates = records.filter((record) => record.Status === 'Backlog'
+    && taskDependencies(record).includes(predecessor.TaskID)
+    && dependenciesOtherThan(record, predecessor.TaskID).every((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status === 'Done'));
+  if (candidates.length !== 1) return [];
+  const candidate = candidates[0];
+  candidate.Status = 'Blocked';
+  candidate.Blocker = `Waiting for active predecessor ${predecessor.TaskID} (${predecessor.Status}).`;
+  candidate.Updated = timestamp;
+  appendEvidence(candidate, `${armedMarker(predecessor.TaskID)} ${timestamp}; automatic serial-lane admission.`);
+  return [candidate.TaskID];
+}
+
+function disarmImmediateSuccessor(records, predecessor, timestamp, reason) {
+  if (!serialLaneEnabled) return [];
+  const candidates = records.filter((record) => isArmedBy(record, predecessor.TaskID));
+  for (const candidate of candidates) {
+    candidate.Status = 'Backlog';
+    candidate.Blocker = '';
+    candidate.Implementer = '';
+    candidate.Updated = timestamp;
+    appendEvidence(candidate, `DISARMED: ${predecessor.TaskID}; ${timestamp}; ${reason}`);
+  }
+  return candidates.map(({ TaskID }) => TaskID);
+}
+
+function ownerWaitStatus(record) {
+  return ownerGateTaskPattern.test(record.TaskID) ? 'Awaiting Owner Gate' : 'Awaiting Owner';
+}
+
+function advanceImmediateSuccessor(records, predecessor, timestamp) {
+  if (!serialLaneEnabled || predecessor.Status !== 'Done') return [];
+  const candidates = records.filter((record) => (record.Status === 'Backlog' || isArmedBy(record, predecessor.TaskID))
+    && taskDependencies(record).includes(predecessor.TaskID)
+    && allDependenciesDone(records, record));
+  if (candidates.length !== 1) return [];
+  const candidate = candidates[0];
+  if (isAgentTask(candidate)) {
+    if (serialLaneOccupants(records, candidate.TaskID).length) return [];
+    candidate.Status = 'Ready';
+    candidate.Blocker = '';
+    candidate.Implementer = '';
+  } else {
+    candidate.Status = ownerWaitStatus(candidate);
+    candidate.Blocker = 'Dependencies complete; owner action is required before workflow can continue.';
+  }
+  candidate.Updated = timestamp;
+  appendEvidence(candidate, `AUTO-ADVANCED: ${predecessor.TaskID} Done -> ${candidate.Status}; ${timestamp}; automatic serial-lane transition.`);
+  return [candidate.TaskID];
 }
 
 function sendJson(response, statusCode, payload) {
@@ -766,6 +862,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 409;
           throw error;
         }
+        assertSerialLaneAvailable(records, taskId);
         const dependencies = taskDependencies(record);
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) {
@@ -802,6 +899,7 @@ const server = createServer(async (request, response) => {
         const claimEvidence = `CLAIM: ${agent} ${timestamp}; managed Run ${runId}.`;
         record.Evidence = record.Evidence ? `${record.Evidence}\n${claimEvidence}` : claimEvidence;
         record.Updated = timestamp;
+        armImmediateSuccessor(records, record, timestamp);
         const claimIntent = {
           taskId,
           runId,
@@ -964,6 +1062,9 @@ const server = createServer(async (request, response) => {
         } else {
           currentRecord.Status = 'In Progress';
         }
+        if (['blocked', 'awaiting-human'].includes(outcome)) {
+          disarmImmediateSuccessor(current.records, currentRecord, timestamp, `predecessor Run closed as ${outcome}`);
+        }
         currentRecord.Evidence = currentRecord.Evidence ? `${currentRecord.Evidence}\nRUN ${runId} ${outcome}: ${summary}` : `RUN ${runId} ${outcome}: ${summary}`;
         currentRecord.Updated = timestamp;
           const runClosure = {
@@ -1075,15 +1176,18 @@ const server = createServer(async (request, response) => {
           record.Status = 'Done';
           record.Blocker = '';
           record.ReviewClaim = '';
+          advanceImmediateSuccessor(records, record, timestamp);
         } else if (decision === 'blocked') {
           record.Status = 'Blocked';
           record.Blocker = reviewBlocker;
           record.ReviewClaim = '';
+          disarmImmediateSuccessor(records, record, timestamp, 'predecessor review is blocked');
         } else {
           record.Status = 'Ready';
           record.Implementer = '';
           record.ReviewClaim = '';
           record.Blocker = '';
+          disarmImmediateSuccessor(records, record, timestamp, 'predecessor review returned to Ready');
         }
         await replaceTracker(header, records);
         const after = await readTracker();
@@ -1152,6 +1256,7 @@ const server = createServer(async (request, response) => {
         if (!dependencies.length) { const error = new Error(`Cannot dependency-unblock ${taskId}; it has no dependencies.`); error.statusCode = 409; throw error; }
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) { const error = new Error(`Cannot unblock ${taskId}; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error; }
+        assertSerialLaneAvailable(records, taskId);
         const timestamp = new Date().toISOString();
         // A completed blocked Run may retain Implementer for historical attribution.
         // Its Run is no longer an active claim; successful maintenance clears that
@@ -1230,6 +1335,15 @@ const server = createServer(async (request, response) => {
         if (targetStatus === 'Ready' && unfinished.length) {
           const error = new Error(`Cannot admit ${taskId} as Ready; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error;
         }
+        if (targetStatus === 'Ready') {
+          assertSerialLaneAvailable(records, taskId);
+        } else if (serialLaneEnabled) {
+          const activeDependencies = dependencies.filter((dependencyId) => ['In Progress', 'In Review'].includes(records.find(({ TaskID }) => TaskID === dependencyId)?.Status));
+          const otherUnfinished = dependencies.filter((dependencyId) => dependencyId !== activeDependencies[0] && records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
+          if (activeDependencies.length !== 1 || otherUnfinished.length) {
+            const error = new Error(`A serial-lane Blocked admission requires exactly one active direct predecessor and all other dependencies Done. ${taskId} is not the immediate successor.`); error.statusCode = 409; throw error;
+          }
+        }
         const timestamp = new Date().toISOString();
         record.Status = targetStatus; record.Blocker = targetStatus === 'Blocked' ? blocker : ''; record.Implementer = ''; record.Updated = timestamp;
         const line = `ADMITTED: Backlog -> ${targetStatus}; ${timestamp}; ${agent}; ${reason}`;
@@ -1241,9 +1355,55 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, result);
       return;
     }
+    const ownerEvaluationMatch = /^\/api\/tasks\/([^/]+)\/owner-evaluation$/.exec(requestPath);
+    if (request.method === 'POST' && ownerEvaluationMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(ownerEvaluationMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const decision = String(body.decision ?? '').trim();
+      const notes = String(body.notes ?? '').trim();
+      const blocker = String(body.blocker ?? '').trim();
+      if (!['approved', 'blocked', 'deferred', 'return-to-owner'].includes(decision) || !notes || notes.length > 8_000 || (decision === 'blocked' && (!blocker || blocker.length > 4_000))) {
+        sendJson(response, 400, { error: 'decision must be approved, blocked, deferred or return-to-owner with notes; blocked also requires a concrete blocker.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (record.Status !== 'Awaiting Agent Evaluation' || isAgentTask(record)) {
+          const error = new Error(`Only a non-review owner task in Awaiting Agent Evaluation can be resolved. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        if (decision === 'approved') {
+          record.Status = 'Done';
+          record.Blocker = '';
+        } else if (decision === 'blocked') {
+          record.Status = 'Blocked';
+          record.Blocker = blocker;
+        } else if (decision === 'deferred') {
+          record.Status = 'Deferred';
+          record.Blocker = '';
+        } else {
+          record.Status = ownerWaitStatus(record);
+          record.Blocker = blocker || 'Owner response requires a further explicit action.';
+        }
+        record.Updated = timestamp;
+        appendEvidence(record, `OWNER EVALUATION ${decision}: ${agent} ${timestamp}; ${notes}`);
+        if (decision === 'approved') advanceImmediateSuccessor(records, record, timestamp);
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
     if (request.method === 'POST' && requestPath === '/api/feedback') {
       verifyMutationRequest(request);
-      const { taskId, feedback } = await readJson(request);
+      const body = await readJson(request);
+      const { taskId, feedback } = body;
       const normalizedTaskId = String(taskId ?? '').trim();
       const normalizedFeedback = String(feedback ?? '').trim();
       if (!normalizedTaskId || !normalizedFeedback) {

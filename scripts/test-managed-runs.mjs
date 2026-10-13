@@ -37,6 +37,7 @@ const child = spawn(process.execPath, ['server.mjs'], {
     TASK_HUB_TEST_FAIL_CLAIM_TASK: 'TEST-004',
     TASK_HUB_TEST_FAIL_CLAIM_AFTER_TRACKER: '1',
     TASK_HUB_TEST_FAIL_CLAIM_AFTER_TRACKER_TASK: 'TEST-005',
+    TASK_HUB_SERIAL_LANE: 'false',
     PORT: '0',
     HOST: '127.0.0.1',
     TRACKER_CSV: trackerPath,
