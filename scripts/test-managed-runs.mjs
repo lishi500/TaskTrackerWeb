@@ -224,6 +224,51 @@ try {
   assert.equal(reviewDecision.response.status, 200);
   assert.equal(reviewDecision.body.task.Status, 'Done');
 
+  const createPacket = await request('/api/tasks/TEST-001/packet');
+  const rejectedCreation = await request('/api/tasks', mutation({
+    trackerRevision: createPacket.body.trackerRevision,
+    agent: 'scheduler-agent',
+    reason: 'This fixture proves graph validation still protects a creation mutation.',
+    newTask: {
+      taskId: 'TEST-CREATE-BAD', parentId: '', milestone: 'M0', workstream: 'Test',
+      task: 'Invalid planned task', specRef: 'README.md', dependsOn: 'MISSING-001',
+      ownerRole: 'Agent', priority: 'P0', acceptance: 'Must never enter the CSV.', reviewRequired: 'Yes',
+    },
+  }));
+  assert.equal(rejectedCreation.response.status, 422);
+  const created = await request('/api/tasks', mutation({
+    trackerRevision: createPacket.body.trackerRevision,
+    agent: 'scheduler-agent',
+    reason: 'A discovered repair must become an auditable planned task before it can be admitted.',
+    newTask: {
+      taskId: 'TEST-CREATE-001', parentId: '', milestone: 'M0', workstream: 'Test',
+      task: 'Create a planned remediation task', specRef: 'README.md', dependsOn: 'TEST-001',
+      ownerRole: 'Agent', priority: 'P0', acceptance: 'Starts as Backlog and requires normal admission.', reviewRequired: 'Yes',
+    },
+  }));
+  assert.equal(created.response.status, 201);
+  assert.equal(created.body.task.Status, 'Backlog');
+  assert.match(created.body.task.Evidence, /CREATED: scheduler-agent/);
+  const duplicateCreation = await request('/api/tasks', mutation({
+    trackerRevision: created.body.trackerRevision,
+    agent: 'scheduler-agent',
+    reason: 'This must reject duplicate Task IDs.',
+    newTask: {
+      taskId: 'TEST-CREATE-001', parentId: '', milestone: 'M0', workstream: 'Test',
+      task: 'Duplicate planned task', specRef: 'README.md', dependsOn: '',
+      ownerRole: 'Agent', priority: 'P0', acceptance: 'Must not replace the existing task.', reviewRequired: 'Yes',
+    },
+  }));
+  assert.equal(duplicateCreation.response.status, 409);
+  const createdPacket = await request('/api/tasks/TEST-CREATE-001/packet');
+  const admittedCreated = await request('/api/tasks/TEST-CREATE-001/admit', mutation({
+    trackerRevision: createdPacket.body.trackerRevision,
+    agent: 'scheduler-agent', targetStatus: 'Ready',
+    reason: 'The planned task has a completed dependency and is deliberately admitted to the execution lane.',
+  }));
+  assert.equal(admittedCreated.response.status, 200);
+  assert.equal(admittedCreated.body.task.Status, 'Ready');
+
   const normalPacket = await request('/api/tasks/TEST-003/packet');
   const normalStart = await request('/api/runs/start', mutation({
     taskId: 'TEST-003',

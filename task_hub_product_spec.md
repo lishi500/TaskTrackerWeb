@@ -27,6 +27,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - Optional serial-lane controller (enabled by default for new instances): one Agent task may be `Ready`/`In Progress`/`In Review`; starting it arms only its unique direct successor, and a completed task advances only one uniquely eligible successor. Ambiguous fan-out remains `Backlog` for explicit coordinator admission.
 - Controlled owner-evaluation endpoint: raw owner feedback remains `Awaiting Agent Evaluation` until an Agent records an auditable resolution for a non-review owner task.
 - Controlled task-contract revision endpoint: an inactive unclaimed planned task may replace its `Task`, `SpecRef` and `Acceptance` together with a named Agent and reason, preserving history without permitting silent post-hoc reinterpretation.
+- Controlled planned-task creation endpoint: a named Agent may add a complete, auditable `Backlog` task with a creation reason. The Hub validates the full proposed dependency graph atomically; creation never exposes a task as `Ready` or fabricates execution/review history.
 - Repository-relative text artifact paths such as `logs/editor.log`; binary or large evidence remains a repository/HTTPS reference rather than an upload.
 - Dependency-graph audit endpoint: a deterministic, read-only report catches unknown or duplicate Task IDs, missing references, self/duplicate dependencies and dependency cycles before they become scheduling deadlocks.
 
@@ -43,6 +44,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - The Hub refuses malformed CSV row widths and binds to loopback. LAN exposure, authentication, remote databases and binary uploads are out of scope.
 - Every Hub mutation validates the current dependency graph before it changes workflow state; its shared atomic replacement path also validates the proposed post-mutation graph. This is mandatory for current state mutations and for any future add/delete/DependsOn-edit endpoint. An invalid graph returns `422` without replacing the CSV. `GET /api/dependency-audit` intentionally remains readable and returns `200` with `valid: false` and all detected errors, so external CSV edits can be diagnosed without bypassing the source-of-truth boundary.
 - A task-contract revision is not a workflow shortcut: it accepts only `Backlog`, `Ready` or `Blocked` tasks with no active Run or review claim; it replaces the complete `Task`/`SpecRef`/`Acceptance` trio, requires at least one changed field and appends an auditable Evidence line. It cannot change a task's status, dependency graph, owner role, priority or review history. A completed or actively reviewed contract requires a distinct remediation task instead of revision.
+- A planned-task creation is not an admission shortcut: it requires the standard 18-column tracker schema, a unique safe Task ID, complete task contract and named creation reason; its only initial status is `Backlog`. Unknown dependencies, duplicate Task IDs and dependency cycles fail the atomic mutation. A coordinator must separately apply project Gate policy and use `/admit` before the task can be claimed.
 
 ## Acceptance
 
@@ -57,6 +59,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 9. A dependency audit identifies malformed CSV structure, unknown/self/duplicate dependencies, duplicate Task IDs and deterministic cycle paths; normal reads and mutations reject an invalid graph without modifying it.
 10. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs`, `node scripts/test-serial-lane.mjs` and `node scripts/test-dependency-audit.mjs` verify isolated Run/review, serial-transition and dependency-integrity contracts.
 11. A contract revision rejects incomplete, unchanged, claimed or active-task edits; an allowed revision atomically retains status/history while recording the complete changed contract and reason.
+12. Planned-task creation preserves a valid dependency graph, starts only in `Backlog`, records provenance and remains subject to normal admission.
 
 ## API contract
 
@@ -64,6 +67,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 GET  /api/instance
 GET  /api/tasks/<TaskID>/packet
 GET  /api/dependency-audit
+POST /api/tasks
 POST /api/runs/start
 POST /api/tasks/<TaskID>/runs/<RunID>/events
 POST /api/tasks/<TaskID>/runs/<RunID>/artifacts
@@ -84,3 +88,5 @@ POST /api/feedback
 `/owner-wait` accepts `authorityTaskId`, `agent`, `ownerStatus` (`Awaiting Owner` or `Awaiting Owner Gate`) and an evidence-bearing `reason`. The target must be unclaimed, non-review `Backlog`; the authority must be its direct `In Progress` dependency and have an active Run claimed by the same Agent. It records the explicit transition only and never marks either task Done.
 
 `/contract` accepts the current `trackerRevision`, `agent`, `reason` and a complete replacement `{ task, specRef, acceptance }`. It is allowed only for an inactive unclaimed `Backlog`, `Ready` or `Blocked` task and must change at least one of those three fields. It records which fields changed but preserves task state, dependencies and historical Evidence.
+
+`POST /api/tasks` accepts the current `trackerRevision`, `agent`, `reason` and `newTask`: `{ taskId, parentId?, milestone, workstream, task, specRef, dependsOn, ownerRole, priority, acceptance, reviewRequired }`. The server derives all workflow fields, creates only `Backlog`, records `CREATED` provenance, and atomically rejects malformed schema, duplicate IDs or an invalid proposed dependency graph. The caller must use normal `/admit` after applying project-specific eligibility rules.

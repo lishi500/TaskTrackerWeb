@@ -29,6 +29,12 @@ const ownerInputStatuses = new Set([
   'Awaiting Owner Gate',
   'Awaiting Agent Evaluation',
 ]);
+const taskCreationColumns = [
+  'TaskID', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef',
+  'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance',
+  'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated',
+  'ReviewClaim', 'Reviewer',
+];
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -507,6 +513,68 @@ function taskDependencies(record) {
   return String(record.DependsOn ?? '').split(';').map((value) => value.trim()).filter(Boolean);
 }
 
+function requireTaskCreationColumns(header) {
+  const missing = taskCreationColumns.filter((column) => !header.includes(column));
+  if (!missing.length) return;
+  const error = new Error(`Task creation requires the standard tracker columns. Missing: ${missing.join(', ')}.`);
+  error.statusCode = 422;
+  throw error;
+}
+
+function creationText(value, label, { required = false, maxLength = 4_000 } = {}) {
+  const text = String(value ?? '').trim();
+  if ((required && !text) || text.length > maxLength || /[\r\n]/.test(text)) {
+    const qualifier = required ? 'is required' : 'is optional';
+    const error = new Error(`${label} ${qualifier}, must be at most ${maxLength} characters and cannot contain a line break.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return text;
+}
+
+function newTaskRecord(header, body, timestamp) {
+  const agent = reviewerIdentity(body.agent);
+  const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
+  const candidate = body.newTask;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    const error = new Error('newTask must be an object containing the complete planned-task contract.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const taskId = safePathSegment(candidate.taskId, 'Task ID');
+  const parentId = creationText(candidate.parentId, 'parentId', { maxLength: 128 });
+  if (parentId) safePathSegment(parentId, 'Parent ID');
+  const dependsOn = creationText(candidate.dependsOn, 'dependsOn', { maxLength: 4_000 });
+  for (const dependencyId of dependsOn.split(';').map((value) => value.trim()).filter(Boolean)) safePathSegment(dependencyId, 'Dependency Task ID');
+  const reviewRequired = creationText(candidate.reviewRequired, 'reviewRequired', { required: true, maxLength: 3 });
+  if (!['Yes', 'No'].includes(reviewRequired)) {
+    const error = new Error('reviewRequired must be exactly Yes or No.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const values = {
+    TaskID: taskId,
+    ParentID: parentId,
+    Milestone: creationText(candidate.milestone, 'milestone', { required: true, maxLength: 256 }),
+    Workstream: creationText(candidate.workstream, 'workstream', { required: true, maxLength: 256 }),
+    Task: creationText(candidate.task, 'task', { required: true, maxLength: 4_000 }),
+    SpecRef: creationText(candidate.specRef, 'specRef', { required: true, maxLength: 4_000 }),
+    DependsOn: dependsOn,
+    OwnerRole: creationText(candidate.ownerRole, 'ownerRole', { required: true, maxLength: 256 }),
+    Status: 'Backlog',
+    Priority: creationText(candidate.priority, 'priority', { required: true, maxLength: 64 }),
+    Acceptance: creationText(candidate.acceptance, 'acceptance', { required: true, maxLength: 8_000 }),
+    ReviewRequired: reviewRequired,
+    Blocker: '',
+    Implementer: '',
+    Evidence: `CREATED: ${agent} ${timestamp}; ${reason}`,
+    Updated: timestamp,
+    ReviewClaim: '',
+    Reviewer: '',
+  };
+  return Object.fromEntries(header.map((column) => [column, values[column] ?? '']));
+}
+
 function safePathSegment(value, label) {
   const normalized = String(value ?? '').trim();
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(normalized)) {
@@ -958,6 +1026,28 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && requestPath === '/api/summary') {
       const { records, trackerRevision } = await readTracker();
       sendJson(response, 200, { ...summarize(records), revision: trackerRevision });
+      return;
+    }
+    if (request.method === 'POST' && requestPath === '/api/tasks') {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        requireTaskCreationColumns(header);
+        const timestamp = new Date().toISOString();
+        const record = newTaskRecord(header, body, timestamp);
+        if (records.some(({ TaskID }) => TaskID === record.TaskID)) {
+          const error = new Error(`Task '${record.TaskID}' already exists.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        records.push(record);
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === record.TaskID), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 201, result);
       return;
     }
     const packetMatch = /^\/api\/tasks\/([^/]+)\/packet$/.exec(requestPath);
