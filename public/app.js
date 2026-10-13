@@ -253,6 +253,27 @@ function renderOwnerActions() {
   }
 }
 
+function renderClaimableSessions() {
+  const target = document.querySelector('#claimable-sessions'); target.replaceChildren();
+  const claimable = state.records.filter((task) => task.Status === 'Ready');
+  if (!claimable.length) {
+    target.append(element('p', 'empty-state', '当前没有可领取的任务。'));
+    return;
+  }
+  for (const task of [...claimable].sort((left, right) => milestoneCompare(left.Milestone, right.Milestone) || (left.Priority || '').localeCompare(right.Priority || '') || left.TaskID.localeCompare(right.TaskID))) {
+    const card = element('article', 'action-card claimable-card');
+    card.append(statusBadge(task.Status)); card.append(renderTaskLink(task));
+    const metadata = [task.Milestone || '未归属'];
+    if (task.Priority) metadata.push(task.Priority);
+    if (task.DependsOn) metadata.push(`依赖 ${task.DependsOn.split(';').filter(Boolean).length} 项`);
+    card.append(element('p', 'muted', metadata.join(' · ')));
+    if (task.Acceptance) card.append(element('p', 'claimable-acceptance', `验收：${task.Acceptance}`));
+    const action = element('button', 'secondary-button', '查看领取条件');
+    action.type = 'button'; action.addEventListener('click', () => openTask(task.TaskID)); card.append(action);
+    target.append(card);
+  }
+}
+
 function renderCompactList(selector, tasks, emptyText) {
   const target = document.querySelector(selector); target.replaceChildren();
   if (!tasks.length) { target.append(element('p', 'empty-state', emptyText)); return; }
@@ -287,6 +308,7 @@ function render() {
   renderOwnerActions();
   renderCompactList('#current-work', state.summary.currentWork, '当前没有 Agent 正在处理的任务。');
   renderCompactList('#blockers', state.summary.blockers, '当前没有受阻任务。');
+  renderClaimableSessions();
   renderMilestones();
   renderTable();
 }

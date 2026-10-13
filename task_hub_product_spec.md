@@ -14,7 +14,7 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 
 ## V1 capabilities
 
-- Dashboard with owner actions, current Agent work, blockers, run summaries, collapsible milestone groups and a separate all-task table.
+- Dashboard with owner actions, current Agent work, a Ready-only claimable-session panel, blockers, run summaries, collapsible milestone groups and a separate all-task table.
 - Packet API with a task, dependencies, reverse dependencies, prior Runs and the current `trackerRevision`.
 - Same-origin, revision-checked owner feedback that records raw evidence and moves only owner-facing tasks to `Awaiting Agent Evaluation`.
 - Ready-only managed Run lifecycle with monotonic allocation, bounded immutable UTF-8 artifacts, ordered events and crash-recoverable claim/close intents.
