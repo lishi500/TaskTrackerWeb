@@ -1166,6 +1166,81 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, result);
       return;
     }
+    const parkMatch = /^\/api\/tasks\/([^/]+)\/park$/.exec(requestPath);
+    if (request.method === 'POST' && parkMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(parkMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const reason = String(body.reason ?? '').trim();
+      if (!reason || reason.length > 8_000) {
+        sendJson(response, 400, { error: 'A concrete parking reason is required within 8,000 characters.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (record.Status !== 'Blocked' || record.ReviewClaim) {
+          const error = new Error(`Only an unclaimed Blocked task can be parked. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' still has active Run '${activeRun.runId}' and cannot be parked.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        record.Status = 'Backlog'; record.Blocker = ''; record.Implementer = ''; record.Updated = timestamp;
+        const line = `PARKED: Blocked -> Backlog; ${timestamp}; ${agent}; ${reason}`;
+        record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
+    const admitMatch = /^\/api\/tasks\/([^/]+)\/admit$/.exec(requestPath);
+    if (request.method === 'POST' && admitMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(admitMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const targetStatus = String(body.targetStatus ?? '').trim();
+      const reason = String(body.reason ?? '').trim();
+      const blocker = String(body.blocker ?? '').trim();
+      if (!['Ready', 'Blocked'].includes(targetStatus) || !reason || reason.length > 8_000 || (targetStatus === 'Blocked' && (!blocker || blocker.length > 4_000))) {
+        sendJson(response, 400, { error: 'targetStatus must be Ready or Blocked; a concrete reason is required, and Blocked also requires a concrete blocker.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (record.Status !== 'Backlog' || record.ReviewClaim) {
+          const error = new Error(`Only an unclaimed Backlog task can be admitted. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' still has active Run '${activeRun.runId}' and cannot be admitted.`); error.statusCode = 409; throw error;
+        }
+        const dependencies = taskDependencies(record);
+        const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => dependencyId === TaskID)?.Status !== 'Done');
+        if (targetStatus === 'Ready' && unfinished.length) {
+          const error = new Error(`Cannot admit ${taskId} as Ready; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        record.Status = targetStatus; record.Blocker = targetStatus === 'Blocked' ? blocker : ''; record.Implementer = ''; record.Updated = timestamp;
+        const line = `ADMITTED: Backlog -> ${targetStatus}; ${timestamp}; ${agent}; ${reason}`;
+        record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => taskId === TaskID), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
     if (request.method === 'POST' && requestPath === '/api/feedback') {
       verifyMutationRequest(request);
       const { taskId, feedback } = await readJson(request);

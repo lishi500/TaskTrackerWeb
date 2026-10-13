@@ -38,7 +38,9 @@ Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用
 
 独立审查使用 `POST /api/tasks/<TaskID>/review`：reviewer 先 `action: "claim"`，再提交 `action: "decision"` 及 `approved`、`rejected` 或 `blocked`。reviewer 必须不同于 `Implementer`；批准才会进入 `Done`，可修复的拒绝回到 `Ready`，阻断审查需要具体 blocker。这个 API 不解释 owner 文字，也不解锁下游。
 
-对于未领取的 `Ready` packet，Agent 可用 `POST /api/tasks/<TaskID>/block` 记录发现的矛盾或缺失条件，不创建 Run。通用 `POST /api/tasks/<TaskID>/unblock` 仅验证没有活跃 Run、所有直接依赖均为 `Done`、并记录理由；已经结束的 blocked Run 保留的历史 `Implementer` 不视为活跃 claim，成功解锁时会清空该陈旧字段。它不理解任何游戏特有的 Gate、Release 或产品决策规则。调用方必须先按该游戏自己的流程确认该状态转换被允许。
+状态语义分开使用：`Blocked` 表示已经纳入近期执行链、但有具体可行动的前置/环境/规则阻碍；`Backlog` 表示已规划但尚未纳入近期执行链的工作，不能出现在 blocker 监控里，也不能领取。不要把“未来 Milestone 尚未开放”写成 `Blocked`。
+
+对于未领取的 `Ready` packet，Agent 可用 `POST /api/tasks/<TaskID>/block` 记录发现的矛盾或缺失条件，不创建 Run。通用 `POST /api/tasks/<TaskID>/unblock` 仅验证没有活跃 Run、所有直接依赖均为 `Done`、并记录理由；已经结束的 blocked Run 保留的历史 `Implementer` 不视为活跃 claim，成功解锁时会清空该陈旧字段。`POST /api/tasks/<TaskID>/park` 可把无 claim/active Run 的 `Blocked` 任务收回 `Backlog`；`POST /api/tasks/<TaskID>/admit` 由协调者把 `Backlog` 任务重新纳入近期链并显式设为 `Ready`（全部依赖已 Done）或 `Blocked`（必须提供具体 blocker）。这些 API 不理解任何游戏特有的 Gate、Release 或产品决策规则。调用方必须先按该游戏自己的流程确认状态转换被允许。
 
 Owner 反馈仍只作为原始 Evidence 写入，并转为 `Awaiting Agent Evaluation`；它不会自动完成任务、批准 Gate、评审实现或解锁依赖。
 

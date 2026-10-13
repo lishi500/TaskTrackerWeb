@@ -52,7 +52,7 @@ This creates a symbolic link, so future updates to this instance's Skill apply i
 
 - Use explicit workflow operations. Do not interpret an owner's raw feedback as `Done`, a decision, Gate approval, or dependency unlock.
 - Read task dependencies and reverse dependencies before changing a task. Preserve historical Evidence and use the project's review-independence rules.
-- Backlog capture is not a claimable task. It needs explicit triage before it can become `Ready`.
+- `Blocked` is only for a task already admitted to the near-term chain that has a concrete actionable blocker. `Backlog` is planned but not yet admitted work; future-Milestone gating alone is Backlog, never Blocked. Backlog capture is not claimable.
 - A task reference may be an HTTPS URL or repository-relative path. Do not upload external/binary material or expose the loopback service without explicit authorization.
 - Use the Hub API to allocate Run IDs, append events/artifacts, close technical outcomes and record independent review. Never edit `task_tracker.csv`, `run.json` or `events.jsonl` directly while the Hub is running.
 - If CSV structure is invalid, stop mutations and report the named structural issue. Do not silently repair historical task meaning.
@@ -78,7 +78,9 @@ If a revision is stale, reload the packet and reconcile the newer owner/reviewer
 
 An independent reviewer, different from the CSV `Implementer`, reviews only an `In Review` task. First call `POST /api/tasks/<TaskID>/review` with `action: "claim"` and `reviewer`; then use the new revision to call it with `action: "decision"`, the same reviewer, `approved`, `rejected` or `blocked`, and review notes. A blocked decision also requires a concrete blocker. The Hub rejects self-review, unclaimed decisions and review while an active Run remains. Approval is the only route to `Done`; rejection returns the task to `Ready` while retaining review evidence.
 
-For a contradictory/incomplete unclaimed Ready packet, use `POST /api/tasks/<TaskID>/block` with the current revision, agent, concrete blocker and evidence. It creates no Run. `POST /api/tasks/<TaskID>/unblock` is only a generic dependency transition: it requires a Blocked task with no active Run or review claim, all direct dependencies Done, an agent and a reason. A completed blocked Run's historical `Implementer` is not an active claim; a successful unblock clears it before returning the task to `Ready`. Before calling it, enforce the current game's Gate, release and product-decision rules; the generic Hub intentionally has no task-ID-specific workflow policy.
+For a contradictory/incomplete unclaimed Ready packet, use `POST /api/tasks/<TaskID>/block` with the current revision, agent, concrete blocker and evidence. It creates no Run. `POST /api/tasks/<TaskID>/unblock` is only a generic dependency transition: it requires a Blocked task with no active Run or review claim, all direct dependencies Done, an agent and a reason. A completed blocked Run's historical `Implementer` is not an active claim; a successful unblock clears it before returning the task to `Ready`.
+
+Use `POST /api/tasks/<TaskID>/park` only to move an unclaimed, inactive `Blocked` task out of the near-term chain into `Backlog`, with a concrete scheduling reason. Use `POST /api/tasks/<TaskID>/admit` to move an unclaimed, inactive `Backlog` task back into the near-term chain: `targetStatus: Ready` requires every direct dependency Done; `targetStatus: Blocked` requires a concrete active blocker. These transitions are generic and do not decide whether a project Gate permits admission; enforce the game's Gate/release/decision rules first.
 
 ## Diagnostic logging
 

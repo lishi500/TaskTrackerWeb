@@ -304,6 +304,18 @@ try {
   const unfinishedDependencyPacket = await request('/api/tasks/TEST-009/packet');
   const unfinishedDependencyUnblock = await request('/api/tasks/TEST-009/unblock', mutation({ trackerRevision: unfinishedDependencyPacket.body.trackerRevision, agent: 'scheduler-agent', reason: 'Must reject because TEST-002 remains In Progress.' }));
   assert.equal(unfinishedDependencyUnblock.response.status, 409);
+  const parkingPacket = await request('/api/tasks/TEST-009/packet');
+  const parked = await request('/api/tasks/TEST-009/park', mutation({ trackerRevision: parkingPacket.body.trackerRevision, agent: 'scheduler-agent', reason: 'TEST-009 belongs to a later execution window and must not inflate active blocker monitoring.' }));
+  assert.equal(parked.response.status, 200);
+  assert.equal(parked.body.task.Status, 'Backlog');
+  assert.equal(parked.body.task.Blocker, '');
+  assert.match(parked.body.task.Evidence, /PARKED: Blocked -> Backlog;/);
+  const prematureAdmission = await request('/api/tasks/TEST-009/admit', mutation({ trackerRevision: parked.body.trackerRevision, agent: 'scheduler-agent', targetStatus: 'Ready', reason: 'This must reject because TEST-002 remains unfinished.' }));
+  assert.equal(prematureAdmission.response.status, 409);
+  const admittedBlocked = await request('/api/tasks/TEST-009/admit', mutation({ trackerRevision: parked.body.trackerRevision, agent: 'scheduler-agent', targetStatus: 'Blocked', blocker: 'TEST-002 remains In Progress in the admitted near-term chain.', reason: 'The coordinator explicitly admits TEST-009 for dependency monitoring.' }));
+  assert.equal(admittedBlocked.response.status, 200);
+  assert.equal(admittedBlocked.body.task.Status, 'Blocked');
+  assert.match(admittedBlocked.body.task.Evidence, /ADMITTED: Backlog -> Blocked;/);
   const ownerWaitPacket = await request('/api/tasks/TEST-010/packet');
   const ownerWaitStart = await request('/api/runs/start', mutation({
     taskId: 'TEST-010',
