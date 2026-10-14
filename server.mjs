@@ -1508,6 +1508,48 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, result);
       return;
     }
+    const dependenciesMatch = /^\/api\/tasks\/([^/]+)\/dependencies$/.exec(requestPath);
+    if (request.method === 'POST' && dependenciesMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(dependenciesMatch[1]), 'Task ID');
+      const agent = reviewerIdentity(body.agent);
+      const reason = String(body.reason ?? '').trim();
+      const dependsOn = creationText(body.dependsOn, 'dependsOn', { maxLength: 4_000 });
+      for (const dependencyId of dependsOn.split(';').map((value) => value.trim()).filter(Boolean)) {
+        safePathSegment(dependencyId, 'Dependency Task ID');
+      }
+      if (!Object.hasOwn(body, 'dependsOn') || !reason || reason.length > 8_000) {
+        sendJson(response, 400, { error: 'agent, reason and a complete dependsOn field are required within their size limits.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        if (!['Backlog', 'Blocked'].includes(record.Status) || record.ReviewClaim || record.Implementer) {
+          const error = new Error(`Only an unclaimed inactive Backlog or Blocked task can receive a dependency revision. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' has active Run '${activeRun.runId}' and cannot receive a dependency revision.`); error.statusCode = 409; throw error;
+        }
+        if (record.DependsOn === dependsOn) {
+          const error = new Error(`Task '${taskId}' dependencies are unchanged.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        const previousDependencies = record.DependsOn || '(none)';
+        record.DependsOn = dependsOn;
+        record.Updated = timestamp;
+        appendEvidence(record, `DEPENDENCIES UPDATED: ${agent} ${timestamp}; from=${previousDependencies}; to=${dependsOn || '(none)'}; ${reason}`);
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
     const blockMatch = /^\/api\/tasks\/([^/]+)\/block$/.exec(requestPath);
     if (request.method === 'POST' && blockMatch) {
       verifyMutationRequest(request);

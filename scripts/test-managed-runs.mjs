@@ -26,8 +26,9 @@ const ownerWaitRow = ['TEST-010', '', 'M0', 'Test', 'Generic owner-wait close li
 const closedBlockRecoveryRow = ['TEST-011', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'Yes', '', '', '', '', '', ''];
 const coordinatorRow = ['TEST-012', '', 'M0', 'Test', 'Coordinator authority lifecycle', 'README.md', '', 'Coordinator', 'Ready', 'P0', 'An active coordinator Run can expose a direct owner dependency', 'Yes', '', '', '', '', '', ''];
 const dependentOwnerRow = ['TEST-013', '', 'M0', 'Test', 'Coordinator-owned preparation', 'README.md', 'TEST-012', 'Owner', 'Backlog', 'P0', 'Enters an explicit owner wait only through its active direct coordinator', 'No', '', '', '', '', '', ''];
+const dependencyRevisionRow = ['TEST-014', '', 'M0', 'Test', 'Dependency revision lifecycle', 'README.md', 'TEST-001', 'Agent', 'Backlog', 'P0', 'Changes dependencies only through an auditable valid graph mutation', 'Yes', '', '', '', '', '', ''];
 await mkdir(recordsPath, { recursive: true });
-await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n${coordinatorRow.join(',')}\n${dependentOwnerRow.join(',')}\n`, 'utf8');
+await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n${coordinatorRow.join(',')}\n${dependentOwnerRow.join(',')}\n${dependencyRevisionRow.join(',')}\n`, 'utf8');
 
 const child = spawn(process.execPath, ['server.mjs'], {
   cwd: root,
@@ -268,6 +269,41 @@ try {
   }));
   assert.equal(admittedCreated.response.status, 200);
   assert.equal(admittedCreated.body.task.Status, 'Ready');
+
+  const dependencyRevisionPacket = await request('/api/tasks/TEST-014/packet');
+  const missingDependencies = await request('/api/tasks/TEST-014/dependencies', mutation({
+    trackerRevision: dependencyRevisionPacket.body.trackerRevision,
+    agent: 'dependency-agent',
+    reason: 'A complete replacement must name dependsOn, even when it is empty.',
+  }));
+  assert.equal(missingDependencies.response.status, 400);
+  const revisedDependencies = await request('/api/tasks/TEST-014/dependencies', mutation({
+    trackerRevision: dependencyRevisionPacket.body.trackerRevision,
+    agent: 'dependency-agent',
+    reason: 'The planned task needs a newly discovered completed prerequisite before admission.',
+    dependsOn: 'TEST-001;TEST-003',
+  }));
+  assert.equal(revisedDependencies.response.status, 200);
+  assert.equal(revisedDependencies.body.task.DependsOn, 'TEST-001;TEST-003');
+  assert.match(revisedDependencies.body.task.Evidence, /DEPENDENCIES UPDATED: dependency-agent/);
+  const beforeInvalidDependencyRevision = await readFile(trackerPath, 'utf8');
+  const invalidDependencyRevision = await request('/api/tasks/TEST-014/dependencies', mutation({
+    trackerRevision: revisedDependencies.body.trackerRevision,
+    agent: 'dependency-agent',
+    reason: 'This must reject a self-dependency without modifying the CSV.',
+    dependsOn: 'TEST-014',
+  }));
+  assert.equal(invalidDependencyRevision.response.status, 422);
+  assert.match(invalidDependencyRevision.body.error, /self dependency/i);
+  assert.equal(await readFile(trackerPath, 'utf8'), beforeInvalidDependencyRevision);
+  const readyDependencyPacket = await request('/api/tasks/TEST-CREATE-001/packet');
+  const readyDependencyRevision = await request('/api/tasks/TEST-CREATE-001/dependencies', mutation({
+    trackerRevision: readyDependencyPacket.body.trackerRevision,
+    agent: 'dependency-agent',
+    reason: 'Ready tasks must not gain dependencies after admission.',
+    dependsOn: 'TEST-001;TEST-003',
+  }));
+  assert.equal(readyDependencyRevision.response.status, 409);
 
   const normalPacket = await request('/api/tasks/TEST-003/packet');
   const normalStart = await request('/api/runs/start', mutation({
