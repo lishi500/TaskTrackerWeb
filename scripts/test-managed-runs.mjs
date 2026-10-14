@@ -502,8 +502,25 @@ try {
   assert.equal(closedBlockClose.response.status, 200);
   assert.equal(closedBlockClose.body.task.Status, 'Blocked');
   assert.equal(closedBlockClose.body.task.Implementer, 'test-agent');
-  const closedBlockUnblock = await request('/api/tasks/TEST-011/unblock', mutation({
+  const closedBlockDependencyRevision = await request('/api/tasks/TEST-011/dependencies', mutation({
     trackerRevision: closedBlockClose.body.trackerRevision,
+    agent: 'scheduler-agent',
+    reason: 'A closed blocked Run is historical attribution, so the coordinator can record a newly discovered prerequisite before retry.',
+    dependsOn: 'TEST-001;TEST-003',
+  }));
+  assert.equal(closedBlockDependencyRevision.response.status, 200);
+  assert.equal(closedBlockDependencyRevision.body.task.Status, 'Blocked');
+  assert.equal(closedBlockDependencyRevision.body.task.Implementer, 'test-agent');
+  assert.equal(closedBlockDependencyRevision.body.task.DependsOn, 'TEST-001;TEST-003');
+  const closedBlockDependencyRestore = await request('/api/tasks/TEST-011/dependencies', mutation({
+    trackerRevision: closedBlockDependencyRevision.body.trackerRevision,
+    agent: 'scheduler-agent',
+    reason: 'Restore the independently completed prerequisite before generic unblock verification.',
+    dependsOn: 'TEST-001',
+  }));
+  assert.equal(closedBlockDependencyRestore.response.status, 200);
+  const closedBlockUnblock = await request('/api/tasks/TEST-011/unblock', mutation({
+    trackerRevision: closedBlockDependencyRestore.body.trackerRevision,
     agent: 'scheduler-agent',
     reason: 'The independent blocker is resolved and TEST-001 remains Done.',
   }));

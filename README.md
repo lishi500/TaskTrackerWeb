@@ -71,7 +71,7 @@ Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用
 
 如果发现任务的 `Task`、`SpecRef` 或 `Acceptance` 与冻结架构相互矛盾，协调 Agent 不得只在 Evidence 中重新解释旧要求，也不得直接编辑 CSV。可在任务没有活跃 Run 或 review claim，且状态为 `Backlog`、`Ready` 或 `Blocked` 时，使用 `POST /api/tasks/<TaskID>/contract` 提交完整替换后的三项字段、当前 revision、Agent 和具体修订理由。Hub 保留旧 Evidence，并追加字段清单、UTC 与理由；它不会改变状态、依赖、OwnerRole、优先级或审查历史。已 `In Progress`/`In Review`/`Done` 的任务必须通过新的补救任务处理，不可回写其完成时的契约。
 
-如果新发现的前置条件必须进入既有、未启动任务的依赖图，使用 `POST /api/tasks/<TaskID>/dependencies`，提交当前 revision、Agent、具体理由和完整替换的分号分隔 `dependsOn`。该接口只接受没有 claim/Run 的 `Backlog` 或 `Blocked` 任务，拒绝已 `Ready`、活跃、审查中或完成的任务；原子校验未知 ID、自依赖、重复依赖和环，并保留旧依赖与新依赖的 Evidence。不要通过直接编辑 CSV 规避该保护。
+如果新发现的前置条件必须进入既有、未启动任务的依赖图，使用 `POST /api/tasks/<TaskID>/dependencies`，提交当前 revision、Agent、具体理由和完整替换的分号分隔 `dependsOn`。该接口只接受没有活跃 Run 或 review claim 的 `Backlog` 或 `Blocked` 任务，拒绝已 `Ready`、活跃、审查中或完成的任务；已关闭 blocked Run 保留的历史 `Implementer` 不属于活跃 claim，不能阻止这类可审计修订。接口原子校验未知 ID、自依赖、重复依赖和环，并保留旧依赖与新依赖的 Evidence。不要通过直接编辑 CSV 规避该保护。
 
 已完成/审查中的任务发现独立缺陷时，协调 Agent 必须创建新的补救任务，不能回写旧任务。使用 `POST /api/tasks` 携带当前 `trackerRevision`、命名 Agent、创建理由，以及完整 `newTask`（`taskId`、`milestone`、`workstream`、`task`、`specRef`、`dependsOn`、`ownerRole`、`priority`、`acceptance`、`reviewRequired`，可选 `parentId`）。Hub 只创建 `Backlog`：它会原子校验完整依赖图、拒绝重复 ID/未知依赖/环，并写入 `CREATED` Evidence。随后仍必须按项目 Gate 和普通 `/admit` 流程纳入近期执行链；创建接口不能伪造 `Ready`、执行者、审查或完成状态。
 

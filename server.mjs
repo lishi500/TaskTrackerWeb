@@ -1528,7 +1528,9 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
-        if (!['Backlog', 'Blocked'].includes(record.Status) || record.ReviewClaim || record.Implementer) {
+        // A closed blocked Run deliberately retains Implementer as historical
+        // attribution. Only an active Run or a review claim is a live claim.
+        if (!['Backlog', 'Blocked'].includes(record.Status) || record.ReviewClaim) {
           const error = new Error(`Only an unclaimed inactive Backlog or Blocked task can receive a dependency revision. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
         }
         const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
