@@ -12,7 +12,7 @@
         <div>
           <p id="instance-eyebrow" class="eyebrow">TASKTRACKERWEB</p>
           <h1 id="instance-heading">开发任务看板</h1>
-          <p class="subtitle">任务状态来自当前实例的 <code>tracker/task_tracker.csv</code>；Agent Run、日志和验证证据位于受 Hub 管理的 <code>tracker/task-records/</code>。</p>
+          <p class="subtitle">任务状态来自当前实例的 <code>tracker/task_tracker.csv</code>；Agent Run、日志和验证证据位于受 Hub 管理的 <code>tracker/task-records/</code>。工具链健康事件独立保存在 <code>tracker/toolchain_issue_events.jsonl</code>，不会改写任务状态。</p>
         </div>
         <button id="refresh-button" class="secondary-button" type="button">刷新数据</button>
       </header>
@@ -20,10 +20,21 @@
       <p id="load-message" class="load-message" aria-live="polite"></p>
 
       <section class="summary-grid" aria-label="任务概况">
-        <article><span>全部任务</span><strong id="total-count">—</strong></article>
+        <article><span>全部工作项</span><strong id="total-count">—</strong></article>
         <article><span>等待你处理</span><strong id="owner-count">—</strong></article>
         <article><span>Agent 处理中</span><strong id="work-count">—</strong></article>
         <article><span>受阻任务</span><strong id="blocked-count">—</strong></article>
+        <article><span>工具链新报警</span><strong id="toolchain-alert-count">—</strong></article>
+      </section>
+      <p id="work-item-breakdown" class="section-note"></p>
+
+      <section class="toolchain-section" aria-labelledby="toolchain-heading">
+        <div class="section-heading">
+          <div><p class="eyebrow">TOOLCHAIN HEALTH</p><h2 id="toolchain-heading">跨任务工具链报警</h2></div>
+          <p>按稳定 failure key 聚合。数字 <code>1 (5)</code> 表示 1 个尚未 ACK 的新报告，且此前已 ACK 过 5 个；ACK 仅确认处理，不代表自动修复。</p>
+        </div>
+        <label><input id="include-acknowledged" type="checkbox"> 包含已 ACK 的历史</label>
+        <div id="toolchain-issues" class="toolchain-issue-list"></div>
       </section>
 
       <section class="highlight-section">
@@ -40,8 +51,12 @@
           <div id="current-work" class="compact-list"></div>
         </div>
         <div class="panel">
-          <div class="section-heading"><div><p class="eyebrow">BLOCKERS</p><h2>阻塞链</h2></div></div>
+          <div class="section-heading"><div><p class="eyebrow">BLOCKERS</p><h2>需处理的阻塞</h2></div></div>
           <div id="blockers" class="compact-list"></div>
+          <details>
+            <summary>正常依赖等待</summary>
+            <div id="dependency-waits" class="compact-list"></div>
+          </details>
         </div>
       </section>
 
@@ -69,7 +84,7 @@
         </summary>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Task ID</th><th>Milestone</th><th>任务</th><th>状态</th><th>最近执行</th><th>依赖</th><th>更新时间</th></tr></thead>
+            <thead><tr><th>Task ID</th><th>类型</th><th>Milestone</th><th>任务</th><th>状态</th><th>最近执行</th><th>依赖</th><th>更新时间</th></tr></thead>
             <tbody id="task-table-body"></tbody>
           </table>
         </div>

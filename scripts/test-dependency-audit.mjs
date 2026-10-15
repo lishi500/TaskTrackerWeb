@@ -11,10 +11,10 @@ import { join } from 'node:path';
 const root = new URL('..', import.meta.url);
 const sandbox = await mkdtemp(join(tmpdir(), 'task-tracker-dependency-audit-'));
 const trackerPath = join(sandbox, 'task_tracker.csv');
-const header = ['TaskID', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
+const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
 
 function row(taskId, dependsOn = '', status = 'Backlog') {
-  return [taskId, '', 'M1', 'Test', `${taskId} dependency audit`, 'README.md', dependsOn, 'Agent', status, 'P0', 'Dependency graph is valid.', 'Yes', '', '', '', '', '', ''];
+  return [taskId, 'Task', '', 'M1', 'Test', `${taskId} dependency audit`, 'README.md', dependsOn, 'Agent', status, 'P0', 'Dependency graph is valid.', 'Yes', '', '', '', '', '', ''];
 }
 
 async function writeRows(rows) {
@@ -56,6 +56,53 @@ try {
   assert.equal(valid.body.valid, true);
   assert.equal(valid.body.taskCount, 2);
   assert.equal(valid.body.edgeCount, 1);
+
+  const invalidType = row('TYPE-INVALID', '', 'Ready');
+  invalidType[1] = 'Epic';
+  await writeRows([invalidType]);
+  const invalidTaskType = await request('/api/dependency-audit');
+  assert.equal(invalidTaskType.response.status, 200);
+  assert.equal(invalidTaskType.body.valid, false);
+  assert.equal(invalidTaskType.body.csvErrors[0].code, 'task-type');
+
+  const malformedStory = row('STORY-INVALID', '', 'Backlog');
+  malformedStory[1] = 'Story';
+  malformedStory[2] = 'GRAPH-001';
+  await writeRows([malformedStory]);
+  const invalidStory = await request('/api/dependency-audit');
+  assert.equal(invalidStory.response.status, 200);
+  assert.equal(invalidStory.body.valid, false);
+  assert.equal(invalidStory.body.csvErrors[0].code, 'story-structure');
+
+  const nonStoryParent = row('PARENT-TASK', '', 'Backlog');
+  const invalidChildParent = row('CHILD-INVALID', '', 'Backlog');
+  invalidChildParent[2] = 'PARENT-TASK';
+  await writeRows([nonStoryParent, invalidChildParent]);
+  const invalidChildParentAudit = await request('/api/dependency-audit');
+  assert.equal(invalidChildParentAudit.response.status, 200);
+  assert.equal(invalidChildParentAudit.body.valid, false);
+  assert.equal(invalidChildParentAudit.body.csvErrors[0].code, 'story-parent');
+
+  const missingStoryParent = row('CHILD-MISSING-PARENT', '', 'Backlog');
+  missingStoryParent[2] = 'STORY-MISSING';
+  await writeRows([missingStoryParent]);
+  const missingStoryParentAudit = await request('/api/dependency-audit');
+  assert.equal(missingStoryParentAudit.response.status, 200);
+  assert.equal(missingStoryParentAudit.body.valid, false);
+  assert.equal(missingStoryParentAudit.body.csvErrors[0].code, 'story-parent');
+
+  const validStory = row('STORY-VALID', '', 'Backlog');
+  validStory[1] = 'Story';
+  validStory[12] = 'No';
+  const invalidStoryDependency = row('DEPENDENCY-INVALID', 'STORY-VALID', 'Backlog');
+  await writeRows([validStory, invalidStoryDependency]);
+  const invalidStoryDependencyAudit = await request('/api/dependency-audit');
+  assert.equal(invalidStoryDependencyAudit.response.status, 200);
+  assert.equal(invalidStoryDependencyAudit.body.valid, false);
+  assert.equal(invalidStoryDependencyAudit.body.csvErrors[0].code, 'story-dependency');
+  const rejectedStoryDependencyRead = await request('/api/tracker');
+  assert.equal(rejectedStoryDependencyRead.response.status, 422);
+  assert.equal(rejectedStoryDependencyRead.body.dependencyAudit.csvErrors[0].code, 'story-dependency');
 
   await writeRows([row('UNKNOWN-001', 'MISSING-001', 'Ready')]);
   const unknown = await request('/api/dependency-audit');

@@ -12,21 +12,21 @@ const root = new URL('..', import.meta.url);
 const sandbox = await mkdtemp(join(tmpdir(), 'task-tracker-runs-'));
 const trackerPath = join(sandbox, 'task_tracker.csv');
 const recordsPath = join(sandbox, 'task-records');
-const header = ['TaskID', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
-const recoveryRow = ['TEST-001', '', 'M0', 'Test', 'Managed run recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Claims and closes safely', 'Yes', '', '', '', '', '', ''];
-const nonReadyRow = ['TEST-002', '', 'M0', 'Test', 'Non-Ready claim rejection', 'README.md', '', 'Agent', 'In Progress', 'P0', 'Rejects a second claim', 'Yes', '', 'other-agent', 'EXISTING CLAIM', '', '', ''];
-const normalRow = ['TEST-003', '', 'M0', 'Test', 'Managed run normal lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Closes safely', 'Yes', '', '', '', '', '', ''];
-const claimRecoveryRow = ['TEST-004', '', 'M0', 'Test', 'Managed claim recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not reuse a failed claim Run ID', 'Yes', '', '', '', '', '', ''];
-const committedClaimRecoveryRow = ['TEST-005', '', 'M0', 'Test', 'Committed claim intent cleanup lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not block a later Ready retry after a reviewed Run', 'Yes', '', '', '', '', '', ''];
-const preclaimBlockRow = ['TEST-006', '', 'M0', 'Test', 'Pre-claim blocker lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Blocks an incomplete packet without a Run', 'Yes', '', '', '', '', '', ''];
-const dependencyUnblockRow = ['TEST-007', '', 'M0', 'Test', 'Dependency unblock lifecycle', 'README.md', 'TEST-001', 'Agent', 'Blocked', 'P0', 'Becomes Ready only after all dependencies are Done', 'Yes', 'TEST-001 review incomplete', '', '', '', '', ''];
-const zeroDependencyBlockedRow = ['TEST-008', '', 'M0', 'Test', 'Zero dependency unblock rejection', 'README.md', '', 'Agent', 'Blocked', 'P0', 'Must not be dependency-unblocked', 'Yes', 'Manual blocker', '', '', '', '', ''];
-const unfinishedDependencyBlockedRow = ['TEST-009', '', 'M0', 'Test', 'Unfinished dependency unblock rejection', 'README.md', 'TEST-002', 'Agent', 'Blocked', 'P0', 'Must retain blocker while dependency remains unfinished', 'Yes', 'TEST-002 incomplete', '', '', '', '', ''];
-const ownerWaitRow = ['TEST-010', '', 'M0', 'Test', 'Generic owner-wait close lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Moves only to an explicit owner status', 'Yes', '', '', '', '', '', ''];
-const closedBlockRecoveryRow = ['TEST-011', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'Yes', '', '', '', '', '', ''];
-const coordinatorRow = ['TEST-012', '', 'M0', 'Test', 'Coordinator authority lifecycle', 'README.md', '', 'Coordinator', 'Ready', 'P0', 'An active coordinator Run can expose a direct owner dependency', 'Yes', '', '', '', '', '', ''];
-const dependentOwnerRow = ['TEST-013', '', 'M0', 'Test', 'Coordinator-owned preparation', 'README.md', 'TEST-012', 'Owner', 'Backlog', 'P0', 'Enters an explicit owner wait only through its active direct coordinator', 'No', '', '', '', '', '', ''];
-const dependencyRevisionRow = ['TEST-014', '', 'M0', 'Test', 'Dependency revision lifecycle', 'README.md', 'TEST-001', 'Agent', 'Backlog', 'P0', 'Changes dependencies only through an auditable valid graph mutation', 'Yes', '', '', '', '', '', ''];
+const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
+const recoveryRow = ['TEST-001', 'Task', '', 'M0', 'Test', 'Managed run recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Claims and closes safely', 'Yes', '', '', '', '', '', ''];
+const nonReadyRow = ['TEST-002', 'Task', '', 'M0', 'Test', 'Non-Ready claim rejection', 'README.md', '', 'Agent', 'In Progress', 'P0', 'Rejects a second claim', 'Yes', '', 'other-agent', 'EXISTING CLAIM', '', '', ''];
+const normalRow = ['TEST-003', 'Task', '', 'M0', 'Test', 'Managed run normal lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Closes safely', 'Yes', '', '', '', '', '', ''];
+const claimRecoveryRow = ['TEST-004', 'Task', '', 'M0', 'Test', 'Managed claim recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not reuse a failed claim Run ID', 'Yes', '', '', '', '', '', ''];
+const committedClaimRecoveryRow = ['TEST-005', 'Task', '', 'M0', 'Test', 'Committed claim intent cleanup lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not block a later Ready retry after a reviewed Run', 'Yes', '', '', '', '', '', ''];
+const preclaimBlockRow = ['TEST-006', 'Task', '', 'M0', 'Test', 'Pre-claim blocker lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Blocks an incomplete packet without a Run', 'Yes', '', '', '', '', '', ''];
+const dependencyUnblockRow = ['TEST-007', 'Task', '', 'M0', 'Test', 'Dependency unblock lifecycle', 'README.md', 'TEST-001', 'Agent', 'Blocked', 'P0', 'Becomes Ready only after all dependencies are Done', 'Yes', 'TEST-001 review incomplete', '', '', '', '', ''];
+const zeroDependencyBlockedRow = ['TEST-008', 'Task', '', 'M0', 'Test', 'Zero dependency unblock rejection', 'README.md', '', 'Agent', 'Blocked', 'P0', 'Must not be dependency-unblocked', 'Yes', 'Manual blocker', '', '', '', '', ''];
+const unfinishedDependencyBlockedRow = ['TEST-009', 'Task', '', 'M0', 'Test', 'Unfinished dependency unblock rejection', 'README.md', 'TEST-002', 'Agent', 'Blocked', 'P0', 'Must retain blocker while dependency remains unfinished', 'Yes', 'TEST-002 incomplete', '', '', '', '', ''];
+const ownerWaitRow = ['TEST-010', 'Task', '', 'M0', 'Test', 'Generic owner-wait close lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Moves only to an explicit owner status', 'Yes', '', '', '', '', '', ''];
+const closedBlockRecoveryRow = ['TEST-011', 'Task', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'Yes', '', '', '', '', '', ''];
+const coordinatorRow = ['TEST-012', 'Task', '', 'M0', 'Test', 'Coordinator authority lifecycle', 'README.md', '', 'Coordinator', 'Ready', 'P0', 'An active coordinator Run can expose a direct owner dependency', 'Yes', '', '', '', '', '', ''];
+const dependentOwnerRow = ['TEST-013', 'Task', '', 'M0', 'Test', 'Coordinator-owned preparation', 'README.md', 'TEST-012', 'Owner', 'Backlog', 'P0', 'Enters an explicit owner wait only through its active direct coordinator', 'No', '', '', '', '', '', ''];
+const dependencyRevisionRow = ['TEST-014', 'Task', '', 'M0', 'Test', 'Dependency revision lifecycle', 'README.md', 'TEST-001', 'Agent', 'Backlog', 'P0', 'Changes dependencies only through an auditable valid graph mutation', 'Yes', '', '', '', '', '', ''];
 await mkdir(recordsPath, { recursive: true });
 await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n${coordinatorRow.join(',')}\n${dependentOwnerRow.join(',')}\n${dependencyRevisionRow.join(',')}\n`, 'utf8');
 
@@ -231,7 +231,7 @@ try {
     agent: 'scheduler-agent',
     reason: 'This fixture proves graph validation still protects a creation mutation.',
     newTask: {
-      taskId: 'TEST-CREATE-BAD', parentId: '', milestone: 'M0', workstream: 'Test',
+      taskId: 'TEST-CREATE-BAD', taskType: 'Task', parentId: '', milestone: 'M0', workstream: 'Test',
       task: 'Invalid planned task', specRef: 'README.md', dependsOn: 'MISSING-001',
       ownerRole: 'Agent', priority: 'P0', acceptance: 'Must never enter the CSV.', reviewRequired: 'Yes',
     },
@@ -242,7 +242,7 @@ try {
     agent: 'scheduler-agent',
     reason: 'A discovered repair must become an auditable planned task before it can be admitted.',
     newTask: {
-      taskId: 'TEST-CREATE-001', parentId: '', milestone: 'M0', workstream: 'Test',
+      taskId: 'TEST-CREATE-001', taskType: 'Task', parentId: '', milestone: 'M0', workstream: 'Test',
       task: 'Create a planned remediation task', specRef: 'README.md', dependsOn: 'TEST-001',
       ownerRole: 'Agent', priority: 'P0', acceptance: 'Starts as Backlog and requires normal admission.', reviewRequired: 'Yes',
     },
@@ -255,7 +255,7 @@ try {
     agent: 'scheduler-agent',
     reason: 'This must reject duplicate Task IDs.',
     newTask: {
-      taskId: 'TEST-CREATE-001', parentId: '', milestone: 'M0', workstream: 'Test',
+      taskId: 'TEST-CREATE-001', taskType: 'Task', parentId: '', milestone: 'M0', workstream: 'Test',
       task: 'Duplicate planned task', specRef: 'README.md', dependsOn: '',
       ownerRole: 'Agent', priority: 'P0', acceptance: 'Must not replace the existing task.', reviewRequired: 'Yes',
     },

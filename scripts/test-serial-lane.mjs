@@ -12,13 +12,13 @@ const root = new URL('..', import.meta.url);
 const sandbox = await mkdtemp(join(tmpdir(), 'task-tracker-serial-'));
 const trackerPath = join(sandbox, 'task_tracker.csv');
 const recordsPath = join(sandbox, 'task-records');
-const header = ['TaskID', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
+const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
 const rows = [
-  ['SER-001', '', 'M1', 'Test', 'First Agent task', 'README.md', '', 'Agent', 'Ready', 'P0', 'Starts the serial lane', 'Yes', '', '', '', '', '', ''],
-  ['GATE-SER-001', '', 'M1', 'Test', 'Owner Gate', 'README.md', 'SER-001', 'Owner', 'Backlog', 'P0', 'Receives owner evaluation', 'No', '', '', '', '', '', ''],
-  ['SER-002', '', 'M1', 'Test', 'Second Agent task', 'README.md', 'GATE-SER-001', 'Agent', 'Backlog', 'P0', 'Follows approved gate', 'Yes', '', '', '', '', '', ''],
-  ['SER-003', '', 'M1', 'Test', 'Third Agent task', 'README.md', 'SER-002', 'Agent', 'Backlog', 'P0', 'Is the only armed successor', 'Yes', '', '', '', '', '', ''],
-  ['SER-004', '', 'M1', 'Test', 'Fourth Agent task', 'README.md', 'SER-003', 'Agent', 'Backlog', 'P0', 'Remains backlog until predecessor starts', 'Yes', '', '', '', '', '', ''],
+  ['SER-001', 'Task', '', 'M1', 'Test', 'First Agent task', 'README.md', '', 'Agent', 'Ready', 'P0', 'Starts the serial lane', 'Yes', '', '', '', '', '', ''],
+  ['GATE-SER-001', 'Task', '', 'M1', 'Test', 'Owner Gate', 'README.md', 'SER-001', 'Owner', 'Backlog', 'P0', 'Receives owner evaluation', 'No', '', '', '', '', '', ''],
+  ['SER-002', 'Task', '', 'M1', 'Test', 'Second Agent task', 'README.md', 'GATE-SER-001', 'Agent', 'Backlog', 'P0', 'Follows approved gate', 'Yes', '', '', '', '', '', ''],
+  ['SER-003', 'Task', '', 'M1', 'Test', 'Third Agent task', 'README.md', 'SER-002', 'Agent', 'Backlog', 'P0', 'Is the only armed successor', 'Yes', '', '', '', '', '', ''],
+  ['SER-004', 'Task', '', 'M1', 'Test', 'Fourth Agent task', 'README.md', 'SER-003', 'Agent', 'Backlog', 'P0', 'Remains backlog until predecessor starts', 'Yes', '', '', '', '', '', ''],
 ];
 await mkdir(recordsPath, { recursive: true });
 await writeFile(trackerPath, `${header.join(',')}\n${rows.map((row) => row.join(',')).join('\n')}\n`, 'utf8');

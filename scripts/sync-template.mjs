@@ -18,6 +18,8 @@ const sharedPaths = [
   'scripts/test-managed-runs.mjs',
   'scripts/test-serial-lane.mjs',
   'scripts/test-dependency-audit.mjs',
+  'scripts/test-task-types-and-toolchain-issues.mjs',
+  'scripts/test-delivery-context.mjs',
   'scripts/sync-template.mjs',
   'scripts/test-template-sync.mjs',
   'templates',

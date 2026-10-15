@@ -16,6 +16,7 @@ const trackerPath = process.env.TRACKER_CSV
   : instance.tracker ? resolve(toolDir, instance.tracker) : undefined;
 const publicDir = join(toolDir, 'public');
 const taskRecordsDir = trackerPath ? join(dirname(trackerPath), 'task-records') : undefined;
+const toolchainIssueEventsPath = trackerPath ? join(dirname(trackerPath), 'toolchain_issue_events.jsonl') : undefined;
 const port = Number(process.env.PORT ?? 4173);
 const host = process.env.HOST ?? '127.0.0.1';
 let activePort = port;
@@ -29,12 +30,14 @@ const ownerInputStatuses = new Set([
   'Awaiting Owner Gate',
   'Awaiting Agent Evaluation',
 ]);
+const ownerActionStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate']);
 const taskCreationColumns = [
-  'TaskID', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef',
+  'TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef',
   'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance',
   'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated',
   'ReviewClaim', 'Reviewer',
 ];
+const taskTypes = new Set(['Task', 'Bug', 'Story']);
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -109,6 +112,24 @@ function encodeCsv(rows) {
   }).join(',')).join('\n')}\n`;
 }
 
+function taskType(record) {
+  const value = String(record.TaskType ?? '').trim();
+  // Existing instances are readable before the explicit schema migration. They
+  // remain ordinary executable Tasks until a coordinator classifies new work.
+  return value || 'Task';
+}
+
+function isStory(record) {
+  return taskType(record) === 'Story';
+}
+
+function assertExecutableTask(record, action) {
+  if (!isStory(record)) return;
+  const error = new Error(`Story '${record.TaskID}' is a non-executable scope container and cannot ${action}. Create or admit a child Task or Bug instead.`);
+  error.statusCode = 409;
+  throw error;
+}
+
 async function readRawTracker() {
   if (!trackerPath) {
     const error = new Error('No tracker is configured. Add a project to task-hub.config.json or set TRACKER_CSV.');
@@ -156,12 +177,64 @@ async function readRawTracker() {
     wellFormedRows.push(values);
   });
   const records = wellFormedRows.map((values) => Object.fromEntries(header.map((name, index) => [name, values[index]])));
+  const hasTaskTypeSchema = header.includes('TaskType');
+  for (const [index, record] of records.entries()) {
+    const explicitTaskType = String(record.TaskType ?? '').trim();
+    if (hasTaskTypeSchema && !taskTypes.has(explicitTaskType)) {
+      csvErrors.push({
+        code: 'task-type', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
+        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) has invalid TaskType '${explicitTaskType}'.`,
+      });
+    }
+    record.TaskType = explicitTaskType || 'Task';
+    if (explicitTaskType === 'Story'
+      && (record.ParentID || taskDependencies(record).length || String(record.ReviewRequired ?? '').trim() !== 'No')) {
+      csvErrors.push({
+        code: 'story-structure', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
+        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) is a Story but has executable relationship fields.`,
+      });
+    }
+  }
+  if (hasTaskTypeSchema) validateTypedStoryRelationships(records, csvErrors);
   return {
     header,
     records,
     trackerRevision,
     csvErrors,
   };
+}
+
+function validateTypedStoryRelationships(records, csvErrors) {
+  const recordsById = new Map();
+  for (const record of records) {
+    const taskId = String(record.TaskID ?? '').trim();
+    if (!taskId) continue;
+    const matches = recordsById.get(taskId) ?? [];
+    matches.push(record);
+    recordsById.set(taskId, matches);
+  }
+  for (const [index, record] of records.entries()) {
+    if (!taskTypes.has(record.TaskType) || isStory(record)) continue;
+    const parentId = String(record.ParentID ?? '').trim();
+    if (parentId) {
+      const parents = recordsById.get(parentId) ?? [];
+      if (parents.length !== 1 || !isStory(parents[0])) {
+        csvErrors.push({
+          code: 'story-parent', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
+          message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) ParentID '${parentId}' must reference exactly one Story.`,
+        });
+      }
+    }
+    const storyDependencies = taskDependencies(record)
+      .filter((dependencyId) => (recordsById.get(dependencyId) ?? []).some((dependency) => isStory(dependency)));
+    if (storyDependencies.length) {
+      csvErrors.push({
+        code: 'story-dependency', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
+        dependencyIds: storyDependencies,
+        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) cannot depend on Story: ${storyDependencies.join(', ')}.`,
+      });
+    }
+  }
 }
 
 function canonicalCyclePath(path) {
@@ -327,6 +400,33 @@ async function withTrackerLock(action) {
   }
 }
 
+async function withToolchainIssueLock(action) {
+  if (!toolchainIssueEventsPath) {
+    const error = new Error('No tracker is configured for toolchain issue tracking.');
+    error.statusCode = 503;
+    throw error;
+  }
+  const lockPath = `${toolchainIssueEventsPath}.lock`;
+  await mkdir(dirname(lockPath), { recursive: true });
+  let lock;
+  try {
+    lock = await open(lockPath, 'wx');
+  } catch (error) {
+    if (error?.code === 'EEXIST') {
+      const conflict = new Error('Toolchain issues are being updated by another request. Reload and try again.');
+      conflict.statusCode = 409;
+      throw conflict;
+    }
+    throw error;
+  }
+  try {
+    return await action();
+  } finally {
+    await lock.close().catch(() => {});
+    await unlink(lockPath).catch(() => {});
+  }
+}
+
 async function withRunLock(taskId, runId, action) {
   const directory = recordDirectory(taskId, runId);
   const lockPath = join(directory, '.run.lock');
@@ -351,23 +451,28 @@ async function withRunLock(taskId, runId, action) {
 
 function summarize(records) {
   const statusCounts = Object.groupBy(records, ({ Status }) => Status || 'Unspecified');
-  const ownerActions = records.filter(({ Status }) => ownerInputStatuses.has(Status));
-  const currentWork = records.filter(({ Status }) => ['In Progress', 'In Review'].includes(Status));
-  const blockers = records.filter(({ Status }) => Status === 'Blocked');
+  const executable = records.filter((record) => !isStory(record));
+  const ownerActions = executable.filter(({ Status }) => ownerActionStatuses.has(Status));
+  const currentWork = executable.filter(({ Status }) => ['In Progress', 'In Review', 'Awaiting Agent Evaluation'].includes(Status));
+  const dependencyWaits = executable.filter((record) => isExpectedDependencyWait(records, record));
+  const blockers = executable.filter((record) => record.Status === 'Blocked' && !dependencyWaits.includes(record));
   return {
     generatedAt: new Date().toISOString(),
     total: records.length,
+    executableCount: executable.length,
+    storyCount: records.length - executable.length,
     statusCounts: Object.fromEntries(Object.entries(statusCounts).map(([status, tasks]) => [status, tasks.length])),
     ownerActions,
     currentWork,
     blockers,
+    dependencyWaits,
   };
 }
 
 const serialLaneStatuses = new Set(['Ready', 'In Progress', 'In Review']);
 
 function isAgentTask(record) {
-  return String(record.ReviewRequired ?? '').trim().toLowerCase() === 'yes';
+  return !isStory(record) && String(record.ReviewRequired ?? '').trim().toLowerCase() === 'yes';
 }
 
 function serialLaneOccupants(records, excludedTaskId = '') {
@@ -396,16 +501,152 @@ function armedMarker(taskId) {
 }
 
 function isArmedBy(record, taskId) {
-  return record.Status === 'Blocked' && record.Evidence?.includes(armedMarker(taskId));
+  // Evidence is append-only: an old arm marker cannot override a later blocker.
+  return record.Status === 'Blocked' && !record.Implementer && !record.ReviewClaim
+    && record.Evidence?.includes(armedMarker(taskId))
+    && ['In Progress', 'In Review'].some((status) => record.Blocker === `Waiting for active predecessor ${taskId} (${status}).`);
+}
+
+function isExpectedDependencyWait(records, record) {
+  if (record.Status !== 'Blocked' || record.Implementer || record.ReviewClaim) return false;
+  const unfinished = taskDependencies(record)
+    .map((id) => records.find(({ TaskID }) => TaskID === id))
+    .filter((dependency) => dependency?.Status !== 'Done');
+  if (unfinished.length !== 1) return false;
+  const predecessor = unfinished[0];
+  return predecessor && ['In Progress', 'In Review'].includes(predecessor.Status)
+    && isArmedBy(record, predecessor.TaskID);
 }
 
 function appendEvidence(record, line) {
   record.Evidence = record.Evidence ? `${record.Evidence}\n${line}` : line;
 }
 
+function issueFailureKey(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._:-]{0,127}$/.test(normalized)) {
+    const error = new Error('failureKey must be a stable lowercase identifier (letters, digits, dot, underscore, colon or hyphen; 128 characters max).');
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalized;
+}
+
+function issueText(value, label, { required = false, maxLength = 4_000, multiline = false } = {}) {
+  const text = String(value ?? '').trim();
+  if ((required && !text) || text.length > maxLength || (!multiline && /[\r\n]/.test(text))) {
+    const error = new Error(`${label} ${required ? 'is required' : 'is optional'}, must be at most ${maxLength} characters${multiline ? '.' : ' and cannot contain a line break.'}`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return text;
+}
+
+async function appendToolchainIssueEvent(event) {
+  if (!toolchainIssueEventsPath) {
+    const error = new Error('No tracker is configured for toolchain issue tracking.');
+    error.statusCode = 503;
+    throw error;
+  }
+  await mkdir(dirname(toolchainIssueEventsPath), { recursive: true });
+  await appendFile(toolchainIssueEventsPath, `${JSON.stringify(event)}\n`, 'utf8');
+}
+
+function invalidToolchainIssueLog(message) {
+  const error = new Error(`Toolchain issue event log is invalid: ${message}`);
+  error.statusCode = 500;
+  return error;
+}
+
+async function readToolchainIssueEvents() {
+  if (!toolchainIssueEventsPath) {
+    const error = new Error('No tracker is configured for toolchain issue tracking.');
+    error.statusCode = 503;
+    throw error;
+  }
+  let source;
+  try {
+    source = await readFile(toolchainIssueEventsPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  const events = [];
+  for (const [index, line] of source.split('\n').entries()) {
+    if (!line) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      throw invalidToolchainIssueLog(`line ${index + 1} is not JSON.`);
+    }
+    if (!event || typeof event !== 'object' || !['reported', 'acknowledged'].includes(event.event)) {
+      throw invalidToolchainIssueLog(`line ${index + 1} has an unsupported event.`);
+    }
+    try {
+      event.failureKey = issueFailureKey(event.failureKey);
+    } catch {
+      throw invalidToolchainIssueLog(`line ${index + 1} has an invalid failureKey.`);
+    }
+    events.push(event);
+  }
+  return events;
+}
+
+function summarizeToolchainIssues(events) {
+  const byKey = new Map();
+  for (const event of events) {
+    const issue = byKey.get(event.failureKey) ?? {
+      failureKey: event.failureKey,
+      reports: [],
+      acknowledgedReportCount: 0,
+      acknowledgements: [],
+    };
+    if (event.event === 'reported') {
+      issue.reports.push(event);
+    } else {
+      const count = Number(event.acknowledgedReportCount);
+      if (!Number.isInteger(count) || count < issue.acknowledgedReportCount || count > issue.reports.length) {
+        throw invalidToolchainIssueLog(`acknowledgement '${event.eventId ?? 'unknown'}' has an invalid report count.`);
+      }
+      issue.acknowledgedReportCount = count;
+      issue.acknowledgements.push(event);
+    }
+    byKey.set(event.failureKey, issue);
+  }
+  return [...byKey.values()].map((issue) => {
+    const latest = issue.reports.at(-1);
+    const unacknowledgedCount = issue.reports.length - issue.acknowledgedReportCount;
+    return {
+      failureKey: issue.failureKey,
+      toolchain: latest?.toolchain ?? '',
+      operation: latest?.operation ?? '',
+      summary: latest?.summary ?? '',
+      detail: latest?.detail ?? '',
+      latestEvidenceRef: latest?.evidenceRef ?? '',
+      totalReportCount: issue.reports.length,
+      acknowledgedReportCount: issue.acknowledgedReportCount,
+      unacknowledgedCount,
+      firstReportedAt: issue.reports[0]?.timestamp ?? '',
+      latestReportedAt: latest?.timestamp ?? '',
+      latestAcknowledgement: issue.acknowledgements.at(-1) ?? null,
+      recentReports: issue.reports.slice(-3).reverse().map((report) => ({
+        eventId: report.eventId,
+        timestamp: report.timestamp,
+        taskId: report.taskId,
+        runId: report.runId ?? '',
+        reporter: report.reporter,
+        evidenceRef: report.evidenceRef ?? '',
+      })),
+    };
+  }).sort((left, right) => right.unacknowledgedCount - left.unacknowledgedCount
+    || String(right.latestReportedAt).localeCompare(String(left.latestReportedAt))
+    || left.failureKey.localeCompare(right.failureKey));
+}
+
 function armImmediateSuccessor(records, predecessor, timestamp) {
   if (!serialLaneEnabled || !isAgentTask(predecessor) || !['In Progress', 'In Review'].includes(predecessor.Status)) return [];
-  const candidates = records.filter((record) => record.Status === 'Backlog'
+  const candidates = records.filter((record) => !isStory(record) && record.Status === 'Backlog'
     && taskDependencies(record).includes(predecessor.TaskID)
     && dependenciesOtherThan(record, predecessor.TaskID).every((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status === 'Done'));
   if (candidates.length !== 1) return [];
@@ -436,7 +677,7 @@ function ownerWaitStatus(record) {
 
 function advanceImmediateSuccessor(records, predecessor, timestamp) {
   if (!serialLaneEnabled || predecessor.Status !== 'Done') return [];
-  const candidates = records.filter((record) => (record.Status === 'Backlog' || isArmedBy(record, predecessor.TaskID))
+  const candidates = records.filter((record) => !isStory(record) && (record.Status === 'Backlog' || isArmedBy(record, predecessor.TaskID))
     && taskDependencies(record).includes(predecessor.TaskID)
     && allDependenciesDone(records, record));
   if (candidates.length !== 1) return [];
@@ -516,7 +757,8 @@ function taskDependencies(record) {
 function requireTaskCreationColumns(header) {
   const missing = taskCreationColumns.filter((column) => !header.includes(column));
   if (!missing.length) return;
-  const error = new Error(`Task creation requires the standard tracker columns. Missing: ${missing.join(', ')}.`);
+  const migrationHint = missing.includes('TaskType') ? ' Run POST /api/tracker/task-types/migrate first for an existing tracker.' : '';
+  const error = new Error(`Task creation requires the standard tracker columns. Missing: ${missing.join(', ')}.${migrationHint}`);
   error.statusCode = 422;
   throw error;
 }
@@ -532,7 +774,51 @@ function creationText(value, label, { required = false, maxLength = 4_000 } = {}
   return text;
 }
 
-function newTaskRecord(header, body, timestamp) {
+function requestedTaskType(value) {
+  const selected = creationText(value, 'taskType', { required: true, maxLength: 16 });
+  if (!taskTypes.has(selected)) {
+    const error = new Error('taskType must be exactly Task, Bug or Story.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return selected;
+}
+
+function assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, reviewRequired }) {
+  const dependencies = dependsOn.split(';').map((value) => value.trim()).filter(Boolean);
+  if (selectedType === 'Story') {
+    if (parentId || dependencies.length || reviewRequired !== 'No') {
+      const error = new Error('Story is a non-executable scope container: it cannot have ParentID or DependsOn and must use reviewRequired=No.');
+      error.statusCode = 422;
+      throw error;
+    }
+    return;
+  }
+  if (parentId) {
+    const parent = records.find(({ TaskID }) => TaskID === parentId);
+    if (!parent) {
+      const error = new Error(`Parent Story '${parentId}' was not found.`);
+      error.statusCode = 422;
+      throw error;
+    }
+    if (!isStory(parent)) {
+      const error = new Error(`Parent '${parentId}' must have TaskType Story; ${parentId} is ${taskType(parent)}.`);
+      error.statusCode = 422;
+      throw error;
+    }
+  }
+  const storyDependencies = dependencies.filter((dependencyId) => {
+    const dependency = records.find(({ TaskID }) => TaskID === dependencyId);
+    return dependency && isStory(dependency);
+  });
+  if (storyDependencies.length) {
+    const error = new Error(`Story is organizational only and cannot be used as DependsOn: ${storyDependencies.join(', ')}.`);
+    error.statusCode = 422;
+    throw error;
+  }
+}
+
+function newTaskRecord(header, body, timestamp, records) {
   const agent = reviewerIdentity(body.agent);
   const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
   const candidate = body.newTask;
@@ -542,6 +828,7 @@ function newTaskRecord(header, body, timestamp) {
     throw error;
   }
   const taskId = safePathSegment(candidate.taskId, 'Task ID');
+  const selectedType = requestedTaskType(candidate.taskType);
   const parentId = creationText(candidate.parentId, 'parentId', { maxLength: 128 });
   if (parentId) safePathSegment(parentId, 'Parent ID');
   const dependsOn = creationText(candidate.dependsOn, 'dependsOn', { maxLength: 4_000 });
@@ -552,8 +839,10 @@ function newTaskRecord(header, body, timestamp) {
     error.statusCode = 400;
     throw error;
   }
+  assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, reviewRequired });
   const values = {
     TaskID: taskId,
+    TaskType: selectedType,
     ParentID: parentId,
     Milestone: creationText(candidate.milestone, 'milestone', { required: true, maxLength: 256 }),
     Workstream: creationText(candidate.workstream, 'workstream', { required: true, maxLength: 256 }),
@@ -946,12 +1235,17 @@ function packetFor(record, records, runs, trackerRevision) {
   const reverseDependencies = records
     .filter((candidate) => taskDependencies(candidate).includes(record.TaskID))
     .map((candidate) => ({ taskId: candidate.TaskID, status: candidate.Status, task: candidate.Task }));
+  const scopeSummary = (item) => ({
+    taskId: item.TaskID, taskType: taskType(item), goal: item.Task,
+    acceptance: item.Acceptance, specRef: item.SpecRef, milestone: item.Milestone,
+  });
+  const story = records.find((candidate) => candidate.TaskID === record.ParentID && isStory(candidate));
   return {
     trackerRevision,
     task: record,
     packet: {
       goal: record.Task,
-      nonGoals: 'Only the CSV Task Scope, explicit Acceptance, necessary verification and required evidence.',
+      nonGoals: 'Task-specific exclusions are in SpecRef and the Story scope when present; no separate non-goals field is stored. A Story does not authorize work outside this task contract.',
       acceptance: record.Acceptance,
       specRef: record.SpecRef,
       blocker: record.Blocker,
@@ -959,6 +1253,11 @@ function packetFor(record, records, runs, trackerRevision) {
       dependencies,
       reverseDependencies,
       existingRuns: runs,
+      context: {
+        story: story ? scopeSummary(story) : null,
+        children: isStory(record) ? records.filter((candidate) => !isStory(candidate) && candidate.ParentID === record.TaskID)
+          .map((candidate) => ({ ...scopeSummary(candidate), status: candidate.Status })) : [],
+      },
     },
   };
 }
@@ -1001,7 +1300,8 @@ async function serveStatic(request, response) {
 
 const server = createServer(async (request, response) => {
   try {
-    const requestPath = new URL(request.url, `http://${request.headers.host}`).pathname;
+    const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+    const requestPath = requestUrl.pathname;
     if (request.method === 'GET' && requestPath === '/api/instance') {
       sendJson(response, 200, publicInstanceMetadata());
       return;
@@ -1028,6 +1328,148 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, { ...summarize(records), revision: trackerRevision });
       return;
     }
+    if (request.method === 'GET' && requestPath === '/api/toolchain-issues') {
+      const issues = summarizeToolchainIssues(await readToolchainIssueEvents());
+      const includeAcknowledged = requestUrl.searchParams.get('includeAcknowledged') === 'true';
+      sendJson(response, 200, {
+        generatedAt: new Date().toISOString(),
+        issues: includeAcknowledged ? issues : issues.filter(({ unacknowledgedCount }) => unacknowledgedCount > 0),
+        totalIssueCount: issues.length,
+        activeIssueCount: issues.filter(({ unacknowledgedCount }) => unacknowledgedCount > 0).length,
+      });
+      return;
+    }
+    if (request.method === 'POST' && requestPath === '/api/tracker/task-types/migrate') {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const actor = reviewerIdentity(body.actor);
+      const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        if (header.includes('TaskType')) {
+          const error = new Error('TaskType is already present; no schema migration is needed.');
+          error.statusCode = 409;
+          throw error;
+        }
+        const legacyColumns = taskCreationColumns.filter((column) => column !== 'TaskType');
+        const missing = legacyColumns.filter((column) => !header.includes(column));
+        if (missing.length) {
+          const error = new Error(`Task type migration requires the legacy standard tracker columns. Missing: ${missing.join(', ')}.`);
+          error.statusCode = 422;
+          throw error;
+        }
+        const taskIdIndex = header.indexOf('TaskID');
+        const migratedHeader = [...header];
+        migratedHeader.splice(taskIdIndex + 1, 0, 'TaskType');
+        const timestamp = new Date().toISOString();
+        for (const record of records) {
+          const legacyParentId = String(record.ParentID ?? '').trim();
+          record.TaskType = 'Task';
+          record.ParentID = '';
+          record.Updated = timestamp;
+          appendEvidence(record, `TASK TYPE SCHEMA MIGRATED: ${actor} ${timestamp}; default=Task; ${reason}`);
+          if (legacyParentId) appendEvidence(record, `LEGACY PARENTID RETAINED AS HISTORY: ${legacyParentId}; not interpreted as a Story relationship.`);
+        }
+        await replaceTracker(migratedHeader, records);
+        const after = await readTracker();
+        return { records: after.records, trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
+    if (request.method === 'POST' && requestPath === '/api/toolchain-issues') {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(body.taskId, 'Task ID');
+      const runId = String(body.runId ?? '').trim();
+      if (runId) safePathSegment(runId, 'Run ID');
+      const failureKey = issueFailureKey(body.failureKey);
+      const reporter = reviewerIdentity(body.reporter);
+      const toolchain = issueText(body.toolchain, 'toolchain', { required: true, maxLength: 128 });
+      const operation = issueText(body.operation, 'operation', { required: true, maxLength: 512 });
+      const summary = issueText(body.summary, 'summary', { required: true, maxLength: 2_000 });
+      const detail = issueText(body.detail, 'detail', { maxLength: 8_000, multiline: true });
+      const evidenceRef = issueText(body.evidenceRef, 'evidenceRef', { maxLength: 512 });
+      const { records } = await readTracker();
+      if (!records.some(({ TaskID }) => TaskID === taskId)) {
+        const error = new Error(`Task '${taskId}' was not found.`);
+        error.statusCode = 404;
+        throw error;
+      }
+      if (runId && !(await listTaskRuns(taskId)).some((run) => run.runId === runId)) {
+        const error = new Error(`Run '${runId}' was not found for task '${taskId}'.`);
+        error.statusCode = 404;
+        throw error;
+      }
+      const result = await withToolchainIssueLock(async () => {
+        const event = {
+          eventId: randomUUID(),
+          event: 'reported',
+          timestamp: new Date().toISOString(),
+          failureKey,
+          taskId,
+          ...(runId ? { runId } : {}),
+          reporter,
+          toolchain,
+          operation,
+          summary,
+          ...(detail ? { detail } : {}),
+          ...(evidenceRef ? { evidenceRef } : {}),
+        };
+        await appendToolchainIssueEvent(event);
+        const issue = summarizeToolchainIssues(await readToolchainIssueEvents()).find((candidate) => candidate.failureKey === failureKey);
+        return { event, issue };
+      });
+      sendJson(response, 201, result);
+      return;
+    }
+    const issueAckMatch = /^\/api\/toolchain-issues\/([^/]+)\/ack$/.exec(requestPath);
+    if (request.method === 'POST' && issueAckMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const failureKey = issueFailureKey(decodeURIComponent(issueAckMatch[1]));
+      const acknowledger = reviewerIdentity(body.acknowledger);
+      const notes = issueText(body.notes, 'notes', { required: true, maxLength: 4_000, multiline: true });
+      const expectedReportCount = body.expectedReportCount;
+      if (!Number.isSafeInteger(expectedReportCount) || expectedReportCount < 1) {
+        sendJson(response, 400, { error: 'expectedReportCount must be the positive totalReportCount from the issue you inspected.' });
+        return;
+      }
+      const result = await withToolchainIssueLock(async () => {
+        const issues = summarizeToolchainIssues(await readToolchainIssueEvents());
+        const issue = issues.find((candidate) => candidate.failureKey === failureKey);
+        if (!issue) {
+          const error = new Error(`Toolchain issue '${failureKey}' was not found.`);
+          error.statusCode = 404;
+          throw error;
+        }
+        if (issue.totalReportCount !== expectedReportCount) {
+          const error = new Error('Toolchain issue has changed. Reload and inspect its new reports before acknowledging.');
+          error.statusCode = 409;
+          throw error;
+        }
+        if (issue.unacknowledgedCount === 0) {
+          const error = new Error(`Toolchain issue '${failureKey}' has no new reports to acknowledge.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        const event = {
+          eventId: randomUUID(),
+          event: 'acknowledged',
+          timestamp: new Date().toISOString(),
+          failureKey,
+          acknowledgedReportCount: issue.totalReportCount,
+          acknowledger,
+          notes,
+        };
+        await appendToolchainIssueEvent(event);
+        const acknowledged = summarizeToolchainIssues(await readToolchainIssueEvents()).find((candidate) => candidate.failureKey === failureKey);
+        return { event, issue: acknowledged };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
     if (request.method === 'POST' && requestPath === '/api/tasks') {
       verifyMutationRequest(request);
       const body = await readJson(request);
@@ -1036,7 +1478,7 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         requireTaskCreationColumns(header);
         const timestamp = new Date().toISOString();
-        const record = newTaskRecord(header, body, timestamp);
+        const record = newTaskRecord(header, body, timestamp, records);
         if (records.some(({ TaskID }) => TaskID === record.TaskID)) {
           const error = new Error(`Task '${record.TaskID}' already exists.`);
           error.statusCode = 409;
@@ -1121,6 +1563,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 404;
           throw error;
         }
+        assertExecutableTask(record, 'start a managed Run');
         if (record.Status !== 'Ready') {
           const error = new Error(`Only Ready tasks can start a managed Run. ${taskId} is '${record.Status}'.`);
           error.statusCode = 409;
@@ -1397,6 +1840,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 404;
           throw error;
         }
+        assertExecutableTask(record, 'be reviewed');
         if (record.Status !== 'In Review') {
           const error = new Error(`Only In Review tasks can be reviewed. ${taskId} is '${record.Status}'.`);
           error.statusCode = 409;
@@ -1528,6 +1972,12 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'receive a dependency revision');
+        const storyDependencies = taskDependencies({ DependsOn: dependsOn })
+          .filter((dependencyId) => isStory(records.find(({ TaskID }) => TaskID === dependencyId)));
+        if (storyDependencies.length) {
+          const error = new Error(`Story is organizational only and cannot be used as DependsOn: ${storyDependencies.join(', ')}.`); error.statusCode = 422; throw error;
+        }
         // A closed blocked Run deliberately retains Implementer as historical
         // attribution. Only an active Run or a review claim is a live claim.
         if (!['Backlog', 'Blocked'].includes(record.Status) || record.ReviewClaim) {
@@ -1571,6 +2021,7 @@ const server = createServer(async (request, response) => {
         if (!record) {
           const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error;
         }
+        assertExecutableTask(record, 'be blocked');
         if (record.Status !== 'Ready') {
           const error = new Error(`Only an unclaimed Ready task can use pre-claim block. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
         }
@@ -1601,6 +2052,7 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'be dependency-unblocked');
         if (record.Status !== 'Blocked' || record.ReviewClaim) {
           const error = new Error(`Only an unclaimed ordinary Blocked task may be dependency-unblocked. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
         }
@@ -1643,6 +2095,7 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'be parked');
         if (record.Status !== 'Blocked' || record.ReviewClaim) {
           const error = new Error(`Only an unclaimed Blocked task can be parked. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
         }
@@ -1679,6 +2132,7 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'be admitted');
         if (record.Status !== 'Backlog' || record.ReviewClaim) {
           const error = new Error(`Only an unclaimed Backlog task can be admitted. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
         }
@@ -1731,6 +2185,8 @@ const server = createServer(async (request, response) => {
         const authority = records.find(({ TaskID }) => TaskID === authorityTaskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
         if (!authority) { const error = new Error(`Authority task '${authorityTaskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'enter an owner wait');
+        assertExecutableTask(authority, 'act as an owner-wait authority');
         if (isAgentTask(record) || record.Status !== 'Backlog' || record.ReviewClaim || record.Implementer) {
           const error = new Error(`Only an unclaimed non-review Backlog task can enter an owner wait. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
         }
@@ -1775,6 +2231,7 @@ const server = createServer(async (request, response) => {
         requireRevision(body, trackerRevision);
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'receive an owner evaluation');
         if (record.Status !== 'Awaiting Agent Evaluation' || isAgentTask(record)) {
           const error = new Error(`Only a non-review owner task in Awaiting Agent Evaluation can be resolved. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
         }
@@ -1825,6 +2282,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 404;
           throw error;
         }
+        assertExecutableTask(record, 'receive owner feedback');
         if (!ownerInputStatuses.has(record.Status)) {
           const error = new Error(`Feedback is only enabled for owner-facing tasks. ${normalizedTaskId} is '${record.Status}'.`);
           error.statusCode = 409;

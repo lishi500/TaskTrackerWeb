@@ -1,4 +1,4 @@
-const state = { records: [], summary: null, instance: { projectName: 'Task Tracker' }, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
+const state = { records: [], summary: null, issues: null, issuesError: '', instance: { projectName: 'Task Tracker' }, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
 const ownerStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation']);
 const activeMilestoneStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation', 'In Progress', 'In Review']);
 const statusOrder = ['In Progress', 'In Review', 'Awaiting Agent Evaluation', 'Awaiting Owner', 'Awaiting Owner Gate', 'Ready', 'Blocked', 'Done', 'Deferred', 'Backlog'];
@@ -31,6 +31,26 @@ function renderInstanceIdentity() {
 
 function statusBadge(status) {
   return element('span', `status status-${status.toLowerCase().replaceAll(/[^a-z]+/g, '-')}`, status);
+}
+
+function taskType(task) {
+  return ['Task', 'Bug', 'Story'].includes(task.TaskType) ? task.TaskType : 'Task';
+}
+
+function taskTypeBadge(task) {
+  const type = taskType(task);
+  return element('span', `task-type task-type-${type.toLowerCase()}`, type);
+}
+
+function storyChildSummary(task) {
+  const children = state.records.filter((candidate) => candidate.ParentID === task.TaskID);
+  if (!children.length) return '尚未拆分子项';
+  const active = children.filter((candidate) => ['In Progress', 'In Review'].includes(candidate.Status)).length;
+  const blocked = children.filter((candidate) => candidate.Status === 'Blocked').length;
+  const parts = [`${children.length} 个子项`];
+  if (active) parts.push(`${active} 进行中`);
+  if (blocked) parts.push(`${blocked} 受阻`);
+  return parts.join(' · ');
 }
 
 function findTask(taskId) { return state.records.find((record) => record.TaskID === taskId); }
@@ -116,24 +136,46 @@ function openTask(taskId) {
   if (!task) return;
   const target = document.querySelector('#task-detail');
   target.replaceChildren();
-  target.append(element('p', 'eyebrow', task.Workstream || 'TASK'));
+  target.append(element('p', 'eyebrow', `${taskType(task).toUpperCase()} · ${task.Workstream || 'TASK'}`));
   target.append(element('h2', null, `${task.TaskID} · ${task.Task}`));
-  target.append(statusBadge(task.Status));
+  target.append(taskTypeBadge(task), statusBadge(task.Status));
   const metadata = [
-    ['Milestone', task.Milestone], ['Owner role', task.OwnerRole], ['Priority', task.Priority],
+    ['Type', taskType(task)], ['Milestone', task.Milestone], ['ParentID', task.ParentID || '无'], ['Owner role', task.OwnerRole], ['Priority', task.Priority],
     ['SpecRef', task.SpecRef], ['DependsOn', task.DependsOn || '无'], ['Blocker', task.Blocker || '无'],
     ['Acceptance', task.Acceptance], ['Evidence', task.Evidence || '暂无'],
   ];
+  if (taskType(task) === 'Story') metadata.splice(3, 0, ['Child items', storyChildSummary(task)]);
   const details = element('dl', 'task-details');
   for (const [label, value] of metadata) {
     details.append(element('dt', null, label));
     details.append(element('dd', null, value));
   }
   target.append(details);
-  const runPanel = element('section', 'run-panel');
-  target.append(runPanel);
-  void renderRunPanel(task, runPanel);
-  if (ownerStatuses.has(task.Status)) target.append(feedbackForm(task));
+  const parentStory = findTask(task.ParentID);
+  if (parentStory && taskType(parentStory) === 'Story') {
+    const context = element('section', 'scope-context');
+    context.append(element('h3', null, '所属 Story 范围'), renderTaskLink(parentStory));
+    context.append(element('p', null, parentStory.Acceptance), element('p', 'muted', `契约：${parentStory.SpecRef}`));
+    context.append(element('p', 'muted', 'Story 提供目标背景；本任务的授权范围与验收仍以自身契约为准。'));
+    target.append(context);
+  }
+  if (taskType(task) === 'Story') {
+    const context = element('section', 'scope-context');
+    context.append(element('h3', null, '范围内的工作项'));
+    context.append(element('p', 'muted', 'Story 不可执行。子项完成数量不代表玩家能力已通过验收；整体行为应由明确的 Task 验证。'));
+    const children = state.records.filter((candidate) => taskType(candidate) !== 'Story' && candidate.ParentID === task.TaskID);
+    if (!children.length) context.append(element('p', 'muted', '尚未拆分子项。'));
+    for (const child of children) {
+      const row = element('p'); row.append(renderTaskLink(child), statusBadge(child.Status)); context.append(row);
+    }
+    target.append(context);
+  }
+  if (taskType(task) !== 'Story') {
+    const runPanel = element('section', 'run-panel');
+    target.append(runPanel);
+    void renderRunPanel(task, runPanel);
+  }
+  if (taskType(task) !== 'Story' && ownerStatuses.has(task.Status)) target.append(feedbackForm(task));
   document.querySelector('#task-dialog').showModal();
 }
 
@@ -176,7 +218,7 @@ function renderTaskLink(task) {
 function filteredTasks() {
   const query = document.querySelector('#task-search').value.trim().toLowerCase();
   if (!query) return state.records;
-  return state.records.filter((task) => [task.TaskID, task.Task, task.Status, task.Blocker, task.Milestone].join(' ').toLowerCase().includes(query));
+  return state.records.filter((task) => [task.TaskID, taskType(task), task.Task, task.Status, task.Blocker, task.Milestone].join(' ').toLowerCase().includes(query));
 }
 
 function milestoneCompare(left, right) {
@@ -205,8 +247,9 @@ function milestoneStatusSummary(tasks) {
 function renderMilestoneTask(task) {
   const row = element('article', 'milestone-task');
   const heading = element('div', 'milestone-task-heading');
-  heading.append(renderTaskLink(task)); heading.append(statusBadge(task.Status)); row.append(heading);
+  heading.append(renderTaskLink(task), taskTypeBadge(task), statusBadge(task.Status)); row.append(heading);
   const metadata = [];
+  if (taskType(task) === 'Story') metadata.push(storyChildSummary(task));
   if (task.Priority) metadata.push(task.Priority);
   if (task.DependsOn) metadata.push(`依赖 ${task.DependsOn.split(';').filter(Boolean).length} 项`);
   if (task.Updated) metadata.push(`更新 ${task.Updated}`);
@@ -255,7 +298,7 @@ function renderOwnerActions() {
     const card = element('article', 'action-card');
     card.append(statusBadge(task.Status)); card.append(renderTaskLink(task));
     if (task.Blocker) card.append(element('p', 'muted', task.Blocker));
-    const action = element('button', 'primary-button', task.Status === 'Awaiting Agent Evaluation' ? '查看或补充反馈' : '处理此项');
+    const action = element('button', 'primary-button', '处理此项');
     action.type = 'button'; action.addEventListener('click', () => openTask(task.TaskID)); card.append(action);
     target.append(card);
   }
@@ -263,7 +306,7 @@ function renderOwnerActions() {
 
 function renderClaimableSessions() {
   const target = document.querySelector('#claimable-sessions'); target.replaceChildren();
-  const claimable = state.records.filter((task) => task.Status === 'Ready');
+  const claimable = state.records.filter((task) => task.Status === 'Ready' && taskType(task) !== 'Story');
   if (!claimable.length) {
     target.append(element('p', 'empty-state', '当前没有可领取的任务。'));
     return;
@@ -296,11 +339,12 @@ function renderTable() {
   for (const task of filteredTasks()) {
     const row = document.createElement('tr');
     const latestRun = task.RunSummary?.current || task.RunSummary?.latest;
-    const cells = [task.TaskID, task.Milestone, task.Task, task.Status, runLabel(latestRun), task.DependsOn || '—', task.Updated || '—'];
+    const cells = [task.TaskID, taskType(task), task.Milestone, task.Task, task.Status, runLabel(latestRun), task.DependsOn || '—', task.Updated || '—'];
     cells.forEach((value, index) => {
       const cell = document.createElement('td');
       if (index === 0) cell.append(renderTaskLink(task));
-      else if (index === 3) cell.append(statusBadge(value));
+      else if (index === 1) cell.append(taskTypeBadge(task));
+      else if (index === 4) cell.append(statusBadge(value));
       else cell.textContent = value;
       row.append(cell);
     });
@@ -308,20 +352,89 @@ function renderTable() {
   }
 }
 
+function issueCountLabel(issue) {
+  return issue.acknowledgedReportCount > 0
+    ? `${issue.unacknowledgedCount} (${issue.acknowledgedReportCount})`
+    : String(issue.unacknowledgedCount);
+}
+
+function renderToolchainIssues() {
+  const target = document.querySelector('#toolchain-issues');
+  target.replaceChildren();
+  document.querySelector('#toolchain-alert-count').textContent = state.issuesError || !state.issues ? '—' : state.issues.activeIssueCount;
+  if (state.issuesError || !state.issues) {
+    target.append(element('p', state.issuesError ? 'run-blocker' : 'muted', state.issuesError || '正在读取工具链报警…'));
+    return;
+  }
+  if (!state.issues.issues.length) {
+    target.append(element('p', 'empty-state', document.querySelector('#include-acknowledged').checked ? '尚无工具链报警记录。' : '当前没有未确认的工具链报警。'));
+    return;
+  }
+  for (const issue of state.issues.issues) {
+    const card = element('article', 'toolchain-issue-card');
+    const heading = element('div', 'toolchain-issue-heading');
+    heading.append(element('code', 'failure-key', issue.failureKey), element('span', 'issue-count', issueCountLabel(issue)));
+    card.append(heading, element('p', 'toolchain-issue-summary', issue.summary));
+    card.append(element('p', 'muted', `${issue.toolchain} · ${issue.operation}`));
+    if (issue.detail) card.append(element('pre', 'toolchain-issue-detail', issue.detail));
+    if (issue.latestEvidenceRef) card.append(element('p', 'muted', `最新证据：${issue.latestEvidenceRef}`));
+    const reports = issue.recentReports.map((report) => `${report.taskId}${report.runId ? ` / ${report.runId}` : ''}`).join(' · ');
+    if (reports) card.append(element('p', 'muted', `最近关联：${reports}`));
+    if (issue.latestAcknowledgement) {
+      const ack = issue.latestAcknowledgement;
+      card.append(element('p', 'muted', `最近 ACK：${ack.acknowledger} · ${ack.timestamp} · ${ack.notes}`));
+    }
+    if (!issue.unacknowledgedCount) {
+      card.append(element('p', 'muted', '已 ACK，保留历史；尚不能据此认定已修复。'));
+      target.append(card);
+      continue;
+    }
+    const form = element('form', 'issue-ack-form');
+    const acknowledger = document.createElement('input');
+    acknowledger.name = 'acknowledger'; acknowledger.required = true; acknowledger.maxLength = 256; acknowledger.placeholder = '确认人';
+    const notes = document.createElement('textarea');
+    notes.name = 'notes'; notes.required = true; notes.maxLength = 4000; notes.placeholder = '说明处理、排查或转交动作；ACK 不等于问题已修复。';
+    const button = element('button', 'secondary-button', 'ACK 新报警'); button.type = 'submit';
+    form.append(acknowledger, notes, button);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      button.disabled = true;
+      setMessage(`正在确认 ${issue.failureKey} 的新报警…`);
+      try {
+        const response = await fetch(`/api/toolchain-issues/${encodeURIComponent(issue.failureKey)}/ack`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ acknowledger: acknowledger.value, notes: notes.value, expectedReportCount: issue.totalReportCount }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(response.status === 409 ? '报警已变化，请刷新并查看新报告后再 ACK。' : payload.error || '确认工具链报警失败。');
+        setMessage(`${issue.failureKey} 的新报警已 ACK；历史报告会被保留。`);
+        await load();
+      } catch (error) {
+        setMessage(error.message, true);
+      } finally { button.disabled = false; }
+    });
+    card.append(form);
+    target.append(card);
+  }
+}
+
 function render() {
   document.querySelector('#total-count').textContent = state.summary.total;
+  document.querySelector('#work-item-breakdown').textContent = `${state.summary.executableCount} 个 Task/Bug · ${state.summary.storyCount} 个 Story；数量不代表产品完成度。`;
   document.querySelector('#owner-count').textContent = state.summary.ownerActions.length;
   document.querySelector('#work-count').textContent = state.summary.currentWork.length;
   document.querySelector('#blocked-count').textContent = state.summary.blockers.length;
   renderOwnerActions();
   renderCompactList('#current-work', state.summary.currentWork, '当前没有 Agent 正在处理的任务。');
   renderCompactList('#blockers', state.summary.blockers, '当前没有受阻任务。');
+  renderCompactList('#dependency-waits', state.summary.dependencyWaits, '当前没有自动排队的依赖等待。');
+  renderToolchainIssues();
   renderClaimableSessions();
   renderMilestones();
   renderTable();
 }
 
-async function load() {
+async function loadTracker() {
   try {
     const [trackerResponse, summaryResponse, instanceResponse] = await Promise.all([fetch('/api/tracker'), fetch('/api/summary'), fetch('/api/instance')]);
     const tracker = await trackerResponse.json(); const summary = await summaryResponse.json(); const instance = await instanceResponse.json();
@@ -333,6 +446,24 @@ async function load() {
   } catch (error) { setMessage(error.message, true); }
 }
 
+async function loadToolchainIssues() {
+  try {
+    const includeAcknowledged = document.querySelector('#include-acknowledged').checked;
+    const response = await fetch(`/api/toolchain-issues?includeAcknowledged=${includeAcknowledged}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '无法读取工具链报警。');
+    state.issues = payload; state.issuesError = '';
+  } catch (error) {
+    state.issues = null; state.issuesError = `工具链报警暂不可用：${error.message}`;
+  }
+  renderToolchainIssues();
+}
+
+async function load() {
+  await Promise.all([loadTracker(), loadToolchainIssues()]);
+}
+
 document.querySelector('#refresh-button').addEventListener('click', load);
 document.querySelector('#task-search').addEventListener('input', () => { renderMilestones(); renderTable(); });
+document.querySelector('#include-acknowledged').addEventListener('change', loadToolchainIssues);
 load();

@@ -1,107 +1,75 @@
 ---
 name: game-task-hub
-description: "Operate a local single-game TaskTrackerWeb instance as the sole task-state authority, including task packets, owner feedback, managed Agent Runs, independent review, durable evidence, and CSV safety rules."
+description: "Operate or maintain a local single-game TaskTrackerWeb: plan Story/Task/Bug work, run and review tasks, handle owner feedback, preserve evidence, and report cross-task toolchain failures."
 ---
 
 # Game Task Hub
 
-Use this skill when a request concerns a local TaskTrackerWeb instance, its task CSV, owner feedback workflow, Agent handoff, managed Agent Runs, or its connection to one game repository.
+Use the project's current Hub for task state. This skill coordinates delivery and evidence; it does not decide gameplay, execute Unity tooling, certify product quality, or authorize unrelated work.
 
-## What this tool is
+## Find the right authority
 
-TaskTrackerWeb is a lightweight, local task-management companion for **one game per Tracker instance**. The game code repository and the Tracker repository stay separate:
+- For game work, read its `AGENTS.md` and Tracker location, then retrieve `GET /api/tasks/<TaskID>/packet`. Read the task's SpecRef and resolved `packet.context.story` when present. Old handoff text and chat summaries are not current state.
+- For template development, read [README](../../../README.md) and [product/API contract](../../../task_hub_product_spec.md). Generic changes belong in TaskTrackerWeb; game rules, task data and instance config stay in the game/instance.
+- Each game has one separate Tracker instance. `tracker/task_tracker.csv` owns current task state; `tracker/task-records/<TaskID>/<RunID>/` holds execution evidence. `tracker/toolchain_issue_events.jsonl` owns toolchain reports/ACK history only.
+- Read task/dependency state before mutations. Use Hub operations, never direct edits to the live CSV, Run manifests or event sources. Same-origin JSON is required for every write; task writes also need the current `trackerRevision`. On stale revision, reread and reconcile rather than blindly retry.
 
-```text
-<Game>/                         game code, assets, game-specific AGENTS.md
-<Game>-Tracker/                 task state, evidence and TaskTrackerWeb
-  tracker/task_tracker.csv      only current task-state source of truth
-  tracker/task_events.jsonl     append-only task-state audit export
-  tracker/task-records/         longer evidence and Agent Run records
-```
+## Plan a deliverable without creating process noise
 
-Do not combine several games into one Tracker instance, and do not embed TaskTrackerWeb inside the game code repository. A Run is execution evidence under one task, not an independent task workflow; never maintain a second task status in the game repository, chat, or a Unity-specific tracker.
+| Work item | Use | Boundary |
+| --- | --- | --- |
+| Story | Coherent feature scope or a future player outcome | Non-executable container: no ParentID/DependsOn, ReviewRequired=No; never claim, admit, review, or depend on it |
+| Task | An independently verifiable delivery or technical prerequisite | May have a Story parent; acceptance defines the authorized outcome |
+| Bug | A distinct defect/regression needing its own tracked correction | Uses the same dependency, Run and review workflow as Task |
 
-## Template and instance boundary
+Milestone is the delivery grouping, not a fourth TaskType. ParentID is scope context, not an execution dependency. Legacy CSV reads as Task until an explicit migration; do not reinterpret historical ParentID values as Story links.
 
-`TaskTrackerWeb` is the reusable template. Generic workflow, API, UI, validation, documentation, Skill and regression-test changes must be made, reviewed and committed in that template first. An instance may then receive an intentional one-way code/Skill/test sync.
+Plan the current slice in detail and future work coarsely. A player-facing slice needs one accountable delivery lead and an executable integration-acceptance Task; technical child tasks may still be small. Completing children does not prove or auto-complete the Story's player outcome. Link the slice contract in SpecRef and put observable behavior in Acceptance; Story context never expands a child's scope by itself.
 
-Never copy an instance's `tracker/`, `task-hub.config.json`, task IDs, project name/branding, project-specific workflow policy, task records, evidence or local port into the template. Conversely, a template upgrade must not overwrite those instance-owned paths. If a problem is discovered while operating one game, first extract the smallest project-neutral rule and regression test in the template; keep any remaining game-specific policy in that game's repository or Tracker instance.
+Keep diagnosis, attempted repairs and reruns within the current task when its contract still covers them. Create a Bug/Task for a distinct scope, independent dependency, or new defect in completed work. Do not create a ticket per command, thought or review step; independent review normally lives on the implementation task. Preserve old acceptance/evidence rather than rewriting history.
 
-For an existing instance, first run `node scripts/sync-template.mjs --target <instance>` from the template to inspect the declared shared paths. Apply only with the explicit `--apply` form, then verify the instance. The synchronizer preserves `tracker/` and `task-hub.config.json` and refuses symlinks; never replace those protections with an ad-hoc bulk copy.
+`ReviewRequired=No` is currently the convention for non-review owner work, not a supported Agent self-review switch. TaskType does not separate execution responsibility from review policy. Keep reviewed Agent Task/Bug work as Yes until that contract is explicitly changed.
 
-## Create a new Tracker instance
+## Execute and report what the evidence proves
 
-From a new clone of the TaskTrackerWeb template, run:
+1. Inspect the packet, dependency evidence, actual working tree and required environment/materials. Identify the player/technical result this work supports and its verification boundary. Read [evidence guidance](references/delivery-evidence.md) for slice planning, verification or handoff; it is a compact format, not another status database.
+2. Only a Ready Task/Bug can start: `POST /api/runs/start` with `taskId`, revision, `agent`, `verificationProfile`, `scope`, and `expectedBehavior`. Hub allocates the Run ID. A missing/contradictory prerequisite can use pre-claim `/block`; routine investigation within authorized scope is Agent work, not automatically an owner decision.
+3. Append material observations through the Run `/events` endpoint and store concise evidence through `/artifacts`. Do not record repetitive polling or hidden reasoning. Text artifacts are immutable and limited to 128 KB each, 32 files / 512 KB per Run. Put large/binary evidence in durable project/artifact storage and reference it with repository identity and build/hash information.
+4. Close through `/api/tasks/<TaskID>/runs/<RunID>/close` using the latest revision, `summary`, and one outcome:
+   - `verified` → In Review. This is the implementer's claim, not automatic evidence validation or Done.
+   - `blocked` → Blocked; provide a concrete blocker.
+   - `awaiting-human` → explicit `ownerStatus` of Awaiting Owner or Awaiting Owner Gate; explain the minimum human action actually required.
+   - `incomplete` → remains In Progress with the Run still active; this does not release a claim or the serial lane.
 
-```bash
-node scripts/init-instance.mjs --project-id <lowercase-id> --project-name "<Game name>"
-node scripts/start.mjs
-```
+Choose verification for the claim: pure logic, actual scene integration, target-device behavior, or human experience. Compilation, component tests or a screenshot alone cannot certify a complete player path. Poll asynchronous tests to their true terminal result; a start response or 0/0 is not a pass. Preserve unverified scope.
 
-The initializer refuses to overwrite an existing `tracker/task_tracker.csv`. It copies `templates/task_tracker.skeleton.csv`; replace its four illustrative rows (`BACKLOG-001`, `DEC-001`, `IMPL-001`, `REV-001`) before treating the instance as actual project state.
+A distinct reviewer claims an In Review task through `/review`, then records approved/rejected/blocked with notes and current revision; blocked also needs a blocker. Do not impersonate independence by changing your own name. Review the acceptance's coverage as well as implementation/evidence. Approved becomes Done; rejected returns Ready; blocked preserves the actual obstruction.
 
-To make this instance's current Skill available to Agents working inside the separate game repository, run once:
+## State and handoff rules
 
-```bash
-node scripts/link-game-skill.mjs /absolute/path/to/<Game>
-```
+- Backlog is unadmitted work; Ready is claimable; Blocked is a specific near-term obstruction. Normal automatic dependency waits appear separately on the dashboard but retain CSV Blocked. Unknown/custom blocker reasons remain actionable.
+- With serialLane enabled, only one reviewed Agent task can be Ready/In Progress/In Review. Start arms a unique direct successor; completion may advance one eligible successor. Ambiguous fan-out needs explicit coordinator selection. Do not keep an executable parent claimed while expecting children to run.
+- Owner actions are Awaiting Owner / Awaiting Owner Gate. After feedback, Awaiting Agent Evaluation is **Agent work**, although the owner may supplement feedback. Raw input is not approval; coordinator `/owner-evaluation` resolves only non-review owner tasks after checking meaning. This is the separate owner-task route to Done.
+- Run close requires an explicit ownerStatus. Automatic successor routing separately uses configured `ownerGateTaskPattern`; neither route proves project Gate eligibility.
+- Technical choices and routine bugs stay with the Agent within existing authorization. Escalate actual product/scope/acceptance/budget changes or human-only access, giving facts, options, recommendation and the minimum requested decision. A tool report does not automatically require owner troubleshooting.
+- Keep dynamic handoff state in the Hub. Link stable contracts and current packets; any saved snapshot must carry its time/revision and not become another editable activity list.
 
-This creates a symbolic link, so future updates to this instance's Skill apply immediately. Do not replace an existing game-local `game-task-hub` Skill without checking its owner and purpose.
+For creation, contract/dependency revision, park/admit/unblock, owner-wait and owner-evaluation payloads/eligibility, read the relevant section of the [API contract](../../../task_hub_product_spec.md). Read-only `/api/dependency-audit` remains available when malformed CSV blocks other operations. Do not bypass an audit failure by editing active state.
 
-`scripts/start.mjs` binds to loopback and chooses an available port by default. Use `PORT=<number>` only when a stable local URL is needed. Do not expose the unauthenticated service on a LAN or public network.
+## Toolchain failure reporting and bounded recovery
 
-## First read
+Report a concrete infrastructure/tool failure with `POST /api/toolchain-issues`: `{ taskId, runId?, failureKey, reporter, toolchain, operation, summary, detail?, evidenceRef? }`. It uses its own event source and needs no tracker revision. Include the allocated Run when there is one; pre-claim incidents can omit it.
 
-1. When working on the game, read that game's `AGENTS.md`, then retrieve `GET /api/tasks/<TaskID>/packet`.
-2. When working on TaskTrackerWeb itself, read [README.md](../../../README.md) and [task_hub_product_spec.md](../../../task_hub_product_spec.md), then confirm no instance-specific name, task state, port, task-ID convention or project policy is entering the template.
-3. Treat `tracker/task_tracker.csv` in the current Tracker instance as the current-state authority. Never use a copied browser view, chat summary, or another game's CSV as task truth.
+Use a stable failure-class key, such as `unity.cli.editor-play-timeout`, across comparable tasks. Keep timestamps, task IDs, paths and raw errors out of the key. Put the command/terminal-result evidence, affected verification and available fallback in detail/evidenceRef. Report actual failed attempts, not each poll of the same attempt; the displayed count is **reports**, not a proven count of unique root causes. Game assertion failures are not automatically toolchain incidents.
 
-## Operating boundary
+Repeated same-class failure without new evidence triggers diagnosis or an authorized alternative, not another identical retry. Multiple basic failures on one player path trigger a review of that path and its acceptance. Use the project's investigation budget/checkpoint; do not invent a universal two-failures owner gate. If a fallback cannot prove the same claim, retain the verification gap rather than silently lower acceptance.
 
-- Use explicit workflow operations. Do not interpret an owner's raw feedback as `Done`, a decision, Gate approval, or dependency unlock.
-- Read task dependencies and reverse dependencies before changing a task. Preserve historical Evidence and use the project's review-independence rules.
-- `Blocked` is only for a task already admitted to the near-term chain that has a concrete actionable blocker. `Backlog` is planned but not yet admitted work; future-Milestone gating alone is Backlog, never Blocked. With `workflow.serialLane=true`, there may be one Agent task in `Ready`/`In Progress`/`In Review` and at most one armed direct successor in `Blocked`; every later link remains Backlog. Backlog capture is not claimable.
-- A task reference may be an HTTPS URL or repository-relative path. Do not upload external/binary material or expose the loopback service without explicit authorization.
-- Use the Hub API to allocate Run IDs, append events/artifacts, close technical outcomes and record independent review. Never edit `task_tracker.csv`, `run.json` or `events.jsonl` directly while the Hub is running.
-- If an inactive `Backlog`/`Ready`/`Blocked` task's `Task`, `SpecRef` or `Acceptance` contradicts its frozen architecture, do not rewrite the old requirement in Evidence. Use `POST /api/tasks/<TaskID>/contract` with the current revision, complete replacement `task`/`specRef`/`acceptance`, named Agent and concrete reason. It retains state/history and appends an audit line; it refuses active Runs, review claims, completed tasks, partial replacements and no-op rewrites.
-- If a newly discovered prerequisite must become part of an existing unstarted task, do not edit CSV. Use `POST /api/tasks/<TaskID>/dependencies` with the current revision, named Agent, concrete reason and the complete semicolon-delimited replacement `dependsOn`. It only accepts inactive `Backlog`/`Blocked` tasks with no active Run or review claim; a historical `Implementer` retained after a closed blocked Run is not a claim. It rejects `Ready`, active, reviewed and completed work, validates the complete proposed graph atomically and records old/new dependency lists in Evidence.
-- If a completed or active task reveals a separate defect, do not reopen it or edit CSV. Create a distinct remediation/planned task through `POST /api/tasks`, with the current revision, named Agent, concrete reason and complete `newTask` contract. The generic service accepts only a valid, unique dependency graph and always creates `Backlog`; it never grants an execution state. Apply the game's Gate rules, then use normal `/admit` to make it eligible.
-- The Hub validates the complete `DependsOn` graph before every mutation and before it atomically writes a proposed update. It rejects unknown Task IDs, duplicate Task IDs, self/duplicate dependencies and cycles with `422`; do not work around that by directly editing the live CSV.
-- For a planned external CSV migration or immediately after adding/removing tasks or changing `DependsOn` outside Hub APIs, call `GET /api/dependency-audit`. It remains readable for invalid CSV and returns deterministic `cycles` plus all structural defects. Fix the CSV deliberately, then re-run the audit; do not silently repair historical task meaning.
+ACK is owner acknowledgement/triage, not a fix or task completion. Do not ACK automatically just because you reported an issue. When authorized to ACK, read the issue first and POST `/api/toolchain-issues/<failureKey>/ack` with `{ acknowledger, notes, expectedReportCount: totalReportCount }`. Missing count is 400; if a new report arrived, 409 requires rereading and inspecting it before another ACK. History is preserved; recurrence `1 (5)` means one unacknowledged report after five previously acknowledged reports. Use `GET /api/toolchain-issues?includeAcknowledged=true` or the history toggle to inspect acknowledged issues. An unavailable health source is not proof of zero issues.
 
-## Managed Agent Run
+## Setup and maintenance (only when needed)
 
-The task packet contains task scope, dependencies, existing Runs and `trackerRevision`. Only a `Ready` task can start a new Run. If goal/non-goals, Acceptance, SpecRef, dependency evidence, current blocker, state/availability, or required verification are absent or contradictory, do not start a Run; report the gap or use the project's authorized workflow to mark it blocked.
-
-Use the Hub's loopback API only after reading the packet. All writes need `Content-Type: application/json` and `Origin: http://127.0.0.1:<port>`.
-
-1. `POST /api/runs/start` with `taskId`, packet `trackerRevision`, `agent`, `verificationProfile`, and concise scope/expected-behavior fields. The Hub atomically assigns `TaskID-R0001`, creates its record and changes `Ready` only to `In Progress`. In serial mode it also arms the unique direct successor from Backlog to Blocked; it never exposes the rest of the chain.
-2. Append an event at every material boundary through `POST /api/tasks/<TaskID>/runs/<RunID>/events`: preflight, baseline, change, verify, diagnose, repair, or escalation. Include a result and an evidence-based message; do not add repetitive no-information events.
-3. Store bounded UTF-8 evidence through `.../artifacts`: `logs/editor.log`, `test-results.xml`, `evidence.md`, or a concise command/result log. For screenshots, builds or larger/binary data, write a repository-relative or HTTPS reference into `evidence.md` instead of uploading it.
-4. Close through `.../close` with the latest `trackerRevision`, a summary and exactly one outcome:
-   - `verified`: Hub moves the task to `In Review`, never `Done`.
-   - `awaiting-human`: include `ownerStatus` exactly equal to `Awaiting Owner` or `Awaiting Owner Gate`; the Hub does not infer it from a task ID.
-   - `blocked`: requires a concrete blocker and moves it to `Blocked`.
-   - `incomplete`: leaves it `In Progress` and records the verification gap.
-
-If a revision is stale, reload the packet and reconcile the newer owner/reviewer update; do not retry with the old revision. If another Run is active, do not compete for the task.
-
-## Independent review and state maintenance
-
-An independent reviewer, different from the CSV `Implementer`, reviews only an `In Review` task. First call `POST /api/tasks/<TaskID>/review` with `action: "claim"` and `reviewer`; then use the new revision to call it with `action: "decision"`, the same reviewer, `approved`, `rejected` or `blocked`, and review notes. A blocked decision also requires a concrete blocker. The Hub rejects self-review, unclaimed decisions and review while an active Run remains. Approval is the only route to `Done`; rejection returns the task to `Ready` while retaining review evidence.
-
-For a contradictory/incomplete unclaimed Ready packet, use `POST /api/tasks/<TaskID>/block` with the current revision, agent, concrete blocker and evidence. It creates no Run. `POST /api/tasks/<TaskID>/unblock` is only a generic dependency transition: it requires a Blocked task with no active Run or review claim, all direct dependencies Done, an agent and a reason. A completed blocked Run's historical `Implementer` is not an active claim; a successful unblock clears it before returning the task to `Ready`. In serial mode, it rejects a new Ready task while another Agent task is Ready/In Progress/In Review.
-
-Use `POST /api/tasks/<TaskID>/park` only to move an unclaimed, inactive `Blocked` task out of the near-term chain into `Backlog`, with a concrete scheduling reason. Use `POST /api/tasks/<TaskID>/admit` to move an unclaimed, inactive `Backlog` task back into the near-term chain: `targetStatus: Ready` requires every direct dependency Done and an empty serial lane; `targetStatus: Blocked` requires one active direct predecessor, all other dependencies Done, and a concrete blocker. These transitions are generic and do not decide whether a project Gate permits admission; enforce the game's Gate/release/decision rules first. After owner UI feedback, do not treat raw text as approval: a coordinator may use `/owner-evaluation` only after independently recording its assessment for a `ReviewRequired=No` task.
-
-When an active managed coordinator Run must expose a direct Human/owner preparation before that coordinator can close, do not edit CSV or pretend the coordinator is already Done. Use `POST /api/tasks/<TaskID>/owner-wait` with `authorityTaskId`, the same claiming `agent`, explicit `ownerStatus` (`Awaiting Owner` or `Awaiting Owner Gate`) and a concrete reason. The Hub accepts this only for an unclaimed non-review `Backlog` task directly depending on that Agent's active `In Progress` authority task; it records evidence and does not unlock dependents. The game workflow, not the generic endpoint, remains responsible for deciding that the transition is allowed.
-
-## Diagnostic logging
-
-Prefer official Unity test, Console, runtime-state and build evidence. Use temporary in-game diagnostic logs only when they reveal a state that those mechanisms cannot expose. Every such log must be `Debug.LogWarning` with `[CyberBudda]`, Task ID, Run ID, expected/actual state and a specific check name. Copy the relevant output into the Run artifact, then remove the instrumentation before production delivery. A trace that merely says a method ran is not functional proof.
-
-## References
-
-- [README.md](../../../README.md): instance creation, launch and Skill linking.
-- [task_hub_product_spec.md](../../../task_hub_product_spec.md): V1.1 task and Agent Run boundaries.
-- [task_tracker.skeleton.csv](../../../templates/task_tracker.skeleton.csv): the 18-column task schema and illustrative workflow rows.
+- New instance: use `node scripts/init-instance.mjs --project-id <id> --project-name "<name>"`, then `node scripts/start.mjs`; replace the illustrative skeleton rows before real use. The initializer refuses an existing tracker. Keep the unauthenticated service on loopback.
+- Legacy schema: inspect current data, then use `POST /api/tracker/task-types/migrate` with `{ trackerRevision, actor, reason }`; it explicitly defaults old rows to Task and retains history. Do not migrate instances merely to inspect them.
+- Link game skill: `node scripts/link-game-skill.mjs /absolute/path/to/game`; inspect an existing link's purpose before replacement.
+- Upgrade instance: implement, validate and commit generic work in the template first. Preview `node scripts/sync-template.mjs --target <instance>`, apply only as part of an authorized upgrade with `--apply`, verify and restart as needed. Protect tracker/, instance config and local links. Template development alone does not imply a live game-instance rollout.
+- Temporary testing logs, if needed, use warn with `[CyberBudda]` and must be removed before production. Use domain execution tools for runtime evidence; this Hub skill owns no game code or Unity test policy.
