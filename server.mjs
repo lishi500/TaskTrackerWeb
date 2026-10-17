@@ -19,6 +19,13 @@ const trackerPath = process.env.TRACKER_CSV
 const publicDir = join(toolDir, 'public');
 const taskRecordsDir = trackerPath ? join(dirname(trackerPath), 'task-records') : undefined;
 const toolchainIssueEventsPath = trackerPath ? join(dirname(trackerPath), 'toolchain_issue_events.jsonl') : undefined;
+// Reported by GET /api/health; the skill's tt.mjs carries the same number and
+// scripts/test-agent-api.mjs fails if the two ever differ.
+const toolVersion = '1.4.0';
+const startedAt = new Date().toISOString();
+// Stable id of this instance (hash of its tracker path, never the path itself)
+// so a second launch can recognise "already running" without leaking locations.
+const instanceId = trackerPath ? createHash('sha256').update(trackerPath.toLowerCase()).digest('hex').slice(0, 12) : '';
 const port = Number(process.env.PORT ?? 4173);
 const host = process.env.HOST ?? '127.0.0.1';
 let activePort = port;
@@ -221,7 +228,15 @@ async function readRawTracker() {
   }
   // Excel's "CSV UTF-8" (and some editors) prepend a BOM; it would otherwise
   // glue itself to the first header cell and hide the TaskID column.
-  const source = stripBom(await readTextWithRetry(trackerPath));
+  let source;
+  try {
+    source = stripBom(await readTextWithRetry(trackerPath));
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw httpError(503, 'The tracker CSV does not exist yet. Initialize this instance: node scripts/init-instance.mjs --project-id <id> --project-name "<name>" (add --empty for a task-free tracker).', 'tracker-missing');
+    }
+    throw error;
+  }
   const trackerRevision = createHash('sha256').update(source).digest('hex');
   let rows;
   try {
@@ -620,6 +635,90 @@ function summarize(records) {
     blockers,
     dependencyWaits,
   };
+}
+
+// ---- Agent-facing compact reads (GET /api/tasks, GET /api/next) ------------------
+// One small object per task instead of the 19-column record with its Evidence
+// log; field names match the write payloads (dependsOn is the ';'-separated string).
+function compactTask(record, activeRun = null) {
+  return {
+    taskId: record.TaskID,
+    taskType: taskType(record),
+    status: record.Status,
+    milestone: record.Milestone,
+    parentId: record.ParentID,
+    dependsOn: record.DependsOn,
+    blocker: record.Blocker,
+    title: record.Task,
+    priority: record.Priority,
+    completionAuthority: record.CompletionAuthority,
+    activeRun,
+  };
+}
+
+async function activeRunIds(records) {
+  const ids = new Map();
+  for (const record of records.filter(({ Status }) => ['In Progress', 'In Review'].includes(Status))) {
+    const active = (await listTaskRuns(record.TaskID)).find((run) => run.status === 'In Progress');
+    if (active) ids.set(record.TaskID, active.runId);
+  }
+  return ids;
+}
+
+const priorityRank = (record) => {
+  const match = /^P(\d)$/i.exec(String(record.Priority ?? '').trim());
+  return match ? Number(match[1]) : 9;
+};
+
+// The next claimable task, or the reason there is none (what holds the lane
+// and which command moves it). Pure function of the projected records.
+function nextWork(records, runIds) {
+  const executable = records.filter((record) => !isStory(record));
+  const byPriority = (left, right) => priorityRank(left) - priorityRank(right) || executable.indexOf(left) - executable.indexOf(right);
+  const claimable = executable.filter((record) => record.Status === 'Ready' && allDependenciesDone(records, record)).sort(byPriority);
+  if (claimable.length) {
+    const [chosen, ...others] = claimable;
+    return {
+      next: { ...compactTask(chosen), acceptance: chosen.Acceptance, specRef: chosen.SpecRef },
+      reason: `Ready: claim it with "tt start ${chosen.TaskID}"${others.length ? ` (${others.length} more Ready: ${others.slice(0, 5).map(({ TaskID }) => TaskID).join(', ')})` : ''}.`,
+    };
+  }
+  const reasons = [];
+  const holders = [];
+  const describe = (record) => `${record.TaskID} (${record.Status})`;
+  for (const record of executable.filter(({ Status }) => Status === 'In Review')) {
+    holders.push({ taskId: record.TaskID, status: record.Status });
+    reasons.push(`${record.TaskID} is In Review (implemented by ${record.Implementer || 'unknown'}): a different reviewer decides with: tt review ${record.TaskID} approve|reject|block "notes"`);
+  }
+  for (const record of executable.filter(({ Status }) => Status === 'In Progress')) {
+    holders.push({ taskId: record.TaskID, status: record.Status });
+    const runId = runIds.get(record.TaskID);
+    reasons.push(`${record.TaskID} is In Progress${runId ? ` (Run ${runId}, agent ${record.Implementer || 'unknown'})` : ''}: finish it with: tt done ${record.TaskID}`);
+  }
+  const ownerWaits = executable.filter(({ Status }) => ownerActionStatuses.has(Status));
+  if (ownerWaits.length) reasons.push(`Waiting for the owner: ${ownerWaits.slice(0, 5).map(describe).join(', ')}.`);
+  const evaluations = executable.filter(({ Status }) => Status === 'Awaiting Agent Evaluation');
+  if (evaluations.length) reasons.push(`Owner feedback needs an Agent decision: ${evaluations.slice(0, 5).map(({ TaskID }) => TaskID).join(', ')} (owner-evaluation / owner-feedback-disposition, see references/api.md).`);
+  const blocked = executable.filter((record) => record.Status === 'Blocked');
+  if (blocked.length) {
+    const actionable = blocked.filter((record) => !isExpectedDependencyWait(records, record));
+    const shown = (actionable.length ? actionable : blocked).slice(0, 3);
+    reasons.push(`${actionable.length ? 'Blocked' : 'Waiting on a predecessor'}: ${shown.map((record) => `${record.TaskID}${record.Blocker ? ` - ${record.Blocker}` : ''}`).join('; ')}.`);
+  }
+  if (!holders.length && !ownerWaits.length && !evaluations.length) {
+    const backlog = executable.filter(({ Status }) => Status === 'Backlog').sort(byPriority);
+    const runnable = backlog.find((record) => allDependenciesDone(records, record));
+    if (runnable) {
+      reasons.push(`Nothing is admitted. The next runnable Backlog task is ${runnable.TaskID}: "tt start ${runnable.TaskID}" admits and starts it.`);
+    } else if (backlog.length) {
+      const waiting = backlog.slice(0, 3).map((record) => `${record.TaskID} needs ${taskDependencies(record).filter((id) => records.find(({ TaskID }) => TaskID === id)?.Status !== 'Done').join(';') || 'a predecessor'}`);
+      reasons.push(`Backlog tasks wait for unfinished dependencies: ${waiting.join('; ')}.`);
+    } else if (!reasons.length) {
+      const doneCount = executable.filter(({ Status }) => Status === 'Done').length;
+      reasons.push(executable.length ? `All ${doneCount} executable task(s) are Done${doneCount === executable.length ? '' : ` (${executable.length - doneCount} in other states)`}.` : 'No executable tasks exist yet: create them with "tt import FILE" or "tt new".');
+    }
+  }
+  return { next: null, reason: reasons.slice(0, 4).join(' | '), ...(holders.length ? { blockedBy: holders } : {}) };
 }
 
 const serialLaneStatuses = new Set(['Ready', 'In Progress', 'In Review']);
@@ -1644,6 +1743,68 @@ const server = createServer(async (request, response) => {
     assertAllowedHost(request);
     if (request.method === 'GET' && requestPath === '/api/instance') {
       sendJson(response, 200, publicInstanceMetadata());
+      return;
+    }
+    if (request.method === 'GET' && requestPath === '/api/health') {
+      // Always 200 while the server is up; `ok` says whether the tracker itself is usable.
+      let trackerRevision = null;
+      let trackerError = '';
+      try {
+        const raw = await readRawTracker();
+        trackerRevision = raw.trackerRevision;
+        const audit = dependencyAudit(raw);
+        if (!audit.valid) trackerError = dependencyAuditMessage(audit).slice(0, 400);
+      } catch (error) {
+        trackerError = publicErrorMessage(error);
+      }
+      sendJson(response, 200, {
+        ok: !trackerError,
+        tool: 'task-hub',
+        toolVersion,
+        ...publicInstanceMetadata(),
+        trackerRevision,
+        serialLane: serialLaneEnabled,
+        startedAt,
+        pid: process.pid,
+        instanceId,
+        ...(trackerError ? { trackerError } : {}),
+      });
+      return;
+    }
+    if (request.method === 'GET' && requestPath === '/api/tasks') {
+      const supported = ['status', 'milestone', 'type', 'parent', 'limit'];
+      for (const key of requestUrl.searchParams.keys()) {
+        if (!supported.includes(key)) throw httpError(400, `Unknown query parameter '${key.slice(0, 40)}'. Supported: ${supported.join(', ')}.`, 'bad-query');
+      }
+      const fold = (value) => String(value ?? '').trim().toLowerCase();
+      const statuses = requestUrl.searchParams.get('status') === null ? null : requestUrl.searchParams.get('status').split(',').map(fold).filter(Boolean);
+      const milestone = requestUrl.searchParams.get('milestone') === null ? null : fold(requestUrl.searchParams.get('milestone'));
+      const typeFilter = requestUrl.searchParams.get('type') === null ? null : fold(requestUrl.searchParams.get('type'));
+      const parent = requestUrl.searchParams.get('parent');
+      if (typeFilter !== null && !['task', 'bug', 'story'].includes(typeFilter)) throw httpError(400, `type must be Task, Bug or Story (got '${typeFilter.slice(0, 20)}').`, 'bad-query');
+      const limitText = requestUrl.searchParams.get('limit');
+      const limit = limitText === null ? 500 : Number(limitText);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 2_000) throw httpError(400, 'limit must be an integer between 1 and 2000.', 'bad-query');
+      const { records, trackerRevision } = await readTracker();
+      const matching = projectStoryStatuses(records).filter((record) => (statuses === null || statuses.includes(fold(record.Status)))
+        && (milestone === null || fold(record.Milestone) === milestone)
+        && (typeFilter === null || fold(taskType(record)) === typeFilter)
+        && (parent === null || record.ParentID === parent));
+      const shown = matching.slice(0, limit);
+      const runIds = await activeRunIds(shown);
+      sendJson(response, 200, {
+        trackerRevision,
+        total: matching.length,
+        count: shown.length,
+        truncated: shown.length < matching.length,
+        tasks: shown.map((record) => compactTask(record, runIds.get(record.TaskID) ?? null)),
+      });
+      return;
+    }
+    if (request.method === 'GET' && requestPath === '/api/next') {
+      const { records, trackerRevision } = await readTracker();
+      const projected = projectStoryStatuses(records);
+      sendJson(response, 200, { trackerRevision, ...nextWork(projected, await activeRunIds(projected)) });
       return;
     }
     if (request.method === 'GET' && requestPath === '/api/dependency-audit') {
