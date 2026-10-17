@@ -97,18 +97,21 @@ await runSuite('windows-robustness', async () => {
     assert.equal(result.body.code, 'locked');
     assert.ok((await readdir(sandbox.dir)).includes('task_tracker.csv.lock'), 'a live lock must not be removed');
 
-    // 3e. fresh empty lock: holder unknown, not stale yet
+    // 3e. a fresh unreadable lock (its creator died between creating the file and writing it):
+    //     the server waits for it to become readable or stale (~1.5 s) instead of failing the write
     await writeFile(lockPath, '');
+    const waitStarted = Date.now();
     result = await create(hub.url, 'L-005');
-    assert.equal(result.status, 409);
-    assert.match(result.body.error, /unknown holder/);
+    assert.equal(result.status, 201, JSON.stringify(result.body));
+    assert.ok(Date.now() - waitStarted >= 1_000, 'the unreadable lock is given time before it is replaced');
+    assert.ok(hub.stderr.some((line) => /\(unreadable lock file\)/.test(line)));
 
     // 3f. a lock from another host cannot be pid-checked: busy while young, replaced when old
     await writeFile(lockPath, lockJson({ host: 'some-other-machine', pid: await deadPid() }));
-    result = await create(hub.url, 'L-005');
+    result = await create(hub.url, 'L-006');
     assert.equal(result.status, 409);
     await writeFile(lockPath, lockJson({ host: 'some-other-machine', createdAt: new Date(Date.now() - 200_000).toISOString() }));
-    result = await create(hub.url, 'L-005');
+    result = await create(hub.url, 'L-006');
     assert.equal(result.status, 201, JSON.stringify(result.body));
 
     // 3g. the run lock and the toolchain-issue lock share the same recovery

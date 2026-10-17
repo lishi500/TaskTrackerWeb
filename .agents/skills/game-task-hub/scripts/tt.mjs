@@ -599,12 +599,15 @@ commands.import = async ({ positional, flags }) => {
   const file = positional[0];
   let source;
   try { source = readFileSync(file, 'utf8'); } catch (error) { fail(`cannot read ${file}`, error.code === 'ENOENT' ? 'no such file' : error.message, 'tt import docs/tasks/<milestone>.md'); }
-  const docPath = (() => { const rel = relative(process.cwd(), resolve(file)).replaceAll('\\', '/'); return rel.startsWith('..') ? file.replaceAll('\\', '/') : rel; })();
+  // SpecRef points at the document relative to the project root (the current directory); never store an absolute path.
+  const docPath = (() => { const rel = relative(process.cwd(), resolve(file)).replaceAll('\\', '/'); return rel.startsWith('..') || /^[A-Za-z]:/.test(rel) ? basename(file) : rel; })();
   const parsed = parseTaskSet(source, { docPath });
   if (parsed.header.lane === 'prototype') {
     fail(`${file} is a prototype-lane task set`, "Lane is 'prototype': it is a checklist for work that is not tracked in the Hub", `keep it as a checklist, or change the Lane line to 'slice' if it should be tracked`);
   }
-  const existing = new Map((await guarded('import', {}, () => get('/api/tasks?limit=2000'))).tasks.map((task) => [task.taskId, task]));
+  const known = await guarded('import', {}, () => get('/api/tasks?limit=2000'));
+  if (known.truncated) fail('the Hub holds more than 2000 items', 'import cannot tell which ids already exist', 'split the plan per milestone, or create the new items with tt new');
+  const existing = new Map(known.tasks.map((task) => [task.taskId, task]));
   const plan = planImport(parsed, existing, { defaultMilestone: flags.milestone ?? '' });
   if (plan.errors.length) {
     const shown = plan.errors.slice(0, 12).map((problem) => `line ${problem.line}: ${problem.message}`);

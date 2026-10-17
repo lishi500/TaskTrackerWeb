@@ -528,7 +528,10 @@ async function replaceTracker(header, records) {
 // its holder is provably gone (same host, pid not running) or older than 120 s;
 // when it is genuinely busy the 409 names the holder and how long it has held it.
 const lockStaleAfterMs = 120_000;
-const unreadableLockStaleAfterMs = 10_000;
+// A lock is only legitimately unreadable for milliseconds (between creating the file and
+// writing its content); an older one belongs to a process that died in that gap, or to a
+// server version that wrote no content at all.
+const unreadableLockStaleAfterMs = 1_500;
 const lockHostName = osHostname();
 let staleLockTakeover = Promise.resolve();
 
@@ -574,7 +577,7 @@ function lockHolderText(inspected) {
 async function acquireLock(lockPath, busyMessage) {
   const token = randomUUID();
   const payload = JSON.stringify({ pid: process.pid, host: lockHostName, createdAt: new Date().toISOString(), token });
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       await writeFile(lockPath, payload, { flag: 'wx' });
       return token;
@@ -582,13 +585,19 @@ async function acquireLock(lockPath, busyMessage) {
       if (transientFileCodes.has(error?.code)) {
         // Windows: a lock that was just deleted stays "delete pending" (EPERM/EACCES) until a
         // concurrent reader closes it, which takes milliseconds.
-        await sleep(10 + attempt * 10);
+        await sleep(10 + Math.min(attempt, 8) * 10);
         continue;
       }
       if (error?.code !== 'EEXIST') throw error;
     }
     const inspected = await inspectLock(lockPath);
     if (!inspected) continue;
+    if (!inspected.staleReason && !inspected.holder && attempt < 30) {
+      // Content not written yet (its creator is mid-write, or died in the gap): it becomes
+      // readable or stale within ~1.5 s, so wait for that instead of failing the request.
+      await sleep(100);
+      continue;
+    }
     if (!inspected.staleReason) throw httpError(409, busyMessage(lockHolderText(inspected)), 'locked');
     // Serialize takeovers inside this process and re-check right before
     // removing, so two requests can never delete each other's fresh lock.
