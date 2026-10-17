@@ -3,7 +3,7 @@
 import { createServer } from 'node:http';
 import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
-import { dirname, extname, join, relative, resolve } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -754,6 +754,26 @@ function advanceImmediateSuccessor(records, predecessor, timestamp) {
   return [candidate.TaskID];
 }
 
+// Error carrying an HTTP status (and an optional machine-readable code that
+// is returned as `code` so clients such as tt can branch without regexes).
+function httpError(statusCode, message, hubCode) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  if (hubCode) error.hubCode = hubCode;
+  return error;
+}
+
+// A request target is always a path. new URL('//x', base) would read it as a
+// protocol-relative reference (host "x"), so leading slashes are collapsed.
+function parseRequestUrl(request) {
+  const target = String(request.url ?? '/').replace(/^\/{2,}/, '/');
+  try {
+    return new URL(target, 'http://tracker.invalid');
+  } catch {
+    throw httpError(400, 'Malformed request URL.', 'bad-url');
+  }
+}
+
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -1354,18 +1374,25 @@ function reviewerIdentity(value) {
   return reviewer;
 }
 
-async function serveStatic(request, response) {
-  const requestPath = new URL(request.url, `http://${request.headers.host}`).pathname;
-  const relative = requestPath === '/' ? 'index.html' : requestPath.slice(1);
-  const filePath = resolve(publicDir, relative);
-  if (!filePath.startsWith(`${publicDir}/`) && filePath !== join(publicDir, 'index.html')) {
+// True when `candidate` is strictly inside `directory`. Separator- and
+// platform-aware: resolve() returns backslashes on Windows, so a literal "/"
+// prefix test rejected every asset there (dashboard rendered unstyled).
+function isInsideDirectory(directory, candidate) {
+  const fromDirectory = relative(directory, candidate);
+  return fromDirectory !== '' && fromDirectory !== '..' && !fromDirectory.startsWith(`..${sep}`) && !isAbsolute(fromDirectory);
+}
+
+async function serveStatic(requestPath, response) {
+  const relativePath = requestPath === '/' ? 'index.html' : requestPath.slice(1);
+  const filePath = resolve(publicDir, relativePath);
+  if (!isInsideDirectory(publicDir, filePath)) {
     response.writeHead(403).end();
     return;
   }
   try {
-    await stat(filePath);
-    response.writeHead(200, { 'Content-Type': mimeTypes[extname(filePath)] ?? 'application/octet-stream', 'Cache-Control': 'no-store' });
-    createReadStream(filePath).pipe(response);
+    if (!(await stat(filePath)).isFile()) throw Object.assign(new Error('Not a file'), { code: 'ENOENT' });
+    response.writeHead(200, { 'Content-Type': mimeTypes[extname(filePath).toLowerCase()] ?? 'application/octet-stream', 'Cache-Control': 'no-store' });
+    createReadStream(filePath).on('error', () => response.destroy()).pipe(response);
   } catch {
     response.writeHead(404).end('Not found');
   }
@@ -1373,7 +1400,7 @@ async function serveStatic(request, response) {
 
 const server = createServer(async (request, response) => {
   try {
-    const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+    const requestUrl = parseRequestUrl(request);
     const requestPath = requestUrl.pathname;
     if (request.method === 'GET' && requestPath === '/api/instance') {
       sendJson(response, 200, publicInstanceMetadata());
@@ -2478,7 +2505,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === 'GET') {
-      await serveStatic(request, response);
+      await serveStatic(requestPath, response);
       return;
     }
     response.writeHead(405, { Allow: 'GET, POST', 'X-Content-Type-Options': 'nosniff' }).end();
