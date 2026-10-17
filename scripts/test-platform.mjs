@@ -4,13 +4,15 @@
 // can be started with an injected platform (TASK_HUB_TEST_PLATFORM, NODE_ENV=test only).
 
 import assert from 'node:assert/strict';
-import { hostname } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import {
   currentPlatform, idKey, isTransientFileError, isWindowsReservedName, linkRemovalMethod, pathsEqual, reservedNameSource, sameMachine, shortHostname, symlinkType,
 } from './lib/platform.mjs';
 import { reservedNameSource as tasksetReservedNameSource } from '../.agents/skills/game-task-hub/scripts/taskset.mjs';
-import { call, createSandbox, mutation, runSuite, startHub, taskRow } from './lib/test-support.mjs';
+import { call, copyTree, createSandbox, mutation, runSuite, startHub, taskRow } from './lib/test-support.mjs';
 
 const platforms = ['win32', 'darwin', 'linux'];
 const hubs = [];
@@ -62,6 +64,44 @@ const legal = ['COM0', 'COM10', 'CONSOLE', 'NULL', 'x.nul', 'CON-001', 'LPT', 'C
 for (const name of reserved) assert.equal(isWindowsReservedName(name), true, `${name} is reserved on every platform`);
 for (const name of legal) assert.equal(isWindowsReservedName(name), false, `${name} is a legal id`);
 assert.equal(tasksetReservedNameSource, reservedNameSource, 'the importer (self-contained in the skill) and the server agree on reserved names');
+
+// ---- copyTree: the recursive copy that replaces fs.cp/cpSync (a native crash on a Windows runner) ----------------
+{
+  const base = mkdtempSync(join(tmpdir(), 'copy tree 发现 '));
+  try {
+    const source = join(base, 'source 来源');
+    mkdirSync(join(source, 'nested dir', 'deep'), { recursive: true });
+    const longAgo = new Date(Date.UTC(2020, 0, 2));
+    const put = (path, content) => { writeFileSync(path, content); utimesSync(path, longAgo, longAgo); };
+    put(join(source, 'a.txt'), 'alpha');
+    put(join(source, 'nested dir', 'b 文件.txt'), 'beta');
+    put(join(source, 'nested dir', 'deep', 'skip-me.test'), 'no');
+    const target = join(base, 'Fish Game', '.claude', 'skills', 'target');
+    copyTree(source, target, { filter: (from) => !from.endsWith('.test') });
+    assert.equal(readFileSync(join(target, 'a.txt'), 'utf8'), 'alpha');
+    assert.equal(readFileSync(join(target, 'nested dir', 'b 文件.txt'), 'utf8'), 'beta', 'non-ASCII names and spaces survive');
+    assert.equal(existsSync(join(target, 'nested dir', 'deep', 'skip-me.test')), false, 'the filter skips what it rejects');
+    assert.equal(statSync(join(target, 'nested dir', 'deep')).isDirectory(), true, 'and keeps the folders it accepts');
+    writeFileSync(join(target, 'extra.txt'), 'kept');
+    put(join(source, 'a.txt'), 'alpha 2');
+    copyTree(source, target, { preserveTimestamps: true });
+    assert.equal(readFileSync(join(target, 'a.txt'), 'utf8'), 'alpha 2', 'a second copy overwrites');
+    assert.equal(readFileSync(join(target, 'extra.txt'), 'utf8'), 'kept', 'and merges: files only the target has stay');
+    assert.ok(Math.abs(statSync(join(target, 'a.txt')).mtimeMs - longAgo.getTime()) < 2_000, 'preserveTimestamps keeps the modification time');
+    copyTree(join(source, 'a.txt'), join(base, 'single', 'one.txt'));
+    assert.equal(readFileSync(join(base, 'single', 'one.txt'), 'utf8'), 'alpha 2', 'a single file works and its folder is created');
+    // links are refused, never followed
+    const link = join(source, 'loop');
+    let linked = true;
+    try { symlinkSync(source, link, process.platform === 'win32' ? 'junction' : 'dir'); } catch { linked = false; }
+    if (linked) {
+      assert.throws(() => copyTree(source, join(base, 'with-link')), /does not copy symbolic links or junctions/);
+      if (process.platform === 'win32') rmdirSync(link); else unlinkSync(link);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  }
+}
 
 await runSuite('platform', async () => {
   const start = async (rows, env) => {
@@ -132,7 +172,7 @@ await runSuite('platform', async () => {
     assert.equal((await create(hub.url, 'I-002')).status, 201);
   }
 
-  console.log('platform test passed: injectable platform helpers, win32 retry vs POSIX fail-fast, host-name tolerance, reserved ids everywhere, case-insensitive id uniqueness.');
+  console.log('platform test passed: injectable platform helpers, win32 retry vs POSIX fail-fast, host-name tolerance, reserved ids everywhere, case-insensitive id uniqueness, copyTree.');
 }, async () => {
   for (const hub of hubs) await hub.stop();
   for (const sandbox of sandboxes) await sandbox.dispose();

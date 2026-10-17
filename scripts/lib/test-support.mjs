@@ -4,12 +4,16 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { copyTree } from './copy-tree.mjs';
+
+// Tests copy folders with this, never with fs.cp/cpSync (see copy-tree.mjs: a native crash on Windows).
+export { copyTree };
 
 export const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 
@@ -136,7 +140,7 @@ export async function createInstance({ parent = tmpdir(), name = 'task-tracker-i
   const root = exactName ? join(parent, name) : await mkdtemp(join(parent, name));
   if (exactName) await mkdir(root);
   const skip = (source) => !/[\\/]scripts[\\/]test-[^\\/]*\.mjs$/.test(source);
-  for (const entry of ['server.mjs', 'public', 'scripts', 'templates', '.agents']) await cp(join(repoRoot, entry), join(root, entry), { recursive: true, filter: skip });
+  for (const entry of ['server.mjs', 'public', 'scripts', 'templates', '.agents']) copyTree(join(repoRoot, entry), join(root, entry), { filter: skip });
   const listenPort = port ?? await getFreePort();
   const init = spawnSync(process.execPath, [join(root, 'scripts', 'init-instance.mjs'), '--project-id', projectId, '--project-name', projectName, '--port', String(listenPort), ...(empty ? ['--empty'] : [])], { cwd: root, encoding: 'utf8' });
   if (init.status !== 0) throw new Error(`init-instance failed: ${init.stderr}`);

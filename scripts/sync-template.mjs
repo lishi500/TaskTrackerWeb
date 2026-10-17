@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { cp, lstat, mkdir, readFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { copyTree } from './lib/copy-tree.mjs';
 
 const templateRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sharedPaths = [
@@ -102,7 +103,7 @@ if (apply) {
     const source = resolve(templateRoot, templatePath);
     const target = resolve(targetRoot, templatePath);
     await mkdir(dirname(target), { recursive: true });
-    await cp(source, target, { recursive: true, force: true, preserveTimestamps: true });
+    copyTree(source, target, { preserveTimestamps: true });
   }
 }
 

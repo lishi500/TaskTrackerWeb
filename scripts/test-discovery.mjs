@@ -5,10 +5,10 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createInstance, runSuite, skipNote } from './lib/test-support.mjs';
+import { copyTree, createInstance, runSuite, skipNote } from './lib/test-support.mjs';
 
 const BOM = String.fromCharCode(0xFEFF);
 const parent = mkdtempSync(join(tmpdir(), 'Hub discovery 发现 '));
@@ -43,7 +43,7 @@ await runSuite('discovery', async () => {
   // the skill as gd-skill installs it: a COPY, no link anywhere
   const skill = join(game, '.claude', 'skills', 'game-task-hub');
   mkdirSync(dirname(skill), { recursive: true });
-  cpSync(join(a.root, '.agents', 'skills', 'game-task-hub'), skill, { recursive: true });
+  copyTree(join(a.root, '.agents', 'skills', 'game-task-hub'), skill);
   const tt = join(skill, 'scripts', 'tt.mjs');
   for (const path of [skill, join(skill, 'scripts'), tt]) assert.equal(lstatSync(path).isSymbolicLink(), false, `${path} is a plain copy`);
   assert.ok(!tt.startsWith(a.root) && !tt.startsWith(b.root), 'the copy is outside every instance');
