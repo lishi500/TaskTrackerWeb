@@ -2,11 +2,12 @@
 
 import { createServer } from 'node:http';
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { createReadStream, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { hostname as osHostname } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
+import { derivePort, nextPortInRange, parsePortNumber } from './scripts/lib/hub-port.mjs';
 
 const toolDir = dirname(fileURLToPath(import.meta.url));
 const configPath = resolve(process.env.TASK_HUB_CONFIG ?? join(toolDir, 'task-hub.config.json'));
@@ -26,7 +27,27 @@ const startedAt = new Date().toISOString();
 // Stable id of this instance (hash of its tracker path, never the path itself)
 // so a second launch can recognise "already running" without leaking locations.
 const instanceId = trackerPath ? createHash('sha256').update(trackerPath.toLowerCase()).digest('hex').slice(0, 12) : '';
-const port = Number(process.env.PORT ?? 4173);
+// Port policy: PORT env wins, then instance.port in task-hub.config.json, then a
+// stable port in 4300-4999 derived from the project id, so a project keeps the
+// same URL across restarts and agents never have to discover it.
+function resolvePortSetting() {
+  if (process.env.PORT !== undefined && process.env.PORT !== '') {
+    return { port: parsePortNumber(process.env.PORT, 'PORT', { allowZero: true }), source: 'env' };
+  }
+  if (instance.port !== undefined && instance.port !== null && instance.port !== '') {
+    return { port: parsePortNumber(instance.port, 'instance.port in task-hub.config.json'), source: 'config' };
+  }
+  if (String(instance.projectId ?? '').trim()) return { port: derivePort(instance.projectId), source: 'derived' };
+  return { port: 4173, source: 'default' };
+}
+let portSetting;
+try {
+  portSetting = resolvePortSetting();
+} catch (error) {
+  console.error(`task-hub: ${error.message}`);
+  process.exit(1);
+}
+const port = portSetting.port;
 const host = process.env.HOST ?? '127.0.0.1';
 let activePort = port;
 const workflow = config.workflow ?? {};
@@ -2951,9 +2972,102 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, host, () => {
+// ---- Start-up: single instance, endpoint files, fixed port ---------------------------
+// tracker/.tracker-url and tracker/.tracker-pid are written here, after a
+// successful listen, so every launch path (start.mjs, a bare `node server.mjs`,
+// a service wrapper) publishes the same discovery information that tt reads.
+const trackerDirectory = trackerPath ? dirname(trackerPath) : undefined;
+const urlFilePath = trackerDirectory ? join(trackerDirectory, '.tracker-url') : undefined;
+const pidFilePath = trackerDirectory ? join(trackerDirectory, '.tracker-pid') : undefined;
+
+function canonicalBase(portNumber) {
+  const publicHost = ['0.0.0.0', '::', '::0', 'localhost'].includes(host) ? '127.0.0.1' : host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${publicHost}:${portNumber}`;
+}
+
+async function probeHub(base) {
+  try {
+    const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1_500) });
+    const body = await response.json();
+    return body?.tool === 'task-hub' ? body : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Another live server for this very CSV (any port) makes a second one pointless.
+async function runningPeer() {
+  if (!urlFilePath) return undefined;
+  let recorded;
+  try { recorded = readFileSync(urlFilePath, 'utf8').trim(); } catch { return undefined; }
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(recorded)) return undefined;
+  const peer = await probeHub(recorded);
+  return peer && peer.instanceId === instanceId && peer.pid !== process.pid ? { url: recorded, peer } : undefined;
+}
+
+function publishEndpoint() {
+  if (!urlFilePath) return;
+  try {
+    writeFileSync(pidFilePath, `${process.pid}\n`);
+    writeFileSync(urlFilePath, `${canonicalBase(activePort)}\n`); // last: its presence implies the pid file is current
+  } catch (error) {
+    console.error(`task-hub: could not write ${basename(urlFilePath)} (${error.code ?? error.message}); tt will fall back to the configured port.`);
+  }
+}
+
+function withdrawEndpoint() {
+  if (!pidFilePath) return;
+  try {
+    if (readFileSync(pidFilePath, 'utf8').trim() !== String(process.pid)) return; // not ours (a newer server took over)
+    unlinkSync(pidFilePath);
+    unlinkSync(urlFilePath);
+  } catch { /* already gone */ }
+}
+
+process.on('exit', withdrawEndpoint);
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(signal, () => process.exit(0));
+// Test-only: Windows has no catchable SIGTERM, so tests ask the server to take its
+// normal clean-exit path (process.exit) to verify the endpoint files are removed.
+if (process.env.NODE_ENV === 'test' && Number(process.env.TASK_HUB_TEST_EXIT_AFTER_MS) > 0) {
+  setTimeout(() => process.exit(0), Number(process.env.TASK_HUB_TEST_EXIT_AFTER_MS));
+}
+
+let candidatePort = port;
+let portAttempts = 0;
+
+server.on('listening', () => {
   const address = server.address();
-  activePort = typeof address === 'object' && address ? address.port : port;
+  activePort = typeof address === 'object' && address ? address.port : candidatePort;
+  publishEndpoint();
   console.log(`Task tracker is available at http://${host}:${activePort}`);
   console.log(`CSV source of truth: ${trackerPath}`);
 });
+
+server.on('error', async (error) => {
+  if (error?.code !== 'EADDRINUSE') {
+    console.error(`task-hub: cannot listen on ${host}:${candidatePort} (${error?.code ?? error?.message}).`);
+    process.exit(1);
+  }
+  const peer = await probeHub(`http://127.0.0.1:${candidatePort}`);
+  if (peer?.instanceId === instanceId) {
+    console.log(`Task tracker is already running at http://127.0.0.1:${candidatePort}`);
+    process.exit(0);
+  }
+  if (portSetting.source === 'derived' && portAttempts < 25) {
+    // A derived port is a preference, not a promise: another project (or program) holds it.
+    portAttempts += 1;
+    candidatePort = nextPortInRange(candidatePort);
+    server.listen(candidatePort, host);
+    return;
+  }
+  const holder = peer ? `by the tracker for project '${peer.projectId}'` : 'by another program';
+  console.error(`task-hub: port ${candidatePort} is already in use ${holder}. Choose a free port with "instance.port" in task-hub.config.json or the PORT environment variable.`);
+  process.exit(1);
+});
+
+const peer = await runningPeer();
+if (peer) {
+  console.log(`Task tracker is already running at ${peer.url}`);
+  process.exit(0);
+}
+server.listen(candidatePort, host);

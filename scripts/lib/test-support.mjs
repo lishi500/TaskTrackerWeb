@@ -2,9 +2,10 @@
 // Each suite stays a standalone script (exit 0/1); this only removes the
 // copy-pasted "create temp CSV, spawn server, parse its URL" boilerplate.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -81,6 +82,66 @@ export async function startHub({ trackerPath, env = {}, cwd = repoRoot, timeoutM
       }
     },
   };
+}
+
+export function getFreePort() {
+  return new Promise((resolvePort, reject) => {
+    const probe = createNetServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolvePort(port));
+    });
+  });
+}
+
+export const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
+
+export async function waitFor(check, { timeoutMs = 10_000, intervalMs = 50, message = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${message}.`);
+    await sleep(intervalMs);
+  }
+}
+
+// A real Tracker instance in a temp folder: the shipped files (server, public,
+// scripts, templates, the skill) copied from this repository and initialized
+// with init-instance.mjs, exactly as a game would get it. `parent` lets a test
+// place it under a path with spaces and non-ASCII characters.
+export async function createInstance({ parent = tmpdir(), name = 'task-tracker-instance-', projectId = 'test-game', projectName = 'Test Game', port, empty = true } = {}) {
+  await mkdir(parent, { recursive: true });
+  const root = await mkdtemp(join(parent, name));
+  const skip = (source) => !/[\\/]scripts[\\/]test-[^\\/]*\.mjs$/.test(source);
+  for (const entry of ['server.mjs', 'public', 'scripts', 'templates', '.agents']) await cp(join(repoRoot, entry), join(root, entry), { recursive: true, filter: skip });
+  const listenPort = port ?? await getFreePort();
+  const init = spawnSync(process.execPath, [join(root, 'scripts', 'init-instance.mjs'), '--project-id', projectId, '--project-name', projectName, '--port', String(listenPort), ...(empty ? ['--empty'] : [])], { cwd: root, encoding: 'utf8' });
+  if (init.status !== 0) throw new Error(`init-instance failed: ${init.stderr}`);
+  const trackerDir = join(root, 'tracker');
+  const instance = {
+    root,
+    port: listenPort,
+    url: `http://127.0.0.1:${listenPort}`,
+    trackerDir,
+    trackerPath: join(trackerDir, 'task_tracker.csv'),
+    node: (script, args = [], options = {}) => spawnSync(process.execPath, [join(root, script), ...args], { cwd: root, encoding: 'utf8', ...options }),
+    async readTrackerFile(name) { return (await readFile(join(trackerDir, name), 'utf8')).trim(); },
+    // Stop whatever server this instance launched (by its pid file), then forget it.
+    async stopServer() {
+      try {
+        const pid = Number(await instance.readTrackerFile('.tracker-pid'));
+        if (pid) process.kill(pid);
+      } catch { /* not running */ }
+      await waitFor(async () => !(await fetch(`${instance.url}/api/health`, { signal: AbortSignal.timeout(500) }).then(() => true, () => false)), { timeoutMs: 5_000, message: 'the server to stop' }).catch(() => {});
+    },
+    async dispose() {
+      await instance.stopServer();
+      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
+    },
+  };
+  return instance;
 }
 
 export const mutation = (url, payload, headers = {}) => ({

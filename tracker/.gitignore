@@ -1,0 +1,5 @@
+.tracker-url
+.tracker-pid
+server.log
+*.lock
+*.tmp
