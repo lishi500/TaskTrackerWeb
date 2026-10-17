@@ -8,6 +8,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { derivePort, nextPortInRange, parsePortNumber } from './scripts/lib/hub-port.mjs';
+import { currentPlatform, idKey, isTransientFileError, isWindowsReservedName, sameMachine } from './scripts/lib/platform.mjs';
 
 const toolDir = dirname(fileURLToPath(import.meta.url));
 const configPath = resolve(process.env.TASK_HUB_CONFIG ?? join(toolDir, 'task-hub.config.json'));
@@ -99,8 +100,6 @@ let testRenameFailuresRemaining = process.env.NODE_ENV === 'test'
   ? Number(process.env.TASK_HUB_TEST_RENAME_EPERM ?? 0) || 0 : 0;
 
 const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
-// Errors Windows raises while another process briefly holds a file open.
-const transientFileCodes = new Set(['EPERM', 'EBUSY', 'EACCES']);
 // 8 attempts, ~1.9 s in total: enough for a scanner or indexer to let go.
 const renameRetryDelaysMs = [15, 30, 60, 120, 240, 480, 960];
 
@@ -116,7 +115,7 @@ async function renameWithRetry(from, to) {
       await rename(from, to);
       return;
     } catch (error) {
-      if (!transientFileCodes.has(error?.code) || attempt >= renameRetryDelaysMs.length) throw error;
+      if (!isTransientFileError(error?.code) || attempt >= renameRetryDelaysMs.length) throw error;
       console.warn(`task-hub: ${error.code} replacing ${basename(to)} (attempt ${attempt + 1}/${renameRetryDelaysMs.length + 1}); retrying`);
       await sleep(renameRetryDelaysMs[attempt]);
     }
@@ -128,7 +127,7 @@ async function readTextWithRetry(path) {
     try {
       return await readFile(path, 'utf8');
     } catch (error) {
-      if (!transientFileCodes.has(error?.code) || attempt >= 4) throw error;
+      if (!isTransientFileError(error?.code) || attempt >= 4) throw error;
       await sleep(15 * 2 ** attempt);
     }
   }
@@ -563,7 +562,7 @@ async function inspectLock(lockPath) {
     if (ageMs > unreadableLockStaleAfterMs) staleReason = 'unreadable lock file';
   } else if (ageMs > lockStaleAfterMs) {
     staleReason = 'older than 120 s';
-  } else if (holder.host === lockHostName && !processIsAlive(holder.pid)) {
+  } else if (sameMachine(holder.host, lockHostName) && !processIsAlive(holder.pid)) {
     staleReason = `holder pid ${holder.pid} is not running`;
   }
   return { text, ageMs, holder: readable ? holder : undefined, staleReason };
@@ -582,7 +581,7 @@ async function acquireLock(lockPath, busyMessage) {
       await writeFile(lockPath, payload, { flag: 'wx' });
       return token;
     } catch (error) {
-      if (transientFileCodes.has(error?.code)) {
+      if (isTransientFileError(error?.code)) {
         // Windows: a lock that was just deleted stays "delete pending" (EPERM/EACCES) until a
         // concurrent reader closes it, which takes milliseconds.
         await sleep(10 + Math.min(attempt, 8) * 10);
@@ -1012,7 +1011,8 @@ function publicErrorMessage(error) {
   if (error?.statusCode) return String(error.message);
   const code = /^E[A-Z0-9]+$/.test(String(error?.code ?? '')) ? error.code : '';
   if (code) {
-    const advice = transientFileCodes.has(code) ? ' Another program (antivirus, indexer, editor) is holding a tracker file; retry in a moment.' : '';
+    const advice = isTransientFileError(code) ? ' Another program (antivirus, indexer, editor) is holding a tracker file; retry in a moment.'
+      : ['EPERM', 'EACCES'].includes(code) ? ' Check that the Hub may write to the tracker folder.' : '';
     return `${code}: the tracker could not complete a file operation${error.syscall ? ` (${error.syscall})` : ''}.${advice}`;
   }
   return scrubPaths(error?.message || 'Unexpected server error.');
@@ -1272,11 +1272,9 @@ function newTaskRecord(header, body, timestamp, records) {
   return Object.fromEntries(header.map((column) => [column, values[column] ?? '']));
 }
 
-// Windows cannot create a file or folder named after a legacy device, with or
-// without an extension (CON, nul.txt, COM1.x ...). Task and Run ids become
-// folder names under tracker/task-records, so they must not look like one.
-const windowsReservedNames = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
-
+// Task and Run ids become folder names under tracker/task-records, so they must not be
+// Windows device names (CON, nul.txt, COM1.x ...) on ANY platform: repositories move between
+// operating systems (see scripts/lib/platform.mjs).
 function safePathSegment(value, label) {
   const normalized = String(value ?? '').trim();
   if (!normalized) throw httpError(400, `${label} is required.`, 'invalid-id');
@@ -1286,7 +1284,7 @@ function safePathSegment(value, label) {
   if (/^\.+$/.test(normalized) || normalized.endsWith('.')) {
     throw httpError(400, `${label} '${normalized}' cannot consist only of dots or end with '.': Windows cannot store such a folder name.`, 'invalid-id');
   }
-  if (windowsReservedNames.test(normalized)) {
+  if (isWindowsReservedName(normalized)) {
     throw httpError(400, `${label} '${normalized}' is a reserved Windows device name (CON PRN AUX NUL COM1-9 LPT1-9); choose another id, for example '${normalized}-1'.`, 'invalid-id');
   }
   return normalized;
@@ -1805,6 +1803,7 @@ const server = createServer(async (request, response) => {
         startedAt,
         pid: process.pid,
         instanceId,
+        platform: currentPlatform(),
         ...(trackerError ? { trackerError } : {}),
       });
       return;
@@ -2057,10 +2056,15 @@ const server = createServer(async (request, response) => {
         requireTaskCreationColumns(header);
         const timestamp = new Date().toISOString();
         const record = newTaskRecord(header, body, timestamp, records);
-        if (records.some(({ TaskID }) => TaskID === record.TaskID)) {
+        const sameId = records.find(({ TaskID }) => idKey(TaskID) === idKey(record.TaskID));
+        if (sameId?.TaskID === record.TaskID) {
           const error = new Error(`Task '${record.TaskID}' already exists.`);
           error.statusCode = 409;
           throw error;
+        }
+        if (sameId) {
+          // T-001 and t-001 would share one task-records folder on case-insensitive file systems.
+          throw httpError(409, `Task id '${record.TaskID}' collides with the existing task '${sameId.TaskID}': ids must be unique ignoring case, because their Run folders are one folder on Windows and macOS.`, 'duplicate-id');
         }
         records.push(record);
         await replaceTracker(header, records);

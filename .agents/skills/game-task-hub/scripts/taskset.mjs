@@ -44,6 +44,7 @@ const joinWrapped = (left, right) => {
   return CJK_END.test(left) && CJK_START.test(next) ? left + next : collapse(`${left} ${next}`);
 };
 
+export const reservedNameSource = RESERVED_WINDOWS_NAME.source;
 export const isValidId = (id) => ID_PATTERN.test(id) && id.length <= 128 && !RESERVED_WINDOWS_NAME.test(id) && !id.endsWith('.');
 
 // "A; B, C" (also full-width separators) -> ['A', 'B', 'C']; "none", "-" and "无" mean no dependencies.

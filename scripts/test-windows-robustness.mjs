@@ -43,7 +43,7 @@ const lockJson = (fields) => JSON.stringify({ pid: process.pid, host: hostname()
 await runSuite('windows-robustness', async () => {
   // ---- 1. transient EPERM on rename is retried and the write succeeds ----------------
   {
-    const { sandbox, hub } = await newHub([taskRow({ TaskID: 'R-001', Status: 'Ready' })], { TASK_HUB_TEST_RENAME_EPERM: '3' });
+    const { sandbox, hub } = await newHub([taskRow({ TaskID: 'R-001', Status: 'Ready' })], { TASK_HUB_TEST_RENAME_EPERM: '3', TASK_HUB_TEST_PLATFORM: 'win32' });
     const result = await create(hub.url, 'R-002');
     assert.equal(result.status, 201, JSON.stringify(result.body));
     assert.ok((await readFile(sandbox.trackerPath, 'utf8')).includes('R-002'), 'the CSV must contain the new task');
@@ -53,7 +53,7 @@ await runSuite('windows-robustness', async () => {
 
   // ---- 2. a persistent rename failure is a clean 500: CSV untouched, no temp left ------
   {
-    const { sandbox, hub } = await newHub([taskRow({ TaskID: 'R-001', Status: 'Ready' })], { TASK_HUB_TEST_RENAME_EPERM: '1000' });
+    const { sandbox, hub } = await newHub([taskRow({ TaskID: 'R-001', Status: 'Ready' })], { TASK_HUB_TEST_RENAME_EPERM: '1000', TASK_HUB_TEST_PLATFORM: 'win32' });
     const before = await readFile(sandbox.trackerPath, 'utf8');
     const started = Date.now();
     const result = await create(hub.url, 'R-002');

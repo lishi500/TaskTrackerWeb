@@ -18,11 +18,12 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { currentPlatform, linkRemovalMethod, pathsEqual, symlinkType } from './lib/platform.mjs';
 
 const skillName = 'game-task-hub';
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const source = join(root, '.agents', 'skills', skillName);
-const isWindows = process.platform === 'win32';
+const platform = currentPlatform();
 
 function fail(what, why, next) {
   console.error(`link-game-skill: ${what} - ${why}${next ? ` - try: ${next}` : ''}`);
@@ -51,7 +52,7 @@ const destinations = [];
 if (!flags.has('--no-claude')) destinations.push(['.claude', 'skills', skillName]);
 if (flags.has('--agents')) destinations.push(['.agents', 'skills', skillName]);
 
-const sameFile = (left, right) => (isWindows ? left.toLowerCase() === right.toLowerCase() : left === right);
+const sameFile = (left, right) => pathsEqual(left, right, platform);
 
 function realpathOrUndefined(path) {
   try { return realpathSync.native(path); } catch { return undefined; }
@@ -64,7 +65,7 @@ function describeLink(path) {
 // Remove only the link itself, never anything it points to. rmdir/unlink fail
 // on a non-empty real directory, so a misdetected directory cannot be wiped.
 function removeLink(path) {
-  if (isWindows) rmdirSync(path);
+  if (linkRemovalMethod(platform) === 'rmdir') rmdirSync(path);
   else unlinkSync(path);
 }
 
@@ -112,10 +113,10 @@ function linkOne(parts) {
     if (process.env.NODE_ENV === 'test' && process.env.TASK_HUB_TEST_LINK_FAIL === '1') {
       throw Object.assign(new Error('EPERM: operation not permitted, symlink'), { code: 'EPERM' });
     }
-    symlinkSync(source, destination, isWindows ? 'junction' : 'dir');
+    symlinkSync(source, destination, symlinkType(platform));
   } catch (error) {
     removeEmptyDirectories(created);
-    fail(`cannot create the link at ${destination}`, `${error.code ?? 'error'}: ${error.message}`, isWindows ? 'check that the game path is on a local NTFS drive (junctions cannot cross to network shares)' : 'check permissions on the game directory');
+    fail(`cannot create the link at ${destination}`, `${error.code ?? 'error'}: ${error.message}`, platform === 'win32' ? 'check that the game path is on a local NTFS drive (junctions cannot cross to network shares)' : 'check permissions on the game directory');
   }
   return { destination, action: existing ? 'repointed' : 'linked' };
 }
