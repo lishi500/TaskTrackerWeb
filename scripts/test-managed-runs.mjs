@@ -12,23 +12,24 @@ const root = new URL('..', import.meta.url);
 const sandbox = await mkdtemp(join(tmpdir(), 'task-tracker-runs-'));
 const trackerPath = join(sandbox, 'task_tracker.csv');
 const recordsPath = join(sandbox, 'task-records');
-const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
-const recoveryRow = ['TEST-001', 'Task', '', 'M0', 'Test', 'Managed run recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Claims and closes safely', 'Yes', '', '', '', '', '', ''];
-const nonReadyRow = ['TEST-002', 'Task', '', 'M0', 'Test', 'Non-Ready claim rejection', 'README.md', '', 'Agent', 'In Progress', 'P0', 'Rejects a second claim', 'Yes', '', 'other-agent', 'EXISTING CLAIM', '', '', ''];
-const normalRow = ['TEST-003', 'Task', '', 'M0', 'Test', 'Managed run normal lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Closes safely', 'Yes', '', '', '', '', '', ''];
-const claimRecoveryRow = ['TEST-004', 'Task', '', 'M0', 'Test', 'Managed claim recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not reuse a failed claim Run ID', 'Yes', '', '', '', '', '', ''];
-const committedClaimRecoveryRow = ['TEST-005', 'Task', '', 'M0', 'Test', 'Committed claim intent cleanup lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not block a later Ready retry after a reviewed Run', 'Yes', '', '', '', '', '', ''];
-const preclaimBlockRow = ['TEST-006', 'Task', '', 'M0', 'Test', 'Pre-claim blocker lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Blocks an incomplete packet without a Run', 'Yes', '', '', '', '', '', ''];
-const dependencyUnblockRow = ['TEST-007', 'Task', '', 'M0', 'Test', 'Dependency unblock lifecycle', 'README.md', 'TEST-001', 'Agent', 'Blocked', 'P0', 'Becomes Ready only after all dependencies are Done', 'Yes', 'TEST-001 review incomplete', '', '', '', '', ''];
-const zeroDependencyBlockedRow = ['TEST-008', 'Task', '', 'M0', 'Test', 'Zero dependency unblock rejection', 'README.md', '', 'Agent', 'Blocked', 'P0', 'Must not be dependency-unblocked', 'Yes', 'Manual blocker', '', '', '', '', ''];
-const unfinishedDependencyBlockedRow = ['TEST-009', 'Task', '', 'M0', 'Test', 'Unfinished dependency unblock rejection', 'README.md', 'TEST-002', 'Agent', 'Blocked', 'P0', 'Must retain blocker while dependency remains unfinished', 'Yes', 'TEST-002 incomplete', '', '', '', '', ''];
-const ownerWaitRow = ['TEST-010', 'Task', '', 'M0', 'Test', 'Generic owner-wait close lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Moves only to an explicit owner status', 'Yes', '', '', '', '', '', ''];
-const closedBlockRecoveryRow = ['TEST-011', 'Task', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'Yes', '', '', '', '', '', ''];
-const coordinatorRow = ['TEST-012', 'Task', '', 'M0', 'Test', 'Coordinator authority lifecycle', 'README.md', '', 'Coordinator', 'Ready', 'P0', 'An active coordinator Run can expose a direct owner dependency', 'Yes', '', '', '', '', '', ''];
-const dependentOwnerRow = ['TEST-013', 'Task', '', 'M0', 'Test', 'Coordinator-owned preparation', 'README.md', 'TEST-012', 'Owner', 'Backlog', 'P0', 'Enters an explicit owner wait only through its active direct coordinator', 'No', '', '', '', '', '', ''];
-const dependencyRevisionRow = ['TEST-014', 'Task', '', 'M0', 'Test', 'Dependency revision lifecycle', 'README.md', 'TEST-001', 'Agent', 'Backlog', 'P0', 'Changes dependencies only through an auditable valid graph mutation', 'Yes', '', '', '', '', '', ''];
+const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'CompletionAuthority', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
+const recoveryRow = ['TEST-001', 'Task', '', 'M0', 'Test', 'Managed run recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Claims and closes safely', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const nonReadyRow = ['TEST-002', 'Task', '', 'M0', 'Test', 'Non-Ready claim rejection', 'README.md', '', 'Agent', 'In Progress', 'P0', 'Rejects a second claim', 'IndependentReviewerAgent', '', 'other-agent', 'EXISTING CLAIM', '', '', ''];
+const normalRow = ['TEST-003', 'Task', '', 'M0', 'Test', 'Managed run normal lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Closes safely', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const claimRecoveryRow = ['TEST-004', 'Task', '', 'M0', 'Test', 'Managed claim recovery lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not reuse a failed claim Run ID', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const committedClaimRecoveryRow = ['TEST-005', 'Task', '', 'M0', 'Test', 'Committed claim intent cleanup lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Does not block a later Ready retry after a reviewed Run', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const preclaimBlockRow = ['TEST-006', 'Task', '', 'M0', 'Test', 'Pre-claim blocker lifecycle', 'README.md', '', 'Agent', 'Ready', 'P0', 'Blocks an incomplete packet without a Run', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const dependencyUnblockRow = ['TEST-007', 'Task', '', 'M0', 'Test', 'Dependency unblock lifecycle', 'README.md', 'TEST-001', 'Agent', 'Blocked', 'P0', 'Becomes Ready only after all dependencies are Done', 'IndependentReviewerAgent', 'TEST-001 review incomplete', '', '', '', '', ''];
+const zeroDependencyBlockedRow = ['TEST-008', 'Task', '', 'M0', 'Test', 'Zero dependency unblock rejection', 'README.md', '', 'Agent', 'Blocked', 'P0', 'Must not be dependency-unblocked', 'IndependentReviewerAgent', 'Manual blocker', '', '', '', '', ''];
+const unfinishedDependencyBlockedRow = ['TEST-009', 'Task', '', 'M0', 'Test', 'Unfinished dependency unblock rejection', 'README.md', 'TEST-002', 'Agent', 'Blocked', 'P0', 'Must retain blocker while dependency remains unfinished', 'IndependentReviewerAgent', 'TEST-002 incomplete', '', '', '', '', ''];
+const ownerWaitRow = ['TEST-010', 'Task', '', 'M0', 'Test', 'Decision-owner wait lifecycle', 'README.md', '', 'Human decision owner', 'Ready', 'P0', 'Moves only to an explicit owner status', 'DecisionOwner', '', '', '', '', '', ''];
+const closedBlockRecoveryRow = ['TEST-011', 'Task', '', 'M0', 'Test', 'Closed blocked Run recovery lifecycle', 'README.md', 'TEST-001', 'Agent', 'Ready', 'P0', 'A closed blocked Run can be dependency-unblocked after its blocker is resolved', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const authorityRunRow = ['TEST-012', 'Task', '', 'M0', 'Test', 'Active authority Run lifecycle', 'README.md', '', 'Implementation agent', 'Ready', 'P0', 'An active Run can expose a direct DecisionOwner dependency', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const dependentOwnerRow = ['TEST-013', 'Task', '', 'M0', 'Test', 'Decision-owner preparation', 'README.md', 'TEST-012', 'Human decision owner', 'Backlog', 'P0', 'Enters an explicit owner wait only through its active direct authority Run', 'DecisionOwner', '', '', '', '', '', ''];
+const dependencyRevisionRow = ['TEST-014', 'Task', '', 'M0', 'Test', 'Dependency revision lifecycle', 'README.md', 'TEST-001', 'Agent', 'Backlog', 'P0', 'Changes dependencies only through an auditable valid graph mutation', 'IndependentReviewerAgent', '', '', '', '', '', ''];
+const decisionReviewRow = ['TEST-015', 'Task', '', 'M0', 'Test', 'Decision-owner review rejection', 'README.md', '', 'Human decision owner', 'In Review', 'P0', 'Cannot enter independent review', 'DecisionOwner', '', 'previous-agent', '', '', '', ''];
 await mkdir(recordsPath, { recursive: true });
-await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n${coordinatorRow.join(',')}\n${dependentOwnerRow.join(',')}\n${dependencyRevisionRow.join(',')}\n`, 'utf8');
+await writeFile(trackerPath, `${header.join(',')}\n${recoveryRow.join(',')}\n${nonReadyRow.join(',')}\n${normalRow.join(',')}\n${claimRecoveryRow.join(',')}\n${committedClaimRecoveryRow.join(',')}\n${preclaimBlockRow.join(',')}\n${dependencyUnblockRow.join(',')}\n${zeroDependencyBlockedRow.join(',')}\n${unfinishedDependencyBlockedRow.join(',')}\n${ownerWaitRow.join(',')}\n${closedBlockRecoveryRow.join(',')}\n${authorityRunRow.join(',')}\n${dependentOwnerRow.join(',')}\n${dependencyRevisionRow.join(',')}\n${decisionReviewRow.join(',')}\n`, 'utf8');
 
 const child = spawn(process.execPath, ['server.mjs'], {
   cwd: root,
@@ -90,6 +91,11 @@ try {
     body: '{}',
   });
   assert.equal(crossOrigin.response.status, 403);
+  const decisionReviewPacket = await request('/api/tasks/TEST-015/packet');
+  const decisionReview = await request('/api/tasks/TEST-015/review', mutation({
+    trackerRevision: decisionReviewPacket.body.trackerRevision, action: 'claim', reviewer: 'independent-reviewer',
+  }));
+  assert.equal(decisionReview.response.status, 409);
 
   const contractPacket = await request('/api/tasks/TEST-006/packet');
   const missingContractField = await request('/api/tasks/TEST-006/contract', mutation({
@@ -233,7 +239,7 @@ try {
     newTask: {
       taskId: 'TEST-CREATE-BAD', taskType: 'Task', parentId: '', milestone: 'M0', workstream: 'Test',
       task: 'Invalid planned task', specRef: 'README.md', dependsOn: 'MISSING-001',
-      ownerRole: 'Agent', priority: 'P0', acceptance: 'Must never enter the CSV.', reviewRequired: 'Yes',
+      ownerRole: 'Agent', priority: 'P0', acceptance: 'Must never enter the CSV.', completionAuthority: 'IndependentReviewerAgent',
     },
   }));
   assert.equal(rejectedCreation.response.status, 422);
@@ -244,7 +250,7 @@ try {
     newTask: {
       taskId: 'TEST-CREATE-001', taskType: 'Task', parentId: '', milestone: 'M0', workstream: 'Test',
       task: 'Create a planned remediation task', specRef: 'README.md', dependsOn: 'TEST-001',
-      ownerRole: 'Agent', priority: 'P0', acceptance: 'Starts as Backlog and requires normal admission.', reviewRequired: 'Yes',
+      ownerRole: 'Agent', priority: 'P0', acceptance: 'Starts as Backlog and requires normal admission.', completionAuthority: 'IndependentReviewerAgent',
     },
   }));
   assert.equal(created.response.status, 201);
@@ -257,7 +263,7 @@ try {
     newTask: {
       taskId: 'TEST-CREATE-001', taskType: 'Task', parentId: '', milestone: 'M0', workstream: 'Test',
       task: 'Duplicate planned task', specRef: 'README.md', dependsOn: '',
-      ownerRole: 'Agent', priority: 'P0', acceptance: 'Must not replace the existing task.', reviewRequired: 'Yes',
+      ownerRole: 'Agent', priority: 'P0', acceptance: 'Must not replace the existing task.', completionAuthority: 'IndependentReviewerAgent',
     },
   }));
   assert.equal(duplicateCreation.response.status, 409);
@@ -427,7 +433,7 @@ try {
   assert.match(parked.body.task.Evidence, /PARKED: Blocked -> Backlog;/);
   const prematureAdmission = await request('/api/tasks/TEST-009/admit', mutation({ trackerRevision: parked.body.trackerRevision, agent: 'scheduler-agent', targetStatus: 'Ready', reason: 'This must reject because TEST-002 remains unfinished.' }));
   assert.equal(prematureAdmission.response.status, 409);
-  const admittedBlocked = await request('/api/tasks/TEST-009/admit', mutation({ trackerRevision: parked.body.trackerRevision, agent: 'scheduler-agent', targetStatus: 'Blocked', blocker: 'TEST-002 remains In Progress in the admitted near-term chain.', reason: 'The coordinator explicitly admits TEST-009 for dependency monitoring.' }));
+  const admittedBlocked = await request('/api/tasks/TEST-009/admit', mutation({ trackerRevision: parked.body.trackerRevision, agent: 'scheduler-agent', targetStatus: 'Blocked', blocker: 'TEST-002 remains In Progress in the admitted near-term chain.', reason: 'The caller explicitly admits TEST-009 for dependency monitoring.' }));
   assert.equal(admittedBlocked.response.status, 200);
   assert.equal(admittedBlocked.body.task.Status, 'Blocked');
   assert.match(admittedBlocked.body.task.Evidence, /ADMITTED: Backlog -> Blocked;/);
@@ -441,6 +447,12 @@ try {
     expectedBehavior: 'The caller explicitly selects an allowed owner-facing status.',
   }));
   assert.equal(ownerWaitStart.response.status, 201);
+  const invalidDecisionOwnerVerification = await request(`/api/tasks/TEST-010/runs/${ownerWaitStart.body.run.runId}/close`, mutation({
+    trackerRevision: ownerWaitStart.body.trackerRevision,
+    outcome: 'verified',
+    summary: 'A DecisionOwner task must not enter the independent-review completion route.',
+  }));
+  assert.equal(invalidDecisionOwnerVerification.response.status, 409);
   const missingOwnerStatus = await request(`/api/tasks/TEST-010/runs/${ownerWaitStart.body.run.runId}/close`, mutation({
     trackerRevision: ownerWaitStart.body.trackerRevision,
     outcome: 'awaiting-human',
@@ -455,18 +467,18 @@ try {
   }));
   assert.equal(ownerWaitClose.response.status, 200);
   assert.equal(ownerWaitClose.body.task.Status, 'Awaiting Owner');
-  const coordinatorPacket = await request('/api/tasks/TEST-012/packet');
-  const coordinatorStart = await request('/api/runs/start', mutation({
+  const authorityPacket = await request('/api/tasks/TEST-012/packet');
+  const authorityStart = await request('/api/runs/start', mutation({
     taskId: 'TEST-012',
-    trackerRevision: coordinatorPacket.body.trackerRevision,
-    agent: 'coordinator-agent',
+    trackerRevision: authorityPacket.body.trackerRevision,
+    agent: 'authority-agent',
     verificationProfile: 'A-Governance',
-    scope: 'Expose one direct owner dependency under an auditable active coordinator Run.',
-    expectedBehavior: 'Only the claimed coordinator can transition its direct Backlog owner dependency into an explicit owner wait.',
+    scope: 'Expose one direct owner dependency under an auditable active authority Run.',
+    expectedBehavior: 'Only the Agent holding the active authority Run can transition its direct DecisionOwner dependency into an explicit owner wait.',
   }));
-  assert.equal(coordinatorStart.response.status, 201);
+  assert.equal(authorityStart.response.status, 201);
   const prematureOwnerWait = await request('/api/tasks/TEST-013/owner-wait', mutation({
-    trackerRevision: coordinatorStart.body.trackerRevision,
+    trackerRevision: authorityStart.body.trackerRevision,
     authorityTaskId: 'TEST-012',
     agent: 'wrong-agent',
     ownerStatus: 'Awaiting Owner',
@@ -474,11 +486,11 @@ try {
   }));
   assert.equal(prematureOwnerWait.response.status, 409);
   const ownerWaitActivation = await request('/api/tasks/TEST-013/owner-wait', mutation({
-    trackerRevision: coordinatorStart.body.trackerRevision,
+    trackerRevision: authorityStart.body.trackerRevision,
     authorityTaskId: 'TEST-012',
-    agent: 'coordinator-agent',
+    agent: 'authority-agent',
     ownerStatus: 'Awaiting Owner',
-    reason: 'The active coordinator independently verified that this direct owner preparation is now required.',
+    reason: 'The Agent holding the active authority Run verified that this direct owner preparation is required.',
   }));
   assert.equal(ownerWaitActivation.response.status, 200);
   assert.equal(ownerWaitActivation.body.task.Status, 'Awaiting Owner');
@@ -505,7 +517,7 @@ try {
   const closedBlockDependencyRevision = await request('/api/tasks/TEST-011/dependencies', mutation({
     trackerRevision: closedBlockClose.body.trackerRevision,
     agent: 'scheduler-agent',
-    reason: 'A closed blocked Run is historical attribution, so the coordinator can record a newly discovered prerequisite before retry.',
+    reason: 'A closed blocked Run is historical attribution, so an Agent can record a newly discovered prerequisite before retry.',
     dependsOn: 'TEST-001;TEST-003',
   }));
   assert.equal(closedBlockDependencyRevision.response.status, 200);

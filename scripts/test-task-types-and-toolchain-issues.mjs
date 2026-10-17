@@ -15,6 +15,7 @@ const legacyHeader = ['TaskID', 'ParentID', 'Milestone', 'Workstream', 'Task', '
 const legacyRows = [
   ['TYPE-001', '', 'M1', 'Test', 'Existing executable task', 'README.md', '', 'Agent', 'Ready', 'P0', 'Supports type schema migration.', 'Yes', '', '', '', '', '', ''],
   ['TYPE-002', 'TYPE-001', 'M1', 'Test', 'Second executable task', 'README.md', '', 'Agent', 'Backlog', 'P1', 'Supports cross-task issue reporting.', 'Yes', '', '', '', '', '', ''],
+  ['TYPE-003', '', 'M1', 'Test', 'Existing decision-owner task', 'README.md', '', 'Human decision owner', 'Backlog', 'P1', 'Supports completion-authority migration.', 'No', '', '', '', '', '', ''],
 ];
 await writeFile(trackerPath, `${legacyHeader.join(',')}\n${legacyRows.map((row) => row.join(',')).join('\n')}\n`, 'utf8');
 
@@ -59,7 +60,7 @@ try {
   const legacyCreate = await createTask(legacyTracker.body.revision, {
     taskId: 'TYPE-PRE-MIGRATION', taskType: 'Task', parentId: '', milestone: 'M1', workstream: 'Test',
     task: 'Must not create before schema migration', specRef: 'README.md', dependsOn: '', ownerRole: 'Agent',
-    priority: 'P1', acceptance: 'The legacy schema remains explicit.', reviewRequired: 'Yes',
+    priority: 'P1', acceptance: 'The legacy schema remains explicit.', completionAuthority: 'IndependentReviewerAgent',
   });
   assert.equal(legacyCreate.response.status, 422);
 
@@ -77,10 +78,29 @@ try {
   }));
   assert.equal(duplicateMigration.response.status, 409);
 
-  const story = await createTask(migrated.body.trackerRevision, {
+  const missingAuthority = await createTask(migrated.body.trackerRevision, {
+    taskId: 'TYPE-PRE-AUTHORITY-MIGRATION', taskType: 'Task', parentId: '', milestone: 'M1', workstream: 'Test',
+    task: 'Must not create before completion-authority migration', specRef: 'README.md', dependsOn: '', ownerRole: 'Agent',
+    priority: 'P1', acceptance: 'The canonical authority schema remains explicit.', completionAuthority: 'IndependentReviewerAgent',
+  });
+  assert.equal(missingAuthority.response.status, 422);
+
+  const authorityMigration = await request('/api/tracker/completion-authority/migrate', mutation({
+    trackerRevision: migrated.body.trackerRevision, actor: 'schema-owner', reason: 'Replace the ambiguous legacy review flag with explicit completion authority.',
+  }));
+  assert.equal(authorityMigration.response.status, 200);
+  assert.equal(authorityMigration.body.records.find(({ TaskID }) => TaskID === 'TYPE-001').CompletionAuthority, 'IndependentReviewerAgent');
+  assert.equal(authorityMigration.body.records.find(({ TaskID }) => TaskID === 'TYPE-003').CompletionAuthority, 'DecisionOwner');
+  assert.match(await readFile(trackerPath, 'utf8'), /^TaskID,TaskType,ParentID,[\s\S]*CompletionAuthority,/);
+  const duplicateAuthorityMigration = await request('/api/tracker/completion-authority/migrate', mutation({
+    trackerRevision: authorityMigration.body.trackerRevision, actor: 'schema-owner', reason: 'A second authority migration must not rewrite the schema.',
+  }));
+  assert.equal(duplicateAuthorityMigration.response.status, 409);
+
+  const story = await createTask(authorityMigration.body.trackerRevision, {
     taskId: 'STORY-001', taskType: 'Story', parentId: '', milestone: 'M2', workstream: 'Test',
     task: 'Future feature scope', specRef: 'README.md', dependsOn: '', ownerRole: 'Product',
-    priority: 'P1', acceptance: 'Child work is planned only when execution is near.', reviewRequired: 'No',
+    priority: 'P1', acceptance: 'Child work is planned only when execution is near.', completionAuthority: 'NotApplicable',
   });
   assert.equal(story.response.status, 201);
   assert.equal(story.body.task.TaskType, 'Story');
@@ -88,28 +108,42 @@ try {
   const invalidStory = await createTask(story.body.trackerRevision, {
     taskId: 'STORY-BAD', taskType: 'Story', parentId: 'STORY-001', milestone: 'M2', workstream: 'Test',
     task: 'Invalid nested scope', specRef: 'README.md', dependsOn: '', ownerRole: 'Product',
-    priority: 'P1', acceptance: 'Must be rejected.', reviewRequired: 'No',
+    priority: 'P1', acceptance: 'Must be rejected.', completionAuthority: 'NotApplicable',
   });
   assert.equal(invalidStory.response.status, 422);
+
+  const invalidStoryAuthority = await createTask(story.body.trackerRevision, {
+    taskId: 'STORY-BAD-AUTHORITY', taskType: 'Story', parentId: '', milestone: 'M2', workstream: 'Test',
+    task: 'Invalid Story authority', specRef: 'README.md', dependsOn: '', ownerRole: 'Product',
+    priority: 'P1', acceptance: 'Must be rejected.', completionAuthority: 'IndependentReviewerAgent',
+  });
+  assert.equal(invalidStoryAuthority.response.status, 422);
 
   const invalidParent = await createTask(story.body.trackerRevision, {
     taskId: 'TYPE-BAD-PARENT', taskType: 'Task', parentId: 'TYPE-001', milestone: 'M2', workstream: 'Test',
     task: 'Invalid non-Story parent', specRef: 'README.md', dependsOn: '', ownerRole: 'Agent',
-    priority: 'P1', acceptance: 'Must be rejected.', reviewRequired: 'Yes',
+    priority: 'P1', acceptance: 'Must be rejected.', completionAuthority: 'IndependentReviewerAgent',
   });
   assert.equal(invalidParent.response.status, 422);
+
+  const invalidExecutableAuthority = await createTask(story.body.trackerRevision, {
+    taskId: 'TYPE-BAD-AUTHORITY', taskType: 'Task', parentId: '', milestone: 'M2', workstream: 'Test',
+    task: 'Invalid executable authority', specRef: 'README.md', dependsOn: '', ownerRole: 'Agent',
+    priority: 'P1', acceptance: 'Must be rejected.', completionAuthority: 'NotApplicable',
+  });
+  assert.equal(invalidExecutableAuthority.response.status, 422);
 
   const childTask = await createTask(story.body.trackerRevision, {
     taskId: 'TYPE-CHILD-001', taskType: 'Task', parentId: 'STORY-001', milestone: 'M2', workstream: 'Test',
     task: 'Implement a scoped slice', specRef: 'README.md', dependsOn: '', ownerRole: 'Agent',
-    priority: 'P0', acceptance: 'Can be admitted as an ordinary executable Task.', reviewRequired: 'Yes',
+    priority: 'P0', acceptance: 'Can be admitted as an ordinary executable Task.', completionAuthority: 'IndependentReviewerAgent',
   });
   assert.equal(childTask.response.status, 201);
 
   const childBug = await createTask(childTask.body.trackerRevision, {
     taskId: 'BUG-CHILD-001', taskType: 'Bug', parentId: 'STORY-001', milestone: 'M2', workstream: 'Test',
     task: 'Fix scoped regression', specRef: 'README.md', dependsOn: '', ownerRole: 'Agent',
-    priority: 'P0', acceptance: 'Uses the ordinary Bug workflow.', reviewRequired: 'Yes',
+    priority: 'P0', acceptance: 'Uses the ordinary Bug workflow.', completionAuthority: 'IndependentReviewerAgent',
   });
   assert.equal(childBug.response.status, 201);
   assert.equal(childBug.body.task.TaskType, 'Bug');
@@ -117,7 +151,7 @@ try {
   const storyDependency = await createTask(childBug.body.trackerRevision, {
     taskId: 'TYPE-BAD-DEPENDENCY', taskType: 'Task', parentId: '', milestone: 'M2', workstream: 'Test',
     task: 'Invalid Story dependency', specRef: 'README.md', dependsOn: 'STORY-001', ownerRole: 'Agent',
-    priority: 'P1', acceptance: 'Must be rejected.', reviewRequired: 'Yes',
+    priority: 'P1', acceptance: 'Must be rejected.', completionAuthority: 'IndependentReviewerAgent',
   });
   assert.equal(storyDependency.response.status, 422);
 

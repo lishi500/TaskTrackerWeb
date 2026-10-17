@@ -18,17 +18,17 @@ Use the project's current Hub for task state. This skill coordinates delivery an
 
 | Work item | Use | Boundary |
 | --- | --- | --- |
-| Story | Coherent feature scope or a future player outcome | Non-executable container: no ParentID/DependsOn, ReviewRequired=No; never claim, admit, review, or depend on it |
+| Story | Coherent feature scope or a future player outcome | Non-executable container: no ParentID/DependsOn, CompletionAuthority=NotApplicable; never claim, admit, review, or depend on it |
 | Task | An independently verifiable delivery or technical prerequisite | May have a Story parent; acceptance defines the authorized outcome |
 | Bug | A distinct defect/regression needing its own tracked correction | Uses the same dependency, Run and review workflow as Task |
 
 Milestone is the delivery grouping, not a fourth TaskType. ParentID is scope context, not an execution dependency. Legacy CSV reads as Task until an explicit migration; do not reinterpret historical ParentID values as Story links.
 
-Plan the current slice in detail and future work coarsely. A player-facing slice needs one accountable delivery lead and an executable integration-acceptance Task; technical child tasks may still be small. Completing children does not prove or auto-complete the Story's player outcome. Link the slice contract in SpecRef and put observable behavior in Acceptance; Story context never expands a child's scope by itself.
+Plan the current slice in detail and future work coarsely. A player-facing slice needs one accountable delivery lead and an executable integration-acceptance Task; technical child tasks may still be small. A Story is automatically `Done` only when its direct Task/Bug child set is non-empty and every child is `Done`; adding a direct child returns it to `Backlog`. This is scope completion, not proof that the Story's player outcome or an integrated path has passed. Link the slice contract in SpecRef and put observable behavior in Acceptance; Story context never expands a child's scope by itself.
 
 Keep diagnosis, attempted repairs and reruns within the current task when its contract still covers them. Create a Bug/Task for a distinct scope, independent dependency, or new defect in completed work. Do not create a ticket per command, thought or review step; independent review normally lives on the implementation task. Preserve old acceptance/evidence rather than rewriting history.
 
-`ReviewRequired=No` is currently the convention for non-review owner work, not a supported Agent self-review switch. TaskType does not separate execution responsibility from review policy. Keep reviewed Agent Task/Bug work as Yes until that contract is explicitly changed.
+`CompletionAuthority` states who can authorize terminal completion; it is not an assignment. Use `IndependentReviewerAgent` for Task/Bug work that needs an independent claimed review, `DecisionOwner` when recorded human decision is the completion authority, and `NotApplicable` only for Story. Never change authority to bypass independent review.
 
 ## Execute and report what the evidence proves
 
@@ -48,13 +48,14 @@ A distinct reviewer claims an In Review task through `/review`, then records app
 ## State and handoff rules
 
 - Backlog is unadmitted work; Ready is claimable; Blocked is a specific near-term obstruction. Normal automatic dependency waits appear separately on the dashboard but retain CSV Blocked. Unknown/custom blocker reasons remain actionable.
-- With serialLane enabled, only one reviewed Agent task can be Ready/In Progress/In Review. Start arms a unique direct successor; completion may advance one eligible successor. Ambiguous fan-out needs explicit coordinator selection. Do not keep an executable parent claimed while expecting children to run.
-- Owner actions are Awaiting Owner / Awaiting Owner Gate. After feedback, Awaiting Agent Evaluation is **Agent work**, although the owner may supplement feedback. Raw input is not approval; coordinator `/owner-evaluation` resolves only non-review owner tasks after checking meaning. This is the separate owner-task route to Done.
+- With serialLane enabled, only one `IndependentReviewerAgent` task can be Ready/In Progress/In Review. Start arms a unique direct successor; completion may advance one eligible successor. Ambiguous fan-out remains Backlog until an authorized caller admits a task. Do not keep an executable parent claimed while expecting children to run.
+- Owner actions are Awaiting Owner / Awaiting Owner Gate. After feedback, `Awaiting Agent Evaluation` means **Owner feedback received — Agent action required**, not that any named or persistent Agent is waiting. Raw input is not approval. `DecisionOwner` work uses `/owner-evaluation` after an Agent checks the feedback's meaning. `IndependentReviewerAgent` Task/Bug work uses `/owner-feedback-disposition` with current revision, an audit `actor`, reason and exactly one action: `resume` only when dependencies are Done and the lane is available; `blocked` with a concrete blocker; or `return-to-owner` with an explicit owner-facing status. Resume requires a new Run and independent review before Done. Never use feedback as self-review or a completion shortcut.
+- Roles are bounded: the Human Decision Owner supplies decisions; an Implementer Agent exists only while its managed Run is active; an Independent Reviewer Agent exists only while it holds its review claim; `actor` is audit identity for a transition. Do not create or wait for a Coordinator role.
 - Run close requires an explicit ownerStatus. Automatic successor routing separately uses configured `ownerGateTaskPattern`; neither route proves project Gate eligibility.
 - Technical choices and routine bugs stay with the Agent within existing authorization. Escalate actual product/scope/acceptance/budget changes or human-only access, giving facts, options, recommendation and the minimum requested decision. A tool report does not automatically require owner troubleshooting.
 - Keep dynamic handoff state in the Hub. Link stable contracts and current packets; any saved snapshot must carry its time/revision and not become another editable activity list.
 
-For creation, contract/dependency revision, park/admit/unblock, owner-wait and owner-evaluation payloads/eligibility, read the relevant section of the [API contract](../../../task_hub_product_spec.md). Read-only `/api/dependency-audit` remains available when malformed CSV blocks other operations. Do not bypass an audit failure by editing active state.
+For creation, contract/dependency revision, park/admit/unblock, owner-wait, owner-evaluation and owner-feedback disposition payloads/eligibility, read the relevant section of the [API contract](../../../task_hub_product_spec.md). Read-only `/api/dependency-audit` remains available when malformed CSV blocks other operations. Do not bypass an audit failure by editing active state.
 
 ## Toolchain failure reporting and bounded recovery
 
@@ -69,7 +70,7 @@ ACK is owner acknowledgement/triage, not a fix or task completion. Do not ACK au
 ## Setup and maintenance (only when needed)
 
 - New instance: use `node scripts/init-instance.mjs --project-id <id> --project-name "<name>"`, then `node scripts/start.mjs`; replace the illustrative skeleton rows before real use. The initializer refuses an existing tracker. Keep the unauthenticated service on loopback.
-- Legacy schema: inspect current data, then use `POST /api/tracker/task-types/migrate` with `{ trackerRevision, actor, reason }`; it explicitly defaults old rows to Task and retains history. Do not migrate instances merely to inspect them.
+- Legacy schema: inspect current data, then use `POST /api/tracker/task-types/migrate` with `{ trackerRevision, actor, reason }`, reread the revision, then use `POST /api/tracker/completion-authority/migrate`. The second migration replaces `ReviewRequired` with canonical `CompletionAuthority` (`Yes -> IndependentReviewerAgent`, `No -> DecisionOwner`, Story -> NotApplicable). Do not migrate instances merely to inspect them.
 - Link game skill: `node scripts/link-game-skill.mjs /absolute/path/to/game`; inspect an existing link's purpose before replacement.
 - Upgrade instance: implement, validate and commit generic work in the template first. Preview `node scripts/sync-template.mjs --target <instance>`, apply only as part of an authorized upgrade with `--apply`, verify and restart as needed. Protect tracker/, instance config and local links. Template development alone does not imply a live game-instance rollout.
 - Temporary testing logs, if needed, use warn with `[CyberBudda]` and must be removed before production. Use domain execution tools for runtime evidence; this Hub skill owns no game code or Unity test policy.

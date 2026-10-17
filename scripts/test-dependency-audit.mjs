@@ -11,10 +11,10 @@ import { join } from 'node:path';
 const root = new URL('..', import.meta.url);
 const sandbox = await mkdtemp(join(tmpdir(), 'task-tracker-dependency-audit-'));
 const trackerPath = join(sandbox, 'task_tracker.csv');
-const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
+const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'CompletionAuthority', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
 
 function row(taskId, dependsOn = '', status = 'Backlog') {
-  return [taskId, 'Task', '', 'M1', 'Test', `${taskId} dependency audit`, 'README.md', dependsOn, 'Agent', status, 'P0', 'Dependency graph is valid.', 'Yes', '', '', '', '', '', ''];
+  return [taskId, 'Task', '', 'M1', 'Test', `${taskId} dependency audit`, 'README.md', dependsOn, 'Agent', status, 'P0', 'Dependency graph is valid.', 'IndependentReviewerAgent', '', '', '', '', '', ''];
 }
 
 async function writeRows(rows) {
@@ -93,7 +93,7 @@ try {
 
   const validStory = row('STORY-VALID', '', 'Backlog');
   validStory[1] = 'Story';
-  validStory[12] = 'No';
+  validStory[12] = 'NotApplicable';
   const invalidStoryDependency = row('DEPENDENCY-INVALID', 'STORY-VALID', 'Backlog');
   await writeRows([validStory, invalidStoryDependency]);
   const invalidStoryDependencyAudit = await request('/api/dependency-audit');

@@ -1,9 +1,9 @@
-const state = { records: [], summary: null, issues: null, issuesError: '', instance: { projectName: 'Task Tracker' }, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), milestoneViewInitialized: false };
+const state = { records: [], summary: null, issues: null, issuesError: '', instance: { projectName: 'Task Tracker' }, trackerRevision: '', selectedTaskId: null, openMilestones: new Set(), openStories: new Set(), milestoneViewInitialized: false };
 const ownerStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation']);
 const activeMilestoneStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation', 'In Progress', 'In Review']);
 const statusOrder = ['In Progress', 'In Review', 'Awaiting Agent Evaluation', 'Awaiting Owner', 'Awaiting Owner Gate', 'Ready', 'Blocked', 'Done', 'Deferred', 'Backlog'];
 const statusLabels = {
-  'In Progress': '进行中', 'In Review': '待审查', 'Awaiting Agent Evaluation': '待 Agent 评估',
+  'In Progress': '进行中', 'In Review': '待审查', 'Awaiting Agent Evaluation': 'Owner 反馈待 Agent 处置',
   'Awaiting Owner': '待 Owner', 'Awaiting Owner Gate': '待 Owner Gate', 'Ready': '可领取',
   'Blocked': '受阻', 'Done': '已完成', 'Deferred': '已延期', 'Backlog': '待排期',
 };
@@ -42,15 +42,42 @@ function taskTypeBadge(task) {
   return element('span', `task-type task-type-${type.toLowerCase()}`, type);
 }
 
+function completionAuthority(task) {
+  const explicit = String(task.CompletionAuthority || '').trim();
+  if (explicit) return explicit;
+  if (taskType(task) === 'Story') return 'NotApplicable';
+  return String(task.ReviewRequired || '').trim().toLowerCase() === 'yes'
+    ? 'IndependentReviewerAgent'
+    : 'DecisionOwner';
+}
+
+function completionAuthorityLabel(task) {
+  const authority = completionAuthority(task);
+  if (authority === 'IndependentReviewerAgent') return '独立 Reviewer Agent';
+  if (authority === 'DecisionOwner') return 'Decision Owner';
+  return '不适用';
+}
+
+function completionAuthorityBadge(task) {
+  const authority = completionAuthority(task);
+  if (authority === 'NotApplicable') return null;
+  return element('span', `completion-authority completion-authority-${authority.toLowerCase()}`, completionAuthorityLabel(task));
+}
+
+function directStoryChildren(task) {
+  return state.records.filter((candidate) => taskType(candidate) !== 'Story' && candidate.ParentID === task.TaskID);
+}
+
+function storyProgress(task) {
+  const children = directStoryChildren(task);
+  const completed = children.filter((candidate) => candidate.Status === 'Done').length;
+  return { children, completed, total: children.length, complete: children.length > 0 && completed === children.length };
+}
+
 function storyChildSummary(task) {
-  const children = state.records.filter((candidate) => candidate.ParentID === task.TaskID);
-  if (!children.length) return '尚未拆分子项';
-  const active = children.filter((candidate) => ['In Progress', 'In Review'].includes(candidate.Status)).length;
-  const blocked = children.filter((candidate) => candidate.Status === 'Blocked').length;
-  const parts = [`${children.length} 个子项`];
-  if (active) parts.push(`${active} 进行中`);
-  if (blocked) parts.push(`${blocked} 受阻`);
-  return parts.join(' · ');
+  const progress = storyProgress(task);
+  if (!progress.total) return '尚未拆分子项';
+  return progress.complete ? `✓ ${progress.completed} / ${progress.total} 已完成` : `${progress.completed} / ${progress.total} 已完成`;
 }
 
 function findTask(taskId) { return state.records.find((record) => record.TaskID === taskId); }
@@ -139,8 +166,9 @@ function openTask(taskId) {
   target.append(element('p', 'eyebrow', `${taskType(task).toUpperCase()} · ${task.Workstream || 'TASK'}`));
   target.append(element('h2', null, `${task.TaskID} · ${task.Task}`));
   target.append(taskTypeBadge(task), statusBadge(task.Status));
+  const authorityBadge = completionAuthorityBadge(task); if (authorityBadge) target.append(authorityBadge);
   const metadata = [
-    ['Type', taskType(task)], ['Milestone', task.Milestone], ['ParentID', task.ParentID || '无'], ['Owner role', task.OwnerRole], ['Priority', task.Priority],
+    ['Type', taskType(task)], ['Milestone', task.Milestone], ['ParentID', task.ParentID || '无'], ['Decision owner role', task.OwnerRole], ['Completion authority', completionAuthorityLabel(task)], ['Priority', task.Priority],
     ['SpecRef', task.SpecRef], ['DependsOn', task.DependsOn || '无'], ['Blocker', task.Blocker || '无'],
     ['Acceptance', task.Acceptance], ['Evidence', task.Evidence || '暂无'],
   ];
@@ -182,7 +210,7 @@ function openTask(taskId) {
 function feedbackForm(task) {
   const section = element('section', 'feedback-section');
   section.append(element('h3', null, task.Status === 'Awaiting Agent Evaluation' ? '补充反馈' : '提交反馈'));
-  section.append(element('p', 'feedback-note', '提交后将写入该任务的 Evidence，并转为“等待 Agent 评估”。不会直接完成任务或解锁依赖。'));
+  section.append(element('p', 'feedback-note', '提交后将写入该任务的 Evidence，并转为“Owner 反馈待 Agent 处置”。不会直接完成任务或解锁依赖。'));
   const form = element('form', 'feedback-form');
   const label = element('label', null, '你的反馈');
   const textarea = document.createElement('textarea');
@@ -199,7 +227,7 @@ function feedbackForm(task) {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '提交失败。');
       document.querySelector('#task-dialog').close();
-      setMessage(`${task.TaskID} 的反馈已记录，等待 Agent 评估。`);
+      setMessage(`${task.TaskID} 的反馈已记录，等待 Agent 处置。`);
       await load();
     } catch (error) {
       setMessage(error.message, true);
@@ -218,7 +246,22 @@ function renderTaskLink(task) {
 function filteredTasks() {
   const query = document.querySelector('#task-search').value.trim().toLowerCase();
   if (!query) return state.records;
-  return state.records.filter((task) => [task.TaskID, taskType(task), task.Task, task.Status, task.Blocker, task.Milestone].join(' ').toLowerCase().includes(query));
+  return state.records.filter((task) => [task.TaskID, taskType(task), completionAuthority(task), task.ParentID, task.Task, task.Status, task.Blocker, task.Milestone, task.Workstream].join(' ').toLowerCase().includes(query));
+}
+
+function milestoneViewTasks() {
+  const query = document.querySelector('#task-search').value.trim().toLowerCase();
+  if (!query) return state.records;
+  const visible = new Map(filteredTasks().map((task) => [task.TaskID, task]));
+  const stories = new Map(state.records.filter((task) => taskType(task) === 'Story').map((task) => [task.TaskID, task]));
+  for (const task of [...visible.values()]) {
+    const parent = stories.get(task.ParentID);
+    if (parent) visible.set(parent.TaskID, parent);
+    if (taskType(task) === 'Story') {
+      for (const child of directStoryChildren(task)) visible.set(child.TaskID, child);
+    }
+  }
+  return state.records.filter((task) => visible.has(task.TaskID));
 }
 
 function milestoneCompare(left, right) {
@@ -232,9 +275,12 @@ function milestoneCompare(left, right) {
 
 function milestoneStatusSummary(tasks) {
   const target = element('div', 'milestone-status-summary');
-  target.append(element('span', 'milestone-total', `总计 ${tasks.length}`));
+  const executableTasks = tasks.filter((task) => taskType(task) !== 'Story');
+  const storyCount = tasks.length - executableTasks.length;
+  target.append(element('span', 'milestone-total', `总计 ${executableTasks.length}`));
+  if (storyCount) target.append(element('span', 'milestone-story-total', `${storyCount} 个 Story`));
   const counts = new Map();
-  for (const task of tasks) counts.set(task.Status, (counts.get(task.Status) || 0) + 1);
+  for (const task of executableTasks) counts.set(task.Status, (counts.get(task.Status) || 0) + 1);
   const ordered = [...statusOrder, ...[...counts.keys()].filter((status) => !statusOrder.includes(status)).sort()];
   for (const status of ordered) {
     const count = counts.get(status) || 0;
@@ -244,12 +290,24 @@ function milestoneStatusSummary(tasks) {
   return target;
 }
 
-function renderMilestoneTask(task) {
-  const row = element('article', 'milestone-task');
+function taskSort(left, right) {
+  return (left.Priority || '').localeCompare(right.Priority || '') || left.TaskID.localeCompare(right.TaskID);
+}
+
+function storyProgressBadge(story) {
+  const progress = storyProgress(story);
+  if (!progress.total) return element('span', 'story-progress', '尚未拆分');
+  return element('span', `story-progress${progress.complete ? ' is-complete' : ''}`, progress.complete ? `✓ ${progress.completed} / ${progress.total}` : `${progress.completed} / ${progress.total} 已完成`);
+}
+
+function renderMilestoneTask(task, { storyChild = false, parentMilestone = '' } = {}) {
+  const row = element('article', `milestone-task${storyChild ? ' story-child-task' : ''}`);
   const heading = element('div', 'milestone-task-heading');
-  heading.append(renderTaskLink(task), taskTypeBadge(task), statusBadge(task.Status)); row.append(heading);
+  heading.append(renderTaskLink(task), taskTypeBadge(task), statusBadge(task.Status));
+  const authorityBadge = completionAuthorityBadge(task); if (authorityBadge) heading.append(authorityBadge);
+  row.append(heading);
   const metadata = [];
-  if (taskType(task) === 'Story') metadata.push(storyChildSummary(task));
+  if (storyChild && parentMilestone && task.Milestone && task.Milestone !== parentMilestone) metadata.push(`Milestone ${task.Milestone}`);
   if (task.Priority) metadata.push(task.Priority);
   if (task.DependsOn) metadata.push(`依赖 ${task.DependsOn.split(';').filter(Boolean).length} 项`);
   if (task.Updated) metadata.push(`更新 ${task.Updated}`);
@@ -260,27 +318,71 @@ function renderMilestoneTask(task) {
   return row;
 }
 
+function renderStoryGroup(story, children, { queryActive }) {
+  const section = element('details', 'story-group');
+  const hasActiveChild = directStoryChildren(story).some((task) => activeMilestoneStatuses.has(task.Status));
+  section.open = queryActive || state.openStories.has(story.TaskID)
+    || (!state.milestoneViewInitialized && (activeMilestoneStatuses.has(story.Status) || hasActiveChild));
+  const summary = element('summary', 'story-summary');
+  const title = element('div', 'story-title');
+  const link = renderTaskLink(story);
+  link.addEventListener('click', (event) => event.stopPropagation());
+  title.append(link, taskTypeBadge(story), statusBadge(story.Status));
+  title.append(element('span', 'story-context', story.Workstream || 'Story 范围'));
+  summary.append(title, storyProgressBadge(story));
+  section.append(summary);
+  const body = element('div', 'story-child-list');
+  if (!children.length) {
+    body.append(element('p', 'empty-state story-empty-state', '当前筛选下没有子项。'));
+  } else {
+    for (const child of [...children].sort(taskSort)) body.append(renderMilestoneTask(child, { storyChild: true, parentMilestone: story.Milestone }));
+  }
+  section.append(body);
+  section.addEventListener('toggle', () => { if (section.open) state.openStories.add(story.TaskID); else state.openStories.delete(story.TaskID); });
+  return section;
+}
+
 function renderMilestones() {
   const target = document.querySelector('#milestone-groups'); target.replaceChildren();
-  const tasks = filteredTasks();
+  const tasks = milestoneViewTasks();
   if (!tasks.length) { target.append(element('p', 'empty-state', '没有与搜索条件匹配的任务。')); return; }
   const groups = new Map();
+  const visibleStories = new Map(tasks.filter((task) => taskType(task) === 'Story').map((task) => [task.TaskID, task]));
+  const groupFor = (milestone) => {
+    const name = milestone || '未归属';
+    if (!groups.has(name)) groups.set(name, { stories: [], standalone: [], storyChildren: new Map(), tasks: [] });
+    return groups.get(name);
+  };
   for (const task of tasks) {
-    const milestone = task.Milestone || '未归属';
-    if (!groups.has(milestone)) groups.set(milestone, []);
-    groups.get(milestone).push(task);
+    if (taskType(task) === 'Story') {
+      const group = groupFor(task.Milestone);
+      group.stories.push(task); group.tasks.push(task);
+      if (!group.storyChildren.has(task.TaskID)) group.storyChildren.set(task.TaskID, []);
+      continue;
+    }
+    const parent = visibleStories.get(task.ParentID);
+    if (parent) {
+      const group = groupFor(parent.Milestone);
+      if (!group.storyChildren.has(parent.TaskID)) group.storyChildren.set(parent.TaskID, []);
+      group.storyChildren.get(parent.TaskID).push(task); group.tasks.push(task);
+    } else {
+      const group = groupFor(task.Milestone);
+      group.standalone.push(task); group.tasks.push(task);
+    }
   }
   const queryActive = Boolean(document.querySelector('#task-search').value.trim());
-  for (const [milestone, groupTasks] of [...groups.entries()].sort(([left], [right]) => milestoneCompare(left, right))) {
+  for (const [milestone, group] of [...groups.entries()].sort(([left], [right]) => milestoneCompare(left, right))) {
     const section = element('details', 'milestone-group');
-    const hasActiveTask = groupTasks.some((task) => activeMilestoneStatuses.has(task.Status));
+    const hasActiveTask = group.tasks.some((task) => activeMilestoneStatuses.has(task.Status));
     section.open = queryActive || state.openMilestones.has(milestone) || (!state.milestoneViewInitialized && hasActiveTask);
     const summary = element('summary', 'milestone-summary');
     const title = element('div', 'milestone-title');
-    title.append(element('span', 'milestone-name', milestone)); title.append(element('span', 'milestone-caption', '任务状态'));
-    summary.append(title); summary.append(milestoneStatusSummary(groupTasks)); section.append(summary);
+    title.append(element('span', 'milestone-name', milestone)); title.append(element('span', 'milestone-caption', '按 Story 范围与独立工作项归纳'));
+    summary.append(title); summary.append(milestoneStatusSummary(group.tasks)); section.append(summary);
     const body = element('div', 'milestone-task-list');
-    for (const task of [...groupTasks].sort((left, right) => (left.Priority || '').localeCompare(right.Priority || '') || left.TaskID.localeCompare(right.TaskID))) body.append(renderMilestoneTask(task));
+    for (const story of [...group.stories].sort(taskSort)) body.append(renderStoryGroup(story, group.storyChildren.get(story.TaskID), { queryActive }));
+    if (group.stories.length && group.standalone.length) body.append(element('p', 'milestone-subgroup-heading', '独立工作项'));
+    for (const task of [...group.standalone].sort(taskSort)) body.append(renderMilestoneTask(task));
     section.append(body);
     section.addEventListener('toggle', () => { if (section.open) state.openMilestones.add(milestone); else state.openMilestones.delete(milestone); });
     target.append(section);
@@ -339,12 +441,15 @@ function renderTable() {
   for (const task of filteredTasks()) {
     const row = document.createElement('tr');
     const latestRun = task.RunSummary?.current || task.RunSummary?.latest;
-    const cells = [task.TaskID, taskType(task), task.Milestone, task.Task, task.Status, runLabel(latestRun), task.DependsOn || '—', task.Updated || '—'];
+    const cells = [task.TaskID, taskType(task), completionAuthorityLabel(task), task.Milestone, task.Task, task.Status, runLabel(latestRun), task.DependsOn || '—', task.Updated || '—'];
     cells.forEach((value, index) => {
       const cell = document.createElement('td');
       if (index === 0) cell.append(renderTaskLink(task));
       else if (index === 1) cell.append(taskTypeBadge(task));
-      else if (index === 4) cell.append(statusBadge(value));
+      else if (index === 2) {
+        const authorityBadge = completionAuthorityBadge(task);
+        cell.append(authorityBadge || element('span', 'muted', value));
+      } else if (index === 5) cell.append(statusBadge(value));
       else cell.textContent = value;
       row.append(cell);
     });

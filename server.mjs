@@ -34,10 +34,12 @@ const ownerActionStatuses = new Set(['Awaiting Owner', 'Awaiting Owner Gate']);
 const taskCreationColumns = [
   'TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef',
   'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance',
-  'ReviewRequired', 'Blocker', 'Implementer', 'Evidence', 'Updated',
+  'CompletionAuthority', 'Blocker', 'Implementer', 'Evidence', 'Updated',
   'ReviewClaim', 'Reviewer',
 ];
+const legacyTaskCreationColumns = taskCreationColumns.map((column) => column === 'CompletionAuthority' ? 'ReviewRequired' : column);
 const taskTypes = new Set(['Task', 'Bug', 'Story']);
+const completionAuthorities = new Set(['IndependentReviewerAgent', 'DecisionOwner', 'NotApplicable']);
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -115,12 +117,51 @@ function encodeCsv(rows) {
 function taskType(record) {
   const value = String(record.TaskType ?? '').trim();
   // Existing instances are readable before the explicit schema migration. They
-  // remain ordinary executable Tasks until a coordinator classifies new work.
+  // remain ordinary executable Tasks until someone explicitly classifies new work.
   return value || 'Task';
 }
 
 function isStory(record) {
   return taskType(record) === 'Story';
+}
+
+function derivedStoryStatus(records, story) {
+  const children = records.filter((record) => !isStory(record) && record.ParentID === story.TaskID);
+  return children.length > 0 && children.every(({ Status }) => Status === 'Done') ? 'Done' : 'Backlog';
+}
+
+// A Story is an organizational scope, so its only workflow-like signal is
+// derived from its direct executable children. Keep read projections pure: a
+// dashboard refresh must never write the tracker merely to correct this cache.
+function projectStoryStatuses(records) {
+  return records.map((record) => isStory(record)
+    ? { ...record, Status: derivedStoryStatus(records, record) }
+    : record);
+}
+
+function synchronizeStoryStatuses(records) {
+  const timestamp = new Date().toISOString();
+  for (const story of records.filter(isStory)) {
+    const derivedStatus = derivedStoryStatus(records, story);
+    if (story.Status === derivedStatus) continue;
+    const previousStatus = story.Status || 'Unspecified';
+    story.Status = derivedStatus;
+    story.Updated = timestamp;
+    appendEvidence(story, `STORY STATUS SYNCHRONIZED: ${previousStatus} -> ${derivedStatus}; derived from direct executable children.`);
+  }
+}
+
+function completionAuthority(record) {
+  const explicit = String(record.CompletionAuthority ?? '').trim();
+  if (explicit) return explicit;
+  if (isStory(record)) return 'NotApplicable';
+  return String(record.ReviewRequired ?? '').trim().toLowerCase() === 'yes'
+    ? 'IndependentReviewerAgent'
+    : 'DecisionOwner';
+}
+
+function requiresIndependentReviewer(record) {
+  return !isStory(record) && completionAuthority(record) === 'IndependentReviewerAgent';
 }
 
 function assertExecutableTask(record, action) {
@@ -178,6 +219,10 @@ async function readRawTracker() {
   });
   const records = wellFormedRows.map((values) => Object.fromEntries(header.map((name, index) => [name, values[index]])));
   const hasTaskTypeSchema = header.includes('TaskType');
+  const hasCompletionAuthoritySchema = header.includes('CompletionAuthority');
+  if (hasCompletionAuthoritySchema && header.includes('ReviewRequired')) {
+    csvErrors.push({ code: 'completion-authority-schema', message: 'task_tracker.csv cannot contain both CompletionAuthority and legacy ReviewRequired.' });
+  }
   for (const [index, record] of records.entries()) {
     const explicitTaskType = String(record.TaskType ?? '').trim();
     if (hasTaskTypeSchema && !taskTypes.has(explicitTaskType)) {
@@ -187,11 +232,25 @@ async function readRawTracker() {
       });
     }
     record.TaskType = explicitTaskType || 'Task';
+    const explicitAuthority = String(record.CompletionAuthority ?? '').trim();
+    if (hasCompletionAuthoritySchema && !completionAuthorities.has(explicitAuthority)) {
+      csvErrors.push({
+        code: 'completion-authority', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
+        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) has invalid CompletionAuthority '${explicitAuthority}'.`,
+      });
+    }
+    record.CompletionAuthority = completionAuthority(record);
     if (explicitTaskType === 'Story'
-      && (record.ParentID || taskDependencies(record).length || String(record.ReviewRequired ?? '').trim() !== 'No')) {
+      && (record.ParentID || taskDependencies(record).length || record.CompletionAuthority !== 'NotApplicable')) {
       csvErrors.push({
         code: 'story-structure', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
-        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) is a Story but has executable relationship fields.`,
+        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) is a Story but has executable relationship fields or completion authority.`,
+      });
+    }
+    if (hasCompletionAuthoritySchema && !isStory(record) && record.CompletionAuthority === 'NotApplicable') {
+      csvErrors.push({
+        code: 'completion-authority', line: index + 2, taskId: record.TaskID || '<missing TaskID>',
+        message: `line ${index + 2} (${record.TaskID || '<missing TaskID>'}) is executable and cannot use CompletionAuthority 'NotApplicable'.`,
       });
     }
   }
@@ -367,6 +426,9 @@ async function readTracker() {
 
 async function replaceTracker(header, records) {
   if (!trackerPath) throw new Error('No tracker is configured.');
+  // Persist the cached Story projection only as part of an authorized tracker
+  // mutation. GET endpoints use projectStoryStatuses instead.
+  synchronizeStoryStatuses(records);
   assertValidDependencyAudit(dependencyAudit({ header, records, csvErrors: [] }));
   const existing = await stat(trackerPath);
   const rows = [header, ...records.map((record) => header.map((name) => record[name] ?? ''))];
@@ -471,13 +533,9 @@ function summarize(records) {
 
 const serialLaneStatuses = new Set(['Ready', 'In Progress', 'In Review']);
 
-function isAgentTask(record) {
-  return !isStory(record) && String(record.ReviewRequired ?? '').trim().toLowerCase() === 'yes';
-}
-
 function serialLaneOccupants(records, excludedTaskId = '') {
   if (!serialLaneEnabled) return [];
-  return records.filter((record) => record.TaskID !== excludedTaskId && isAgentTask(record) && serialLaneStatuses.has(record.Status));
+  return records.filter((record) => record.TaskID !== excludedTaskId && requiresIndependentReviewer(record) && serialLaneStatuses.has(record.Status));
 }
 
 function assertSerialLaneAvailable(records, taskId) {
@@ -645,7 +703,7 @@ function summarizeToolchainIssues(events) {
 }
 
 function armImmediateSuccessor(records, predecessor, timestamp) {
-  if (!serialLaneEnabled || !isAgentTask(predecessor) || !['In Progress', 'In Review'].includes(predecessor.Status)) return [];
+  if (!serialLaneEnabled || !requiresIndependentReviewer(predecessor) || !['In Progress', 'In Review'].includes(predecessor.Status)) return [];
   const candidates = records.filter((record) => !isStory(record) && record.Status === 'Backlog'
     && taskDependencies(record).includes(predecessor.TaskID)
     && dependenciesOtherThan(record, predecessor.TaskID).every((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status === 'Done'));
@@ -682,7 +740,7 @@ function advanceImmediateSuccessor(records, predecessor, timestamp) {
     && allDependenciesDone(records, record));
   if (candidates.length !== 1) return [];
   const candidate = candidates[0];
-  if (isAgentTask(candidate)) {
+  if (requiresIndependentReviewer(candidate)) {
     if (serialLaneOccupants(records, candidate.TaskID).length) return [];
     candidate.Status = 'Ready';
     candidate.Blocker = '';
@@ -757,7 +815,10 @@ function taskDependencies(record) {
 function requireTaskCreationColumns(header) {
   const missing = taskCreationColumns.filter((column) => !header.includes(column));
   if (!missing.length) return;
-  const migrationHint = missing.includes('TaskType') ? ' Run POST /api/tracker/task-types/migrate first for an existing tracker.' : '';
+  const hints = [];
+  if (missing.includes('TaskType')) hints.push('Run POST /api/tracker/task-types/migrate first for an existing tracker.');
+  if (missing.includes('CompletionAuthority') && header.includes('ReviewRequired')) hints.push('Run POST /api/tracker/completion-authority/migrate to replace legacy ReviewRequired.');
+  const migrationHint = hints.length ? ` ${hints.join(' ')}` : '';
   const error = new Error(`Task creation requires the standard tracker columns. Missing: ${missing.join(', ')}.${migrationHint}`);
   error.statusCode = 422;
   throw error;
@@ -784,15 +845,30 @@ function requestedTaskType(value) {
   return selected;
 }
 
-function assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, reviewRequired }) {
+function requestedCompletionAuthority(value) {
+  const selected = creationText(value, 'completionAuthority', { required: true, maxLength: 64 });
+  if (!completionAuthorities.has(selected)) {
+    const error = new Error('completionAuthority must be IndependentReviewerAgent, DecisionOwner or NotApplicable.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return selected;
+}
+
+function assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, completionAuthority: selectedAuthority }) {
   const dependencies = dependsOn.split(';').map((value) => value.trim()).filter(Boolean);
   if (selectedType === 'Story') {
-    if (parentId || dependencies.length || reviewRequired !== 'No') {
-      const error = new Error('Story is a non-executable scope container: it cannot have ParentID or DependsOn and must use reviewRequired=No.');
+    if (parentId || dependencies.length || selectedAuthority !== 'NotApplicable') {
+      const error = new Error('Story is a non-executable scope container: it cannot have ParentID or DependsOn and must use completionAuthority=NotApplicable.');
       error.statusCode = 422;
       throw error;
     }
     return;
+  }
+  if (selectedAuthority === 'NotApplicable') {
+    const error = new Error('Task and Bug must use completionAuthority=IndependentReviewerAgent or DecisionOwner.');
+    error.statusCode = 422;
+    throw error;
   }
   if (parentId) {
     const parent = records.find(({ TaskID }) => TaskID === parentId);
@@ -833,13 +909,8 @@ function newTaskRecord(header, body, timestamp, records) {
   if (parentId) safePathSegment(parentId, 'Parent ID');
   const dependsOn = creationText(candidate.dependsOn, 'dependsOn', { maxLength: 4_000 });
   for (const dependencyId of dependsOn.split(';').map((value) => value.trim()).filter(Boolean)) safePathSegment(dependencyId, 'Dependency Task ID');
-  const reviewRequired = creationText(candidate.reviewRequired, 'reviewRequired', { required: true, maxLength: 3 });
-  if (!['Yes', 'No'].includes(reviewRequired)) {
-    const error = new Error('reviewRequired must be exactly Yes or No.');
-    error.statusCode = 400;
-    throw error;
-  }
-  assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, reviewRequired });
+  const selectedAuthority = requestedCompletionAuthority(candidate.completionAuthority);
+  assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, completionAuthority: selectedAuthority });
   const values = {
     TaskID: taskId,
     TaskType: selectedType,
@@ -853,7 +924,7 @@ function newTaskRecord(header, body, timestamp, records) {
     Status: 'Backlog',
     Priority: creationText(candidate.priority, 'priority', { required: true, maxLength: 64 }),
     Acceptance: creationText(candidate.acceptance, 'acceptance', { required: true, maxLength: 8_000 }),
-    ReviewRequired: reviewRequired,
+    CompletionAuthority: selectedAuthority,
     Blocker: '',
     Implementer: '',
     Evidence: `CREATED: ${agent} ${timestamp}; ${reason}`,
@@ -1222,8 +1293,10 @@ function requireRevision(body, trackerRevision) {
 }
 
 function packetFor(record, records, runs, trackerRevision) {
-  const dependencies = taskDependencies(record).map((taskId) => {
-    const dependency = records.find(({ TaskID }) => TaskID === taskId);
+  const projectedRecords = projectStoryStatuses(records);
+  const projectedRecord = projectedRecords.find(({ TaskID }) => TaskID === record.TaskID);
+  const dependencies = taskDependencies(projectedRecord).map((taskId) => {
+    const dependency = projectedRecords.find(({ TaskID }) => TaskID === taskId);
     return dependency ? {
       taskId,
       status: dependency.Status,
@@ -1232,30 +1305,30 @@ function packetFor(record, records, runs, trackerRevision) {
       specRef: dependency.SpecRef,
     } : { taskId, missing: true };
   });
-  const reverseDependencies = records
-    .filter((candidate) => taskDependencies(candidate).includes(record.TaskID))
+  const reverseDependencies = projectedRecords
+    .filter((candidate) => taskDependencies(candidate).includes(projectedRecord.TaskID))
     .map((candidate) => ({ taskId: candidate.TaskID, status: candidate.Status, task: candidate.Task }));
   const scopeSummary = (item) => ({
     taskId: item.TaskID, taskType: taskType(item), goal: item.Task,
     acceptance: item.Acceptance, specRef: item.SpecRef, milestone: item.Milestone,
   });
-  const story = records.find((candidate) => candidate.TaskID === record.ParentID && isStory(candidate));
+  const story = projectedRecords.find((candidate) => candidate.TaskID === projectedRecord.ParentID && isStory(candidate));
   return {
     trackerRevision,
-    task: record,
+    task: projectedRecord,
     packet: {
-      goal: record.Task,
+      goal: projectedRecord.Task,
       nonGoals: 'Task-specific exclusions are in SpecRef and the Story scope when present; no separate non-goals field is stored. A Story does not authorize work outside this task contract.',
-      acceptance: record.Acceptance,
-      specRef: record.SpecRef,
-      blocker: record.Blocker,
-      availability: record.Status,
+      acceptance: projectedRecord.Acceptance,
+      specRef: projectedRecord.SpecRef,
+      blocker: projectedRecord.Blocker,
+      availability: projectedRecord.Status,
       dependencies,
       reverseDependencies,
       existingRuns: runs,
       context: {
         story: story ? scopeSummary(story) : null,
-        children: isStory(record) ? records.filter((candidate) => !isStory(candidate) && candidate.ParentID === record.TaskID)
+        children: isStory(projectedRecord) ? projectedRecords.filter((candidate) => !isStory(candidate) && candidate.ParentID === projectedRecord.TaskID)
           .map((candidate) => ({ ...scopeSummary(candidate), status: candidate.Status })) : [],
       },
     },
@@ -1317,15 +1390,16 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && requestPath === '/api/tracker') {
       const { records, trackerRevision } = await readTracker();
       const summaries = await taskRunSummaries(records);
+      const projectedRecords = projectStoryStatuses(records);
       sendJson(response, 200, {
         revision: trackerRevision,
-        records: records.map((record) => ({ ...record, RunSummary: summaries.get(record.TaskID) ?? null })),
+        records: projectedRecords.map((record) => ({ ...record, RunSummary: summaries.get(record.TaskID) ?? null })),
       });
       return;
     }
     if (request.method === 'GET' && requestPath === '/api/summary') {
       const { records, trackerRevision } = await readTracker();
-      sendJson(response, 200, { ...summarize(records), revision: trackerRevision });
+      sendJson(response, 200, { ...summarize(projectStoryStatuses(records)), revision: trackerRevision });
       return;
     }
     if (request.method === 'GET' && requestPath === '/api/toolchain-issues') {
@@ -1352,7 +1426,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 409;
           throw error;
         }
-        const legacyColumns = taskCreationColumns.filter((column) => column !== 'TaskType');
+        const legacyColumns = legacyTaskCreationColumns.filter((column) => column !== 'TaskType');
         const missing = legacyColumns.filter((column) => !header.includes(column));
         if (missing.length) {
           const error = new Error(`Task type migration requires the legacy standard tracker columns. Missing: ${missing.join(', ')}.`);
@@ -1370,6 +1444,44 @@ const server = createServer(async (request, response) => {
           record.Updated = timestamp;
           appendEvidence(record, `TASK TYPE SCHEMA MIGRATED: ${actor} ${timestamp}; default=Task; ${reason}`);
           if (legacyParentId) appendEvidence(record, `LEGACY PARENTID RETAINED AS HISTORY: ${legacyParentId}; not interpreted as a Story relationship.`);
+        }
+        await replaceTracker(migratedHeader, records);
+        const after = await readTracker();
+        return { records: after.records, trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
+    if (request.method === 'POST' && requestPath === '/api/tracker/completion-authority/migrate') {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const actor = reviewerIdentity(body.actor);
+      const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        if (header.includes('CompletionAuthority')) {
+          const error = new Error('CompletionAuthority is already present; no schema migration is needed.');
+          error.statusCode = 409;
+          throw error;
+        }
+        if (!header.includes('TaskType') || !header.includes('ReviewRequired')) {
+          const error = new Error('Completion authority migration requires TaskType and legacy ReviewRequired. Run the task-type migration first when needed.');
+          error.statusCode = 422;
+          throw error;
+        }
+        const reviewRequiredIndex = header.indexOf('ReviewRequired');
+        const migratedHeader = [...header];
+        migratedHeader[reviewRequiredIndex] = 'CompletionAuthority';
+        const timestamp = new Date().toISOString();
+        for (const record of records) {
+          const legacyReviewRequired = String(record.ReviewRequired ?? '').trim();
+          const authority = isStory(record)
+            ? 'NotApplicable'
+            : legacyReviewRequired.toLowerCase() === 'yes' ? 'IndependentReviewerAgent' : 'DecisionOwner';
+          record.CompletionAuthority = authority;
+          record.Updated = timestamp;
+          appendEvidence(record, `COMPLETION AUTHORITY SCHEMA MIGRATED: ${actor} ${timestamp}; ReviewRequired=${legacyReviewRequired || '(blank)'} -> ${authority}; ${reason}`);
         }
         await replaceTracker(migratedHeader, records);
         const after = await readTracker();
@@ -1569,7 +1681,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 409;
           throw error;
         }
-        assertSerialLaneAvailable(records, taskId);
+        if (requiresIndependentReviewer(record)) assertSerialLaneAvailable(records, taskId);
         const dependencies = taskDependencies(record);
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) {
@@ -1747,7 +1859,12 @@ const server = createServer(async (request, response) => {
             return { run: currentRun, task: currentRecord, trackerRevision: current.trackerRevision };
           }
           const beforeRecord = Object.fromEntries(current.header.map((name) => [name, currentRecord[name] ?? '']));
-          if (outcome === 'verified') {
+        if (outcome === 'verified' && !requiresIndependentReviewer(currentRecord)) {
+          const error = new Error(`Only IndependentReviewerAgent work can close as verified. ${taskId} must return to an owner-facing status for a DecisionOwner decision.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        if (outcome === 'verified') {
           currentRecord.Status = 'In Review';
           currentRecord.Blocker = '';
         } else if (outcome === 'blocked') {
@@ -1841,6 +1958,11 @@ const server = createServer(async (request, response) => {
           throw error;
         }
         assertExecutableTask(record, 'be reviewed');
+        if (!requiresIndependentReviewer(record)) {
+          const error = new Error(`Only IndependentReviewerAgent work can be independently reviewed. ${taskId} uses ${completionAuthority(record)}.`);
+          error.statusCode = 409;
+          throw error;
+        }
         if (record.Status !== 'In Review') {
           const error = new Error(`Only In Review tasks can be reviewed. ${taskId} is '${record.Status}'.`);
           error.statusCode = 409;
@@ -2064,7 +2186,7 @@ const server = createServer(async (request, response) => {
         if (!dependencies.length) { const error = new Error(`Cannot dependency-unblock ${taskId}; it has no dependencies.`); error.statusCode = 409; throw error; }
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) { const error = new Error(`Cannot unblock ${taskId}; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error; }
-        assertSerialLaneAvailable(records, taskId);
+        if (requiresIndependentReviewer(record)) assertSerialLaneAvailable(records, taskId);
         const timestamp = new Date().toISOString();
         // A completed blocked Run may retain Implementer for historical attribution.
         // Its Run is no longer an active claim; successful maintenance clears that
@@ -2146,7 +2268,7 @@ const server = createServer(async (request, response) => {
           const error = new Error(`Cannot admit ${taskId} as Ready; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error;
         }
         if (targetStatus === 'Ready') {
-          assertSerialLaneAvailable(records, taskId);
+          if (requiresIndependentReviewer(record)) assertSerialLaneAvailable(records, taskId);
         } else if (serialLaneEnabled) {
           const activeDependencies = dependencies.filter((dependencyId) => ['In Progress', 'In Review'].includes(records.find(({ TaskID }) => TaskID === dependencyId)?.Status));
           const otherUnfinished = dependencies.filter((dependencyId) => dependencyId !== activeDependencies[0] && records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
@@ -2187,8 +2309,8 @@ const server = createServer(async (request, response) => {
         if (!authority) { const error = new Error(`Authority task '${authorityTaskId}' was not found.`); error.statusCode = 404; throw error; }
         assertExecutableTask(record, 'enter an owner wait');
         assertExecutableTask(authority, 'act as an owner-wait authority');
-        if (isAgentTask(record) || record.Status !== 'Backlog' || record.ReviewClaim || record.Implementer) {
-          const error = new Error(`Only an unclaimed non-review Backlog task can enter an owner wait. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
+        if (requiresIndependentReviewer(record) || record.Status !== 'Backlog' || record.ReviewClaim || record.Implementer) {
+          const error = new Error(`Only an unclaimed DecisionOwner Backlog task can enter an owner wait. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
         }
         if (authority.Status !== 'In Progress' || authority.Implementer !== agent || !taskDependencies(record).includes(authorityTaskId)) {
           const error = new Error(`Authority task '${authorityTaskId}' must be an In Progress direct dependency claimed by '${agent}'.`); error.statusCode = 409; throw error;
@@ -2232,8 +2354,8 @@ const server = createServer(async (request, response) => {
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
         assertExecutableTask(record, 'receive an owner evaluation');
-        if (record.Status !== 'Awaiting Agent Evaluation' || isAgentTask(record)) {
-          const error = new Error(`Only a non-review owner task in Awaiting Agent Evaluation can be resolved. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
+        if (record.Status !== 'Awaiting Agent Evaluation' || completionAuthority(record) !== 'DecisionOwner') {
+          const error = new Error(`Only a DecisionOwner task in Awaiting Agent Evaluation can be resolved. ${taskId} is '${record.Status}'.`); error.statusCode = 409; throw error;
         }
         const timestamp = new Date().toISOString();
         if (decision === 'approved') {
@@ -2252,6 +2374,60 @@ const server = createServer(async (request, response) => {
         record.Updated = timestamp;
         appendEvidence(record, `OWNER EVALUATION ${decision}: ${agent} ${timestamp}; ${notes}`);
         if (decision === 'approved') advanceImmediateSuccessor(records, record, timestamp);
+        await replaceTracker(header, records);
+        const after = await readTracker();
+        return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
+      });
+      sendJson(response, 200, result);
+      return;
+    }
+    const ownerFeedbackDispositionMatch = /^\/api\/tasks\/([^/]+)\/owner-feedback-disposition$/.exec(requestPath);
+    if (request.method === 'POST' && ownerFeedbackDispositionMatch) {
+      verifyMutationRequest(request);
+      const body = await readJson(request);
+      const taskId = safePathSegment(decodeURIComponent(ownerFeedbackDispositionMatch[1]), 'Task ID');
+      const actor = reviewerIdentity(body.actor);
+      const action = String(body.action ?? '').trim();
+      const reason = String(body.reason ?? '').trim();
+      const blocker = String(body.blocker ?? '').trim();
+      const ownerStatus = String(body.ownerStatus ?? '').trim();
+      if (!['resume', 'blocked', 'return-to-owner'].includes(action) || !reason || reason.length > 8_000
+        || (action === 'blocked' && (!blocker || blocker.length > 4_000))
+        || (action === 'return-to-owner' && !['Awaiting Owner', 'Awaiting Owner Gate'].includes(ownerStatus))) {
+        sendJson(response, 400, { error: 'action must be resume, blocked or return-to-owner with a concrete reason; blocked requires blocker and return-to-owner requires ownerStatus.' });
+        return;
+      }
+      const result = await withTrackerLock(async () => {
+        const { header, records, trackerRevision } = await readTracker();
+        requireRevision(body, trackerRevision);
+        const record = records.find(({ TaskID }) => TaskID === taskId);
+        if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
+        assertExecutableTask(record, 'receive an owner-feedback disposition');
+        if (record.Status !== 'Awaiting Agent Evaluation' || !requiresIndependentReviewer(record) || record.ReviewClaim) {
+          const error = new Error(`Only an unclaimed IndependentReviewerAgent task awaiting Agent action can receive this disposition. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
+        }
+        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        if (activeRun) {
+          const error = new Error(`Task '${taskId}' has active Run '${activeRun.runId}' and cannot receive an owner-feedback disposition.`); error.statusCode = 409; throw error;
+        }
+        const timestamp = new Date().toISOString();
+        if (action === 'resume') {
+          const unfinished = taskDependencies(record).filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
+          if (unfinished.length) {
+            const error = new Error(`Cannot resume ${taskId}; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error;
+          }
+          assertSerialLaneAvailable(records, taskId);
+          // The prior Run was closed before owner feedback. Its Implementer is
+          // historical attribution, not a claim on the new implementation pass.
+          record.Status = 'Ready'; record.Blocker = ''; record.Implementer = '';
+        } else if (action === 'blocked') {
+          record.Status = 'Blocked'; record.Blocker = blocker;
+        } else {
+          record.Status = ownerStatus;
+          record.Blocker = 'Further owner action is required before this task can continue.';
+        }
+        record.Updated = timestamp;
+        appendEvidence(record, `OWNER FEEDBACK DISPOSITION ${action}: ${actor} ${timestamp}; ${reason}`);
         await replaceTracker(header, records);
         const after = await readTracker();
         return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
