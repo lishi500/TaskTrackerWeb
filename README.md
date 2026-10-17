@@ -69,7 +69,7 @@ tt review T-001 approve "核对了验收条件"            # 独立评审人；�
 | `event ID [RUN] TYPE RESULT "说明"` · `art ID [RUN] NAME FILE\|-` | 事件与文本证据（≤ 128 KB，同名不同内容会自动改名） |
 | `done ID ["摘要"] [--evidence FILE]… [--no-evidence] [--outcome verified\|blocked\|incomplete\|awaiting-human] [--blocker …] [--owner-status …]` | 先存证据再关闭 Run；`reports/last-check.md` 比 Run 开始时间新时自动附加；`DecisionOwner` 任务默认 `awaiting-human` |
 | `review ID approve\|reject\|block "说明" [--as NAME]` | claim + decision 一步完成；评审名默认 `reviewer-xxxx`（或 `TT_REVIEWER`），与实现者重名（忽略大小写/空格）会被本地和服务器同时拒绝 |
-| `eval ID approve|resume|block|defer|return "说明"` | 处理 Owner 反馈（任务处于 `Awaiting Agent Evaluation`）：`DecisionOwner` 任务走 owner-evaluation，评审权属任务走 owner-feedback-disposition（只能 `resume`/`block`/`return`，不能凭反馈直接通过） |
+| `eval ID approve\|resume\|block\|defer\|return "说明"` | 处理 Owner 反馈（任务处于 `Awaiting Agent Evaluation`）：`DecisionOwner` 任务走 owner-evaluation，评审权属任务走 owner-feedback-disposition（只能 `resume`/`block`/`return`，不能凭反馈直接通过） |
 | `issue ID "摘要" --key K --toolchain T --op O` | 工具链故障上报（稳定 key，如 `godot.headless.import-timeout`） |
 
 环境变量：`TT_AGENT`（实现者名，默认 `claude`）、`TT_REVIEWER`、`TT_URL`、`TT_DIR`。文本参数写成 `"@文件.md"` 时从文件读取。PowerShell 5.1 若把中文输出显示成 `?`，先执行 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`；Git Bash 无此问题。
