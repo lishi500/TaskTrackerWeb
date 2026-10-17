@@ -574,11 +574,17 @@ function lockHolderText(inspected) {
 async function acquireLock(lockPath, busyMessage) {
   const token = randomUUID();
   const payload = JSON.stringify({ pid: process.pid, host: lockHostName, createdAt: new Date().toISOString(), token });
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
       await writeFile(lockPath, payload, { flag: 'wx' });
       return token;
     } catch (error) {
+      if (transientFileCodes.has(error?.code)) {
+        // Windows: a lock that was just deleted stays "delete pending" (EPERM/EACCES) until a
+        // concurrent reader closes it, which takes milliseconds.
+        await sleep(10 + attempt * 10);
+        continue;
+      }
       if (error?.code !== 'EEXIST') throw error;
     }
     const inspected = await inspectLock(lockPath);
