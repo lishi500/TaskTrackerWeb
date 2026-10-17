@@ -5,7 +5,7 @@ description: "Track and deliver slice-level game work in the local Task Hub with
 
 # Game Task Hub (`tt`)
 
-The Hub owns task state; never edit `tracker/task_tracker.csv`, Run files or events by hand. Use only `tt` (game root: `tools\tt`, i.e. `node .claude/skills/game-task-hub/scripts/tt.mjs`). It starts the server, finds the URL, sends headers and the global revision, retries, keeps UTF-8 intact. Errors read `tt: what - why - try: command`.
+The Hub owns task state; never edit `tracker/task_tracker.csv`, Run files or events by hand. Use only `tt` (game root: `tools/tt`, i.e. `node .claude/skills/game-task-hub/scripts/tt.mjs`; the forward slash works in PowerShell and Git Bash). It starts the server, finds the URL, sends headers and the global revision, retries, keeps UTF-8 intact. Errors read `tt: what - why - try: command`.
 
 ## Standard flow (one task)
 ```text
