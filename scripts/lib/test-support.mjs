@@ -120,9 +120,11 @@ export async function waitFor(check, { timeoutMs = 10_000, intervalMs = 50, mess
 // scripts, templates, the skill) copied from this repository and initialized
 // with init-instance.mjs, exactly as a game would get it. `parent` lets a test
 // place it under a path with spaces and non-ASCII characters.
-export async function createInstance({ parent = tmpdir(), name = 'task-tracker-instance-', projectId = 'test-game', projectName = 'Test Game', port, empty = true } = {}) {
+export async function createInstance({ parent = tmpdir(), name = 'task-tracker-instance-', exactName = false, projectId = 'test-game', projectName = 'Test Game', port, empty = true } = {}) {
   await mkdir(parent, { recursive: true });
-  const root = await mkdtemp(join(parent, name));
+  // exactName: the folder is called exactly `name` (for the "<game>-Tracker" sibling convention) instead of name + random suffix.
+  const root = exactName ? join(parent, name) : await mkdtemp(join(parent, name));
+  if (exactName) await mkdir(root);
   const skip = (source) => !/[\\/]scripts[\\/]test-[^\\/]*\.mjs$/.test(source);
   for (const entry of ['server.mjs', 'public', 'scripts', 'templates', '.agents']) await cp(join(repoRoot, entry), join(root, entry), { recursive: true, filter: skip });
   const listenPort = port ?? await getFreePort();

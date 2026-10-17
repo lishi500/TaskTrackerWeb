@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // tt - command-line client for the Game Task Hub (TaskTrackerWeb).
-// Zero dependencies, Node >= 22. Lives inside the skill so the skill is self-contained
-// and works through a directory junction: the tracker instance is found from this
-// file's real path (<instance>/.agents/skills/game-task-hub/scripts/tt.mjs).
+// Zero dependencies, Node >= 22. Lives inside the skill so the skill is self-contained: the skill
+// may be a plain copy inside a game, and the tracker instance is found without any link (see
+// "Where is the tracker instance?" below; `tt doctor` prints which place won).
 //
 // What it hides from the agent: server URL discovery and start-up, the Origin and
 // Content-Type headers, the global trackerRevision (re-read before every write, retried
@@ -15,7 +15,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseTaskSet, planImport } from './taskset.mjs';
 
@@ -53,18 +53,104 @@ function derivePort(projectId) { // identical to scripts/lib/hub-port.mjs (test-
   return 4300 + (digest.readUInt32BE(0) % 700);
 }
 
+// Where is the tracker instance? The skill may be a COPY inside a game (no link anywhere), so tt tries,
+// in this order, and the first place that names a valid instance (server.mjs + task-hub.config.json) wins:
+//   1. env TT_DIR                      (an explicit value that is wrong is an error, not a hint)
+//   2. tracker.json                    beside the skill's scripts/ folder: {"dir": "<absolute path>"}
+//   3. .tt-dir                         one line, an absolute path, in the nearest folder above the current
+//                                      directory that has AGENTS.md or .git (then in the outer ones)
+//   4. sibling <folder name>-Tracker   next to that same folder
+//   5. the real path of this file      is inside an instance (<instance>/.agents/skills/game-task-hub/scripts)
+// `tt doctor` prints which step won and why the earlier ones did not. Pointer files must hold ABSOLUTE
+// paths: a relative one would let a cloned repository steer tt at scripts it ships itself.
+const DISCOVERY_STEPS = ['TT_DIR', 'tracker.json', '.tt-dir', 'sibling -Tracker folder', 'location of tt.mjs'];
+const isInstanceDir = (dir) => existsSync(join(dir, 'server.mjs')) && existsSync(join(dir, 'task-hub.config.json'));
+const NOT_AN_INSTANCE = 'which has no server.mjs and task-hub.config.json';
+
+function pointerTarget(value, source) {
+  const text = String(value ?? '').trim();
+  if (!text) return { reason: `${source} is empty` };
+  if (!isAbsolute(text)) return { reason: `${source} holds the relative path '${clip(text, 80)}'; write the absolute path of the tracker folder` };
+  const dir = resolve(text);
+  return isInstanceDir(dir) ? { dir } : { reason: `${source} points to ${dir}, ${NOT_AN_INSTANCE}` };
+}
+
+// Folders above (and including) `start` that have AGENTS.md or .git, nearest first.
+function projectRootsFrom(start) {
+  const roots = [];
+  for (let dir = resolve(start); ; dir = dirname(dir)) {
+    if (existsSync(join(dir, 'AGENTS.md')) || existsSync(join(dir, '.git'))) roots.push(dir);
+    if (dirname(dir) === dir) return roots;
+  }
+}
+
+function discover() {
+  const trail = [];
+  const note = (step, status, detail, root) => { trail.push({ step, name: DISCOVERY_STEPS[step - 1], status, detail, ...(root ? { root } : {}) }); return root ? { root, trail } : undefined; };
+  const stripBom = (text) => text.replace(/^﻿/, '');
+  const scriptPath = fileURLToPath(import.meta.url);
+
+  if (process.env.TT_DIR) {
+    const dir = resolve(process.env.TT_DIR);
+    if (isInstanceDir(dir)) return note(1, 'won', `TT_DIR=${dir}`, dir);
+    note(1, 'failed', `TT_DIR=${dir} ${NOT_AN_INSTANCE}`);
+    return { trail, fatal: true };
+  }
+  note(1, 'skipped', 'TT_DIR is not set');
+
+  const pointerFile = join(dirname(dirname(scriptPath)), 'tracker.json');
+  if (existsSync(pointerFile)) {
+    let target;
+    try { target = pointerTarget(JSON.parse(stripBom(readFileSync(pointerFile, 'utf8'))).dir, pointerFile); } catch (error) { target = { reason: `${pointerFile} is not valid JSON (${error.message})` }; }
+    if (target.dir) return note(2, 'won', pointerFile, target.dir);
+    note(2, 'failed', target.reason);
+  } else {
+    note(2, 'skipped', `no tracker.json beside ${join(dirname(dirname(scriptPath)), 'scripts')}`);
+  }
+
+  const roots = projectRootsFrom(process.cwd());
+  if (!roots.length) {
+    note(3, 'skipped', `no folder with AGENTS.md or .git at or above ${process.cwd()}`);
+    note(4, 'skipped', 'no project folder to look next to');
+  } else {
+    const problems = [];
+    for (const root of roots) {
+      const file = join(root, '.tt-dir');
+      if (!existsSync(file)) continue;
+      const firstLine = stripBom(readText(file)).split(/\r?\n/).find((line) => line.trim()) ?? '';
+      const target = pointerTarget(firstLine, file);
+      if (target.dir) return note(3, 'won', file, target.dir);
+      problems.push(target.reason);
+    }
+    note(3, problems.length ? 'failed' : 'skipped', problems.join('; ') || `no .tt-dir in ${roots.join(', ')}`);
+    for (const root of roots) {
+      if (!basename(root)) continue;
+      const sibling = join(dirname(root), `${basename(root)}-Tracker`);
+      if (isInstanceDir(sibling)) return note(4, 'won', `${sibling} next to ${root}`, sibling);
+    }
+    note(4, 'skipped', `no ${roots.map((root) => `${basename(root)}-Tracker`).join(' / ')} next to ${roots.length > 1 ? 'those folders' : roots[0]}`);
+  }
+
+  const here = realpathSync(scriptPath); // follows a junction or symlink to the instance's skill
+  const inside = resolve(dirname(here), '..', '..', '..', '..');
+  if (isInstanceDir(inside)) return note(5, 'won', `${here} is inside it`, inside);
+  note(5, 'skipped', `${here} is not inside a tracker instance`);
+  return { trail };
+}
+
 let located;
 function instance() {
   if (located) return located;
-  const here = realpathSync(fileURLToPath(import.meta.url)); // follows junctions
-  const root = process.env.TT_DIR ? resolve(process.env.TT_DIR) : resolve(dirname(here), '..', '..', '..', '..');
-  if (!existsSync(join(root, 'server.mjs')) || !existsSync(join(root, 'task-hub.config.json'))) {
-    fail('cannot find the tracker instance', `${root} has no server.mjs and task-hub.config.json (tt.mjs resolved to ${here})`, 'set TT_DIR to the <Game>-Tracker folder');
+  const found = discover();
+  if (!found.root) {
+    const detail = found.trail.map(({ step, name, detail: text }) => `${step}. ${name}: ${text}`);
+    fail('cannot find the tracker instance', found.fatal ? found.trail[0].detail : 'none of the 5 places names one', found.fatal ? 'fix or unset TT_DIR' : 'write the absolute path of the <Game>-Tracker folder into <game>/.tt-dir (gd-skill activate --tracker DIR does), or set TT_DIR', detail);
   }
-  const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^\uFEFF/, ''));
+  const root = found.root;
+  const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^﻿/, ''));
   const trackerDir = dirname(resolve(root, config.instance?.tracker ?? 'tracker/task_tracker.csv'));
   const port = config.instance?.port ?? derivePort(config.instance?.projectId || 'uninitialized');
-  located = { root, config, trackerDir, projectId: config.instance?.projectId ?? '', port, urlFile: join(trackerDir, '.tracker-url'), pidFile: join(trackerDir, '.tracker-pid') };
+  located = { root, config, trackerDir, projectId: config.instance?.projectId ?? '', port, urlFile: join(trackerDir, '.tracker-url'), pidFile: join(trackerDir, '.tracker-pid'), discovery: found.trail };
   return located;
 }
 
@@ -864,11 +950,23 @@ commands.import = async ({ positional, flags }) => {
 };
 
 commands.doctor = async () => {
-  const where = instance();
   const lines = [];
   const note = (level, text) => lines.push(`${level.padEnd(4)} ${text}`);
   note(Number(process.versions.node.split('.')[0]) >= 22 ? 'ok' : 'FAIL', `node ${process.versions.node} (needs >= 22)`);
+  // Which of the five places named the instance, and why the earlier ones did not.
+  const found = discover();
+  const earlier = found.root ? found.trail.slice(0, -1) : found.trail;
+  if (!found.root) {
+    for (const { step, name, status, detail } of earlier) note(status === 'failed' ? 'FAIL' : 'info', `step ${step} ${name}: ${detail}`);
+    note('FAIL', 'no tracker instance found - write the absolute path of the <Game>-Tracker folder into <game>/.tt-dir (gd-skill activate --tracker DIR does), or set TT_DIR');
+    emit(lines, { lines });
+    throw new Exit(1);
+  }
+  const where = instance();
+  const winner = found.trail.at(-1);
   note('ok', `instance ${where.root} (project ${where.projectId || '?'}, port ${where.port})`);
+  note('ok', `found by step ${winner.step} ${winner.name}: ${winner.detail}`);
+  for (const { step, name, status, detail } of earlier) note(status === 'failed' ? 'warn' : 'info', `step ${step} ${name}: ${detail}`);
   const wasUp = Boolean(await findServer());
   const { url, health } = await ensureUp();
   note('ok', `server ${url} v${health.toolVersion} pid ${health.pid}${wasUp ? '' : ' (was down, started now)'}`);
