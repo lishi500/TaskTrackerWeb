@@ -910,18 +910,44 @@ function publicInstanceMetadata() {
   };
 }
 
+// ---- Local-only request guards ----------------------------------------------
+const loopbackNames = new Set(['127.0.0.1', 'localhost', '[::1]']);
+const bindIsLoopback = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host) || /^127\./.test(host);
+
+// The page may be opened as 127.0.0.1, localhost or [::1]; browsers send the
+// exact spelling as Origin, so every loopback alias of this port is the same
+// origin for our purposes.
+function allowedOrigins() {
+  const origins = [`http://127.0.0.1:${activePort}`, `http://localhost:${activePort}`, `http://[::1]:${activePort}`];
+  const configured = `http://${host}:${activePort}`;
+  if (!origins.includes(configured)) origins.push(configured);
+  return origins;
+}
+
+// DNS-rebinding guard: while bound to loopback, only loopback names may be
+// used to address the tracker. A rebound hostname (evil.example -> 127.0.0.1)
+// would otherwise be same-origin for the attacker's page and for our Origin check.
+function assertAllowedHost(request) {
+  if (!bindIsLoopback) return;
+  const raw = String(request.headers.host ?? '');
+  let name = '';
+  try { name = new URL(`http://${raw}`).hostname; } catch { /* rejected below */ }
+  if (loopbackNames.has(name) || name === host) return;
+  throw httpError(403, `Host '${raw.slice(0, 80)}' is not allowed: this tracker only answers requests addressed to 127.0.0.1, localhost or [::1].`, 'host');
+}
+
 function verifyMutationRequest(request) {
   const contentType = request.headers['content-type'] ?? '';
   if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
-    const error = new Error('Mutation requests must use Content-Type: application/json.');
-    error.statusCode = 415;
-    throw error;
+    throw httpError(415, 'Mutation requests must use Content-Type: application/json.', 'content-type');
   }
-  const expectedOrigin = `http://${host}:${activePort}`;
-  if (request.headers.origin !== expectedOrigin) {
-    const error = new Error('Mutation requests must come from this local tracker page.');
-    error.statusCode = 403;
-    throw error;
+  const origins = allowedOrigins();
+  const origin = request.headers.origin;
+  if (!origin) {
+    throw httpError(403, `Origin header is missing: send "Origin: ${origins[0]}" with every POST (tt and the dashboard do this automatically).`, 'origin');
+  }
+  if (!origins.includes(origin)) {
+    throw httpError(403, `Origin '${String(origin).slice(0, 100)}' is not allowed; mutation requests must come from this tracker: ${origins.join(', ')}.`, 'origin');
   }
 }
 
@@ -930,19 +956,34 @@ async function readJson(request) {
   let bytes = 0;
   for await (const chunk of request) {
     bytes += chunk.length;
-    if (bytes > 196_608) {
-      const error = new Error('Request body is limited to 192 KB.');
-      error.statusCode = 413;
-      throw error;
-    }
+    if (bytes > 196_608) throw httpError(413, 'Request body is limited to 192 KB.', 'body-too-large');
     chunks.push(chunk);
   }
+  const buffer = Buffer.concat(chunks);
+  if (!buffer.length) throw httpError(400, 'Request body is empty: send a JSON object.', 'bad-body');
+  let text;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    text = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
   } catch {
-    const error = new Error('Request body must be valid JSON.');
-    error.statusCode = 400;
-    throw error;
+    throw httpError(400, 'Request body is not valid UTF-8 (a console code page probably re-encoded it, e.g. curl.exe -d or Invoke-RestMethod in PowerShell 5.1). Send the JSON from a UTF-8 file or from Node fetch.', 'bad-encoding');
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw httpError(400, `Request body must be valid JSON (${String(error.message).slice(0, 100)}).`, 'bad-json');
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw httpError(400, 'Request body must be a JSON object, for example {"trackerRevision":"...","agent":"claude"}.', 'bad-body');
+  }
+  return value;
+}
+
+function decodeSegment(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw httpError(400, 'Malformed %-encoding in the URL path.', 'bad-url');
   }
 }
 
@@ -993,8 +1034,29 @@ function requestedCompletionAuthority(value) {
   return selected;
 }
 
-function assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, completionAuthority: selectedAuthority }) {
-  const dependencies = dependsOn.split(';').map((value) => value.trim()).filter(Boolean);
+// DependsOn is one string of TaskIDs separated by ';'. Agents often send
+// "A,B" or "A B"; say so instead of a generic id-character error.
+function parseDependsOn(value) {
+  return String(value ?? '').split(';').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+    if (/[,\s]/.test(entry)) {
+      throw httpError(400, `dependsOn entry '${entry.slice(0, 60)}' is not a TaskID. Separate multiple dependencies with ';' (for example "T-001;T-002"), not with commas or spaces.`, 'invalid-dependency');
+    }
+    return safePathSegment(entry, 'Dependency Task ID');
+  });
+}
+
+function assertKnownDependencies(records, dependencyIds, ownTaskId) {
+  if (dependencyIds.includes(ownTaskId)) {
+    throw httpError(422, `Task '${ownTaskId}' cannot depend on itself (self dependency).`, 'invalid-dependency');
+  }
+  const unknown = dependencyIds.filter((dependencyId) => !records.some(({ TaskID }) => TaskID === dependencyId));
+  if (unknown.length) {
+    throw httpError(422, `Unknown dependency TaskID(s): ${unknown.join(', ')}. dependsOn is a ';'-separated list of existing TaskIDs (list them with GET /api/tasks).`, 'unknown-dependency');
+  }
+}
+
+function assertPlannedTaskRelationships(records, { taskId, taskType: selectedType, parentId, dependsOn, completionAuthority: selectedAuthority }) {
+  const dependencies = parseDependsOn(dependsOn);
   if (selectedType === 'Story') {
     if (parentId || dependencies.length || selectedAuthority !== 'NotApplicable') {
       const error = new Error('Story is a non-executable scope container: it cannot have ParentID or DependsOn and must use completionAuthority=NotApplicable.');
@@ -1021,6 +1083,7 @@ function assertPlannedTaskRelationships(records, { taskType: selectedType, paren
       throw error;
     }
   }
+  assertKnownDependencies(records, dependencies, taskId);
   const storyDependencies = dependencies.filter((dependencyId) => {
     const dependency = records.find(({ TaskID }) => TaskID === dependencyId);
     return dependency && isStory(dependency);
@@ -1033,7 +1096,7 @@ function assertPlannedTaskRelationships(records, { taskType: selectedType, paren
 }
 
 function newTaskRecord(header, body, timestamp, records) {
-  const agent = reviewerIdentity(body.agent);
+  const agent = identityField(body.agent, 'agent');
   const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
   const candidate = body.newTask;
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
@@ -1046,9 +1109,8 @@ function newTaskRecord(header, body, timestamp, records) {
   const parentId = creationText(candidate.parentId, 'parentId', { maxLength: 128 });
   if (parentId) safePathSegment(parentId, 'Parent ID');
   const dependsOn = creationText(candidate.dependsOn, 'dependsOn', { maxLength: 4_000 });
-  for (const dependencyId of dependsOn.split(';').map((value) => value.trim()).filter(Boolean)) safePathSegment(dependencyId, 'Dependency Task ID');
   const selectedAuthority = requestedCompletionAuthority(candidate.completionAuthority);
-  assertPlannedTaskRelationships(records, { taskType: selectedType, parentId, dependsOn, completionAuthority: selectedAuthority });
+  assertPlannedTaskRelationships(records, { taskId, taskType: selectedType, parentId, dependsOn, completionAuthority: selectedAuthority });
   const values = {
     TaskID: taskId,
     TaskType: selectedType,
@@ -1203,6 +1265,34 @@ async function writeRun(run) {
   } finally {
     await unlink(temporaryPath).catch(() => {});
   }
+}
+
+// readRun() surfaces ENOENT unchanged (claim recovery relies on that); API
+// handlers use these two wrappers to answer 404 instead of a raw filesystem error.
+async function readRunOrNotFound(taskId, runId) {
+  try {
+    return await readRun(taskId, runId);
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw httpError(404, `Run '${runId}' was not found for task '${taskId}'.`, 'run-not-found');
+    throw error;
+  }
+}
+
+async function assertRunExists(taskId, runId) {
+  try {
+    await stat(join(recordDirectory(taskId, runId), 'run.json'));
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') throw httpError(404, `Run '${runId}' was not found for task '${taskId}'.`, 'run-not-found');
+    throw error;
+  }
+}
+
+// Artifacts are agent-authored: HTML, SVG and XML are served as plain text so a
+// stored file can never execute with the dashboard's origin.
+function artifactContentType(path) {
+  const extension = extname(path).toLowerCase();
+  if (['.html', '.htm', '.xhtml', '.svg', '.xml'].includes(extension)) return 'text/plain; charset=utf-8';
+  return mimeTypes[extension] ?? 'text/plain; charset=utf-8';
 }
 
 async function readRun(taskId, runId) {
@@ -1433,10 +1523,11 @@ async function artifactUsage(taskId, runId) {
 
 function requireRevision(body, trackerRevision) {
   const requested = String(body?.trackerRevision ?? '').trim();
-  if (!requested || requested !== trackerRevision) {
-    const error = new Error('Tracker revision is stale. Reload the task packet and try again.');
-    error.statusCode = 409;
-    throw error;
+  if (!requested) {
+    throw httpError(400, 'trackerRevision is required: read the current value from GET /api/health (or any packet or list response) and send it in the JSON body.', 'revision-required');
+  }
+  if (requested !== trackerRevision) {
+    throw httpError(409, `trackerRevision is stale (current: ${trackerRevision}). Re-read it from GET /api/health and retry.`, 'revision-stale');
   }
 }
 
@@ -1486,8 +1577,8 @@ function packetFor(record, records, runs, trackerRevision) {
 function parseRunPath(requestPath) {
   const match = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/(events|artifacts|close)$/.exec(requestPath);
   return match ? {
-    taskId: decodeURIComponent(match[1]),
-    runId: decodeURIComponent(match[2]),
+    taskId: decodeSegment(match[1]),
+    runId: decodeSegment(match[2]),
     operation: match[3],
   } : undefined;
 }
@@ -1503,14 +1594,17 @@ function reviewClaimant(claim) {
   return /^REVIEW-CLAIM: (.+) \d{4}-\d{2}-\d{2}T\S+$/.exec(String(claim ?? ''))?.[1] ?? '';
 }
 
-function reviewerIdentity(value) {
-  const reviewer = String(value ?? '').trim();
-  if (!reviewer || reviewer.length > 256 || /[\r\n]/.test(reviewer)) {
-    const error = new Error('reviewer is required, must be at most 256 characters and cannot contain a line break.');
-    error.statusCode = 400;
-    throw error;
+// Acting identity (agent / reviewer / actor / reporter / acknowledger). The
+// error names the field that was actually missing.
+function identityField(value, name) {
+  const text = String(value ?? '').trim();
+  if (!text) {
+    throw httpError(400, `${name} is required: send the acting agent's name (for example "claude") in the JSON body.`, 'identity-required');
   }
-  return reviewer;
+  if (text.length > 256 || /[\r\n]/.test(text)) {
+    throw httpError(400, `${name} must be at most 256 characters and cannot contain a line break.`, 'identity-invalid');
+  }
+  return text;
 }
 
 // True when `candidate` is strictly inside `directory`. Separator- and
@@ -1530,7 +1624,13 @@ async function serveStatic(requestPath, response) {
   }
   try {
     if (!(await stat(filePath)).isFile()) throw Object.assign(new Error('Not a file'), { code: 'ENOENT' });
-    response.writeHead(200, { 'Content-Type': mimeTypes[extname(filePath).toLowerCase()] ?? 'application/octet-stream', 'Cache-Control': 'no-store' });
+    response.writeHead(200, {
+      'Content-Type': mimeTypes[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      // The dashboard is one module script plus one stylesheet: nothing inline, nothing remote.
+      'Content-Security-Policy': "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    });
     createReadStream(filePath).on('error', () => response.destroy()).pipe(response);
   } catch {
     response.writeHead(404).end('Not found');
@@ -1541,6 +1641,7 @@ const server = createServer(async (request, response) => {
   try {
     const requestUrl = parseRequestUrl(request);
     const requestPath = requestUrl.pathname;
+    assertAllowedHost(request);
     if (request.method === 'GET' && requestPath === '/api/instance') {
       sendJson(response, 200, publicInstanceMetadata());
       return;
@@ -1582,7 +1683,7 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && requestPath === '/api/tracker/task-types/migrate') {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const actor = reviewerIdentity(body.actor);
+      const actor = identityField(body.actor, 'actor');
       const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
       const result = await withTrackerLock(async () => {
         const { header, records, trackerRevision } = await readTracker();
@@ -1621,7 +1722,7 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && requestPath === '/api/tracker/completion-authority/migrate') {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const actor = reviewerIdentity(body.actor);
+      const actor = identityField(body.actor, 'actor');
       const reason = creationText(body.reason, 'reason', { required: true, maxLength: 8_000 });
       const result = await withTrackerLock(async () => {
         const { header, records, trackerRevision } = await readTracker();
@@ -1663,7 +1764,7 @@ const server = createServer(async (request, response) => {
       const runId = String(body.runId ?? '').trim();
       if (runId) safePathSegment(runId, 'Run ID');
       const failureKey = issueFailureKey(body.failureKey);
-      const reporter = reviewerIdentity(body.reporter);
+      const reporter = identityField(body.reporter, 'reporter');
       const toolchain = issueText(body.toolchain, 'toolchain', { required: true, maxLength: 128 });
       const operation = issueText(body.operation, 'operation', { required: true, maxLength: 512 });
       const summary = issueText(body.summary, 'summary', { required: true, maxLength: 2_000 });
@@ -1706,8 +1807,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && issueAckMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const failureKey = issueFailureKey(decodeURIComponent(issueAckMatch[1]));
-      const acknowledger = reviewerIdentity(body.acknowledger);
+      const failureKey = issueFailureKey(decodeSegment(issueAckMatch[1]));
+      const acknowledger = identityField(body.acknowledger, 'acknowledger');
       const notes = issueText(body.notes, 'notes', { required: true, maxLength: 4_000, multiline: true });
       const expectedReportCount = body.expectedReportCount;
       if (!Number.isSafeInteger(expectedReportCount) || expectedReportCount < 1) {
@@ -1772,7 +1873,7 @@ const server = createServer(async (request, response) => {
     }
     const packetMatch = /^\/api\/tasks\/([^/]+)\/packet$/.exec(requestPath);
     if (request.method === 'GET' && packetMatch) {
-      const taskId = decodeURIComponent(packetMatch[1]);
+      const taskId = decodeSegment(packetMatch[1]);
       const { records, trackerRevision } = await readTracker();
       const record = records.find(({ TaskID }) => TaskID === taskId);
       if (!record) {
@@ -1784,7 +1885,7 @@ const server = createServer(async (request, response) => {
     }
     const runsMatch = /^\/api\/tasks\/([^/]+)\/runs$/.exec(requestPath);
     if (request.method === 'GET' && runsMatch) {
-      const taskId = safePathSegment(decodeURIComponent(runsMatch[1]), 'Task ID');
+      const taskId = safePathSegment(decodeSegment(runsMatch[1]), 'Task ID');
       const { records } = await readTracker();
       if (!records.some(({ TaskID }) => TaskID === taskId)) {
         sendJson(response, 404, { error: `Task '${taskId}' was not found.` });
@@ -1795,37 +1896,48 @@ const server = createServer(async (request, response) => {
     }
     const artifactReadMatch = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/artifacts\/(.+)$/.exec(requestPath);
     if (request.method === 'GET' && artifactReadMatch) {
-      const taskId = safePathSegment(decodeURIComponent(artifactReadMatch[1]), 'Task ID');
-      const runId = safePathSegment(decodeURIComponent(artifactReadMatch[2]), 'Run ID');
-      const artifact = artifactPath(taskId, runId, decodeURIComponent(artifactReadMatch[3]));
-      const artifactInfo = await stat(artifact.path);
-      if (!artifactInfo.isFile()) {
-        sendJson(response, 404, { error: `Artifact '${artifact.name}' was not found.` });
-        return;
+      const taskId = safePathSegment(decodeSegment(artifactReadMatch[1]), 'Task ID');
+      const runId = safePathSegment(decodeSegment(artifactReadMatch[2]), 'Run ID');
+      const artifact = artifactPath(taskId, runId, decodeSegment(artifactReadMatch[3]));
+      let artifactInfo;
+      try {
+        artifactInfo = await stat(artifact.path);
+      } catch (error) {
+        if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) throw error;
       }
-      response.writeHead(200, { 'Content-Type': mimeTypes[extname(artifact.path)] ?? 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
-      createReadStream(artifact.path).pipe(response);
+      if (!artifactInfo?.isFile()) {
+        throw httpError(404, `Artifact '${artifact.name}' was not found in Run '${runId}' (list artifacts with GET /api/tasks/${taskId}/runs/${runId}).`, 'artifact-not-found');
+      }
+      // Agent-written files are served from the dashboard's origin: never as
+      // active content (HTML/SVG/XML would run script with our Origin).
+      response.writeHead(200, {
+        'Content-Type': artifactContentType(artifact.path),
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "sandbox; default-src 'none'",
+      });
+      createReadStream(artifact.path).on('error', () => response.destroy()).pipe(response);
       return;
     }
     const runDetailMatch = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)$/.exec(requestPath);
     if (request.method === 'GET' && runDetailMatch) {
-      const taskId = safePathSegment(decodeURIComponent(runDetailMatch[1]), 'Task ID');
-      const runId = safePathSegment(decodeURIComponent(runDetailMatch[2]), 'Run ID');
-      const run = await readRun(taskId, runId);
+      const taskId = safePathSegment(decodeSegment(runDetailMatch[1]), 'Task ID');
+      const runId = safePathSegment(decodeSegment(runDetailMatch[2]), 'Run ID');
+      const run = await readRunOrNotFound(taskId, runId);
       sendJson(response, 200, { run: await runForDisplay(run), events: await readRunEvents(taskId, runId) });
       return;
     }
     if (request.method === 'POST' && requestPath === '/api/runs/start') {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(body.taskId, 'Task ID');
+      const taskId = safePathSegment(body.taskId, 'taskId');
       const agent = String(body.agent ?? '').trim();
       const verificationProfile = String(body.verificationProfile ?? '').trim();
       const scope = String(body.scope ?? '').trim();
       const expectedBehavior = String(body.expectedBehavior ?? '').trim();
-      if (!agent || !verificationProfile || !scope || !expectedBehavior) {
-        sendJson(response, 400, { error: 'agent, verificationProfile, scope and expectedBehavior are required.' });
-        return;
+      const missingRunFields = Object.entries({ agent, verificationProfile, scope, expectedBehavior }).filter(([, value]) => !value).map(([name]) => name);
+      if (missingRunFields.length) {
+        throw httpError(400, `Missing required field(s): ${missingRunFields.join(', ')}. POST /api/runs/start needs taskId, trackerRevision, agent, verificationProfile, scope and expectedBehavior as non-empty strings.`, 'missing-field');
       }
       if ([agent, verificationProfile, scope, expectedBehavior].some((value) => value.length > 4_000)) {
         sendJson(response, 400, { error: 'Run fields are limited to 4,000 characters.' });
@@ -1919,13 +2031,17 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const taskId = safePathSegment(runPath.taskId, 'Task ID');
       const runId = safePathSegment(runPath.runId, 'Run ID');
+      await assertRunExists(taskId, runId);
       if (runPath.operation === 'events') {
         const type = String(body.type ?? '').trim();
         const result = String(body.result ?? '').trim();
         const message = String(body.message ?? '').trim();
-        if (!type || !result || !message || [type, result, message].some((value) => value.length > 8_000)) {
-          sendJson(response, 400, { error: 'type, result and message are required and limited to 8,000 characters.' });
-          return;
+        const missingEventFields = Object.entries({ type, result, message }).filter(([, value]) => !value).map(([name]) => name);
+        if (missingEventFields.length) {
+          throw httpError(400, `Missing required field(s): ${missingEventFields.join(', ')}. An event needs trackerRevision, type, result and message (each at most 8,000 characters).`, 'missing-field');
+        }
+        if ([type, result, message].some((value) => value.length > 8_000)) {
+          throw httpError(400, 'type, result and message are limited to 8,000 characters each.', 'field-too-long');
         }
         const eventResult = await withRunLock(taskId, runId, async () => {
           await recoverPendingClose(taskId, runId);
@@ -1954,10 +2070,9 @@ const server = createServer(async (request, response) => {
         const requestedName = String(body.name ?? '').trim();
         const content = String(body.content ?? '');
         const byteLength = Buffer.byteLength(content, 'utf8');
-        if (!content || byteLength > maxArtifactBytes) {
-          sendJson(response, 400, { error: 'Artifact content is required and limited to 128 KB.' });
-          return;
-        }
+        if (!requestedName) throw httpError(400, 'Missing required field: name. An artifact needs trackerRevision, name (a safe relative path such as evidence.md or logs/editor.log) and content (text, at most 128 KB).', 'missing-field');
+        if (!content) throw httpError(400, 'Missing required field: content. Artifacts are text, at most 128 KB; reference large or binary evidence by repository path or HTTPS URL inside an evidence artifact.', 'missing-field');
+        if (byteLength > maxArtifactBytes) throw httpError(400, `Artifact content is ${byteLength} bytes; the limit is 128 KB (${maxArtifactBytes} bytes). Trim it or store the large file in the repository and reference its path.`, 'artifact-too-large');
         const artifactResult = await withRunLock(taskId, runId, async () => {
           await recoverPendingClose(taskId, runId);
           const { records, trackerRevision } = await readTracker();
@@ -2003,10 +2118,10 @@ const server = createServer(async (request, response) => {
       const summary = String(body.summary ?? '').trim();
       const blocker = String(body.blocker ?? '').trim();
       const ownerStatus = String(body.ownerStatus ?? '').trim();
-      if (!['verified', 'blocked', 'awaiting-human', 'incomplete'].includes(outcome) || !summary) {
-        sendJson(response, 400, { error: 'outcome must be verified, blocked, awaiting-human or incomplete; summary is required.' });
-        return;
+      if (!['verified', 'blocked', 'awaiting-human', 'incomplete'].includes(outcome)) {
+        throw httpError(400, `outcome must be verified, blocked, awaiting-human or incomplete${outcome ? ` (got '${outcome.slice(0, 40)}')` : ' (missing)'}.`, 'invalid-field');
       }
+      if (!summary) throw httpError(400, 'summary is required: one or two sentences saying what was done and verified.', 'missing-field');
       const closeResult = await withRunLock(taskId, runId, async () => {
         await recoverPendingClose(taskId, runId);
         return withTrackerLock(async () => {
@@ -2095,10 +2210,10 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && reviewMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(reviewMatch[1]), 'Task ID');
+      const taskId = safePathSegment(decodeSegment(reviewMatch[1]), 'Task ID');
       await recoverTaskPendingCloses(taskId);
       const action = String(body.action ?? '').trim();
-      const reviewer = reviewerIdentity(body.reviewer);
+      const reviewer = identityField(body.reviewer, 'reviewer');
       if (!['claim', 'decision'].includes(action)) {
         sendJson(response, 400, { error: 'action must be claim or decision.' });
         return;
@@ -2206,8 +2321,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && contractMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(contractMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(contractMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const reason = String(body.reason ?? '').trim();
       const requestedContract = {
         Task: String(body.task ?? '').trim(),
@@ -2254,15 +2369,13 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && dependenciesMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(dependenciesMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(dependenciesMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const reason = String(body.reason ?? '').trim();
       const dependsOn = creationText(body.dependsOn, 'dependsOn', { maxLength: 4_000 });
-      for (const dependencyId of dependsOn.split(';').map((value) => value.trim()).filter(Boolean)) {
-        safePathSegment(dependencyId, 'Dependency Task ID');
-      }
+      const requestedDependencies = parseDependsOn(dependsOn);
       if (!Object.hasOwn(body, 'dependsOn') || !reason || reason.length > 8_000) {
-        sendJson(response, 400, { error: 'agent, reason and a complete dependsOn field are required within their size limits.' });
+        sendJson(response, 400, { error: 'agent, reason and a complete dependsOn field are required within their size limits (dependsOn may be an empty string to clear all dependencies).' });
         return;
       }
       const result = await withTrackerLock(async () => {
@@ -2271,7 +2384,8 @@ const server = createServer(async (request, response) => {
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
         assertExecutableTask(record, 'receive a dependency revision');
-        const storyDependencies = taskDependencies({ DependsOn: dependsOn })
+        assertKnownDependencies(records, requestedDependencies, taskId);
+        const storyDependencies = requestedDependencies
           .filter((dependencyId) => isStory(records.find(({ TaskID }) => TaskID === dependencyId)));
         if (storyDependencies.length) {
           const error = new Error(`Story is organizational only and cannot be used as DependsOn: ${storyDependencies.join(', ')}.`); error.statusCode = 422; throw error;
@@ -2304,8 +2418,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && blockMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(blockMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(blockMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const blocker = String(body.blocker ?? '').trim();
       const evidence = String(body.evidence ?? '').trim();
       if (!blocker || blocker.length > 4_000 || !evidence || evidence.length > 8_000) {
@@ -2338,8 +2452,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && unblockMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(unblockMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(unblockMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const reason = String(body.reason ?? '').trim();
       if (!reason || reason.length > 8_000) {
         sendJson(response, 400, { error: 'A concrete dependency-unblock reason is required within 8,000 characters.' });
@@ -2381,8 +2495,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && parkMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(parkMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(parkMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const reason = String(body.reason ?? '').trim();
       if (!reason || reason.length > 8_000) {
         sendJson(response, 400, { error: 'A concrete parking reason is required within 8,000 characters.' });
@@ -2416,8 +2530,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && admitMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(admitMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(admitMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const targetStatus = String(body.targetStatus ?? '').trim();
       const reason = String(body.reason ?? '').trim();
       const blocker = String(body.blocker ?? '').trim();
@@ -2467,9 +2581,9 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && ownerWaitMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(ownerWaitMatch[1]), 'Task ID');
+      const taskId = safePathSegment(decodeSegment(ownerWaitMatch[1]), 'Task ID');
       const authorityTaskId = safePathSegment(body.authorityTaskId, 'Authority task ID');
-      const agent = reviewerIdentity(body.agent);
+      const agent = identityField(body.agent, 'agent');
       const ownerStatus = String(body.ownerStatus ?? '').trim();
       const reason = String(body.reason ?? '').trim();
       if (!['Awaiting Owner', 'Awaiting Owner Gate'].includes(ownerStatus) || !reason || reason.length > 8_000) {
@@ -2515,8 +2629,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && ownerEvaluationMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(ownerEvaluationMatch[1]), 'Task ID');
-      const agent = reviewerIdentity(body.agent);
+      const taskId = safePathSegment(decodeSegment(ownerEvaluationMatch[1]), 'Task ID');
+      const agent = identityField(body.agent, 'agent');
       const decision = String(body.decision ?? '').trim();
       const notes = String(body.notes ?? '').trim();
       const blocker = String(body.blocker ?? '').trim();
@@ -2561,8 +2675,8 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && ownerFeedbackDispositionMatch) {
       verifyMutationRequest(request);
       const body = await readJson(request);
-      const taskId = safePathSegment(decodeURIComponent(ownerFeedbackDispositionMatch[1]), 'Task ID');
-      const actor = reviewerIdentity(body.actor);
+      const taskId = safePathSegment(decodeSegment(ownerFeedbackDispositionMatch[1]), 'Task ID');
+      const actor = identityField(body.actor, 'actor');
       const action = String(body.action ?? '').trim();
       const reason = String(body.reason ?? '').trim();
       const blocker = String(body.blocker ?? '').trim();
@@ -2652,6 +2766,9 @@ const server = createServer(async (request, response) => {
       });
       sendJson(response, 200, result);
       return;
+    }
+    if (requestPath.startsWith('/api/') && ['GET', 'POST'].includes(request.method)) {
+      throw httpError(404, `Unknown endpoint, or wrong HTTP method: ${request.method} ${requestPath.slice(0, 120)}. The endpoint list is in references/api.md of the game-task-hub skill.`, 'unknown-endpoint');
     }
     if (request.method === 'GET') {
       await serveStatic(requestPath, response);
