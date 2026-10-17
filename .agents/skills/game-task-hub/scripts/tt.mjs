@@ -580,6 +580,34 @@ commands.review = async ({ positional, flags }) => {
   });
 };
 
+// Owner feedback arrived on a task (status "Awaiting Agent Evaluation"): record the agent's reading of it.
+// DecisionOwner work -> /owner-evaluation; reviewer-authority work -> /owner-feedback-disposition.
+commands.eval = async ({ positional, flags }) => {
+  needArgs('eval', positional, 3, 'ID approve|resume|block|defer|return "notes"');
+  const [id, verbArgument] = positional;
+  const verb = String(verbArgument).toLowerCase();
+  const notes = textArg(positional.slice(2).join(' '));
+  await guarded(`eval ${id}`, { id }, async () => {
+    const { task } = await packetOf(id);
+    if (task.Status !== 'Awaiting Agent Evaluation') {
+      fail(`${id} is ${task.Status}, not Awaiting Agent Evaluation`, 'there is no owner feedback waiting for an agent', String(task.Status).startsWith('Awaiting Owner') ? 'wait for the owner to answer in the dashboard' : `tt show ${id}`);
+    }
+    const ownerStatus = flags['owner-status'] ?? 'Awaiting Owner';
+    const blocker = flags.blocker ? textArg(flags.blocker) : clip(notes, 500);
+    let result;
+    if (task.CompletionAuthority === 'DecisionOwner') {
+      const decision = { approve: 'approved', block: 'blocked', defer: 'deferred', return: 'return-to-owner' }[verb];
+      if (!decision) fail(`'${verbArgument}' does not fit a DecisionOwner task`, 'use approve, block, defer or return', `tt eval ${id} approve "what the owner decided"`);
+      result = await write(`/api/tasks/${encodeURIComponent(id)}/owner-evaluation`, { agent: AGENT, decision, notes, ...(decision === 'blocked' ? { blocker } : {}) });
+    } else {
+      const action = { resume: 'resume', block: 'blocked', return: 'return-to-owner' }[verb];
+      if (!action) fail(`'${verbArgument}' does not fit ${task.CompletionAuthority} work`, 'feedback cannot approve it: resume (new Run + independent review), block or return', `tt eval ${id} resume "what changes"`);
+      result = await write(`/api/tasks/${encodeURIComponent(id)}/owner-feedback-disposition`, { actor: AGENT, action, reason: notes, ...(action === 'blocked' ? { blocker } : {}), ...(action === 'return-to-owner' ? { ownerStatus } : {}) });
+    }
+    emit(`${id} -> ${result.task.Status} (${verb})`, { taskId: id, status: result.task.Status, verb });
+  });
+};
+
 commands.issue = async ({ positional, flags }) => {
   needArgs('issue', positional, 2, 'ID "summary" --key K --toolchain T --op O');
   const [id] = positional;
@@ -697,6 +725,7 @@ const HELP = `tt ${TT_VERSION} - Game Task Hub CLI   (agent: ${AGENT}; --json pr
   import FILE [--dry-run] [--admit-first] [--milestone M]
   new ID "title" --accept "..." [--type Task|Bug|Story] [--parent S] [--deps "A;B"] [--spec PATH] [--auth reviewer|owner] [--prio P1] [--milestone M] [--stream X]
   admit ID | park ID | unblock ID | block ID "what blocks it" | issue ID "summary" --key K --toolchain T --op O [--detail "..."]
+  eval ID approve|resume|block|defer|return "notes"   record your reading of owner feedback (task is Awaiting Agent Evaluation)
   up | down | url | doctor                  "@file.md" as a text argument reads that file`;
 
 async function main() {

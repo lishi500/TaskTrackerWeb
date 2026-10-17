@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, rmdirSync, unlinkSync, utimesSync, writ
 import { readFile } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { call, createInstance, runSuite, sleep, waitFor } from './lib/test-support.mjs';
+import { call, createInstance, mutation, runSuite, sleep, waitFor } from './lib/test-support.mjs';
 
 const parent = join(tmpdir(), 'Hub 测试 空格');
 mkdirSync(parent, { recursive: true });
@@ -255,6 +255,33 @@ await runSuite('tt', async () => {
   result = ok(tt(['doctor']));
   assert.match(result.out, /^ok {3}server .* v\d+\.\d+\.\d+ pid \d+$/m);
   assert.match(result.out, /^ok {3}no problems found$/m);
+
+  // ---- owner feedback -> tt eval (the owner answers in the dashboard; here through the same endpoint) -------------
+  const ownerFeedback = async (taskId, text) => {
+    const revision = (await call(instance.url, '/api/health')).body.trackerRevision;
+    const answered = await call(instance.url, '/api/feedback', mutation(instance.url, { trackerRevision: revision, taskId, feedback: text }));
+    assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  };
+  assert.match(tt(['eval', 'D-001', 'approve', '还没有反馈']).err, /^tt: D-001 is Awaiting Owner, not Awaiting Agent Evaluation - there is no owner feedback waiting for an agent - try: wait for the owner to answer in the dashboard/);
+  await ownerFeedback('D-001', '手感可以，通过');
+  assert.match(ok(tt(['show', 'D-001'])).out, /\[OWNER FEEDBACK [^\]]+\] 手感可以，通过/, 'tt show surfaces the owner feedback');
+  assert.match(tt(['eval', 'D-001', 'resume', '继续']).err, /^tt: 'resume' does not fit a DecisionOwner task - use approve, block, defer or return/);
+  assert.match(tt(['eval', 'D-001', 'approve']).err, /^tt: eval needs ID approve\|resume\|block\|defer\|return "notes"/);
+  assert.equal(ok(tt(['eval', 'D-001', 'approve', '负责人试玩后确认手感通过'])).out.trim(), 'D-001 -> Done (approve)');
+  assert.match((await call(instance.url, '/api/tasks/D-001/packet')).body.task.Evidence, /OWNER EVALUATION approved: claude .*; 负责人试玩后确认手感通过/);
+
+  // reviewer-authority work cannot be approved by feedback; it resumes with a new Run and review
+  ok(tt(['new', 'E-001', '手感调参', '--accept', '参数在试玩中可接受']));
+  ok(tt(['start', 'E-001']));
+  ok(tt(['done', 'E-001', '需要负责人试玩确认参数', '--outcome', 'awaiting-human', '--owner-status', 'Awaiting Owner Gate']));
+  assert.match(ok(tt(['ls', '--status', 'Awaiting Owner Gate'])).out, /^E-001\tTask\tAwaiting Owner Gate/);
+  await ownerFeedback('E-001', '再快一点');
+  assert.match(tt(['eval', 'E-001', 'approve', 'x']).err, /does not fit IndependentReviewerAgent work - feedback cannot approve it: resume \(new Run \+ independent review\), block or return/);
+  assert.equal(ok(tt(['eval', 'E-001', 'resume', '把收线速度提高 20%'])).out.trim(), 'E-001 -> Ready (resume)');
+  ok(tt(['start', 'E-001']));
+  ok(tt(['done', 'E-001', '收线速度已提高 20% 并验证', '--no-evidence']));
+  ok(tt(['review', 'E-001', 'approve', '参数符合反馈', '--as', 'eval-reviewer']));
+  assert.match(ok(tt(['ls', '--status', 'Done'])).out, /E-001\tTask\tDone/);
 
   // ---- resilience: parallel writers all succeed (stale revision / lock retries) ---------------------------------
   ok(tt(['new', 'P-001', '并发写入', '--accept', '六个并发事件都被记录']));

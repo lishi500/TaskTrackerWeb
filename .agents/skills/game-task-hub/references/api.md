@@ -41,8 +41,8 @@ await fetch(`${base}/api/tasks/T-001/admit`, { method: 'POST', headers: { 'Conte
 | `/api/tasks/ID/contract` | `agent, reason, task, specRef, acceptance` | replace the contract trio of an unclaimed Backlog/Ready/Blocked task; history kept in Evidence |
 | `/api/tasks/ID/dependencies` | `agent, reason, dependsOn` | replace the full list of an unclaimed Backlog/Blocked task; graph validated atomically |
 | `/api/tasks/ID/owner-wait` | `agent, authorityTaskId, ownerStatus, reason` | the agent holding the active Run of a direct dependency exposes an unclaimed DecisionOwner Backlog task to the owner |
-| `/api/tasks/ID/owner-evaluation` | `agent, decision: approved\|blocked\|deferred\|return-to-owner, notes, blocker?` | DecisionOwner task in `Awaiting Agent Evaluation` only |
-| `/api/tasks/ID/owner-feedback-disposition` | `actor, action: resume\|blocked\|return-to-owner, reason, blocker?, ownerStatus?` | reviewer-authority task in `Awaiting Agent Evaluation`; `resume` needs dependencies Done and a free lane, then a new Run and review |
+| `/api/tasks/ID/owner-evaluation` | `agent, decision: approved\|blocked\|deferred\|return-to-owner, notes, blocker?` | DecisionOwner task in `Awaiting Agent Evaluation` only (`tt eval`) |
+| `/api/tasks/ID/owner-feedback-disposition` | `actor, action: resume\|blocked\|return-to-owner, reason, blocker?, ownerStatus?` | reviewer-authority task in `Awaiting Agent Evaluation`; `resume` needs dependencies Done and a free lane, then a new Run and review (`tt eval`) |
 | `/api/feedback` | `taskId, feedback` | the owner's dashboard form: Awaiting Owner* -> `Awaiting Agent Evaluation` |
 | `/api/toolchain-issues` | `taskId, runId?, failureKey, reporter, toolchain, operation, summary, detail?, evidenceRef?` | no revision; `failureKey` is a stable lowercase class such as `godot.headless.import-timeout` |
 | `/api/toolchain-issues/KEY/ack` | `acknowledger, notes, expectedReportCount` | owner acknowledgement; count must equal the inspected `totalReportCount` (409 if it changed) |
