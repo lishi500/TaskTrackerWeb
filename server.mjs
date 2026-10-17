@@ -3269,12 +3269,25 @@ server.on('listening', () => {
   console.log(`CSV source of truth: ${trackerPath}`);
 });
 
+// Windows reserves ranges of ports for Hyper-V, WSL2 and Docker ("excluded port ranges"); binding inside
+// one fails with EACCES, not EADDRINUSE. A derived port is only a preference, so it moves on like a busy one.
+function listenOn(candidate) {
+  // Test-only: pretend these ports are reserved so the fallback is exercised on every OS.
+  const reserved = process.env.NODE_ENV === 'test' ? String(process.env.TASK_HUB_TEST_LISTEN_EACCES ?? '').split(',') : [];
+  if (reserved.includes(String(candidate))) {
+    queueMicrotask(() => server.emit('error', Object.assign(new Error(`listen EACCES: permission denied ${host}:${candidate}`), { code: 'EACCES' })));
+    return;
+  }
+  server.listen(candidate, host);
+}
+
 server.on('error', async (error) => {
-  if (error?.code !== 'EADDRINUSE') {
+  if (error?.code !== 'EADDRINUSE' && error?.code !== 'EACCES') {
     console.error(`task-hub: cannot listen on ${host}:${candidatePort} (${error?.code ?? error?.message}).`);
     process.exit(1);
   }
-  const peer = await probeHub(`http://127.0.0.1:${candidatePort}`);
+  // Only a busy port can hold this very instance's own server.
+  const peer = error.code === 'EADDRINUSE' ? await probeHub(`http://127.0.0.1:${candidatePort}`) : undefined;
   if (peer?.instanceId === instanceId) {
     console.log(`Task tracker is already running at http://127.0.0.1:${candidatePort}`);
     process.exit(0);
@@ -3283,8 +3296,12 @@ server.on('error', async (error) => {
     // A derived port is a preference, not a promise: another project (or program) holds it.
     portAttempts += 1;
     candidatePort = nextPortInRange(candidatePort);
-    server.listen(candidatePort, host);
+    listenOn(candidatePort);
     return;
+  }
+  if (error.code === 'EACCES') {
+    console.error(`task-hub: port ${candidatePort} is not available to this user (EACCES). On Windows it is usually inside an excluded port range (see: netsh interface ipv4 show excludedportrange protocol=tcp). Choose another with "instance.port" in task-hub.config.json or the PORT environment variable.`);
+    process.exit(1);
   }
   const holder = peer ? `by the tracker for project '${peer.projectId}'` : 'by another program';
   console.error(`task-hub: port ${candidatePort} is already in use ${holder}. Choose a free port with "instance.port" in task-hub.config.json or the PORT environment variable.`);
@@ -3296,4 +3313,4 @@ if (peer) {
   console.log(`Task tracker is already running at ${peer.url}`);
   process.exit(0);
 }
-server.listen(candidatePort, host);
+listenOn(candidatePort);

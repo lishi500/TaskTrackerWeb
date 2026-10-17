@@ -219,6 +219,24 @@ await runSuite('start-init', async () => {
   assert.ok(actual >= 4300 && actual <= 4999);
   await run.exited;
 
+  // Windows reserves port ranges (Hyper-V, WSL2, Docker): binding inside one fails with EACCES, not EADDRINUSE.
+  // The hook makes the server see EACCES for chosen ports, so this runs the same on every OS.
+  const reservedInstance = await newInstance({ projectId: 'derived-reserved' });
+  const reservedConfigPath = join(reservedInstance.root, 'task-hub.config.json');
+  const reservedConfig = JSON.parse(readFileSync(reservedConfigPath, 'utf8'));
+  delete reservedConfig.instance.port;
+  await writeFile(reservedConfigPath, JSON.stringify(reservedConfig));
+  const reservedPreferred = derivePort('derived-reserved');
+  run = await launch(reservedInstance, { TASK_HUB_TEST_LISTEN_EACCES: String(reservedPreferred), TASK_HUB_TEST_EXIT_AFTER_MS: '1500' });
+  await waitFor(() => announced(run), { message: 'the banner after a reserved derived port' });
+  assert.notEqual(Number(new URL(announced(run)).port), reservedPreferred, 'a reserved derived port is skipped like a busy one');
+  await run.exited;
+  const reservedExplicit = await getFreePort();
+  const reservedRefused = await newInstance({ projectId: 'explicit-reserved', port: reservedExplicit });
+  run = await launch(reservedRefused, { TASK_HUB_TEST_LISTEN_EACCES: String(reservedExplicit) });
+  assert.equal(await run.exited, 1, 'an explicit port is never moved');
+  assert.match(run.stderr.join('\n'), new RegExp(`port ${reservedExplicit} is not available to this user \\(EACCES\\)\\. On Windows it is usually inside an excluded port range \\(see: netsh interface ipv4 show excludedportrange protocol=tcp\\)\\. Choose another with "instance\\.port"`));
+
   // ---- start.mjs ------------------------------------------------------------------------------------
   const started = await newInstance({ projectId: 'start-script' });
   let first = started.node('scripts/start.mjs', ['--detach']);
