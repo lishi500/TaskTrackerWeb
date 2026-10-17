@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { storyReviewErrors } from '../.agents/skills/game-task-hub/scripts/taskset.mjs';
-import { call, createInstance, createSandbox, runSuite, skipNote, startHub, taskRow } from './lib/test-support.mjs';
+import { call, createInstance, createSandbox, mutation, runSuite, skipNote, startHub, taskRow } from './lib/test-support.mjs';
 
 const parent = join(tmpdir(), 'Hub story 测试');
 mkdirSync(parent, { recursive: true });
@@ -363,6 +363,21 @@ await runSuite('tt-story', async () => {
   writeCheck('RESULT: PASS (standalone)\n');
   result = ok(ttChain(['done', '--next'], { cwd: gameDir }));
   assert.match(result.lines[1], /^next: nothing to start - All 4 executable task\(s\) are Done\.$/);
+
+  // owner feedback on a checks task: it can resume, and resuming leads back to a passing check (no review)
+  ok(ttOpen(['new', 'A-4', 'task A-4', '--accept', 'works', '--auth', 'checks'], { cwd: plainDir }));
+  ok(ttOpen(['start', 'A-4'], { cwd: plainDir }));
+  ok(ttOpen(['done', 'the owner should look at the feel', '--outcome', 'awaiting-human'], { cwd: plainDir }));
+  assert.equal((await call(open.url, '/api/tasks/A-4/packet')).body.task.Status, 'Awaiting Owner');
+  const feedbackRevision = (await call(open.url, '/api/health')).body.trackerRevision;
+  const answered = await call(open.url, '/api/feedback', mutation(open.url, { trackerRevision: feedbackRevision, taskId: 'A-4', feedback: 'a bit faster please' }));
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.match(ttOpen(['eval', 'A-4', 'approve', 'fine'], { cwd: plainDir }).err, /does not fit RunEvidence work - feedback cannot approve it: resume \(new Run \+ a passing check\), block or return/);
+  assert.equal(ok(ttOpen(['eval', 'A-4', 'resume', 'make it faster'], { cwd: plainDir })).out.trim(), 'A-4 -> Ready (resume)');
+  ok(ttOpen(['start', 'A-4'], { cwd: plainDir }));
+  writeFileSync(plainCheck, 'RESULT: PASS (a4)\n');
+  stamp(plainCheck);
+  assert.match(ok(ttOpen(['done', 'faster now'], { cwd: plainDir })).lines[0], /^A-4 -> Done \(run A-4-R0002, verified; evidence: last-check\.md; auto-accepted\)$/);
 
   console.log('tt-story test passed: import invariant, checks in two calls (one with --next), evidence pre-check, GITREV, story rollup, evidence, single review, warnings and doctor.');
 }, async () => {

@@ -889,7 +889,7 @@ commands.eval = async ({ positional, flags }) => {
       result = await write(`/api/tasks/${encodeURIComponent(id)}/owner-evaluation`, { agent: AGENT, decision, notes, ...(decision === 'blocked' ? { blocker } : {}) });
     } else {
       const action = { resume: 'resume', block: 'blocked', return: 'return-to-owner' }[verb];
-      if (!action) fail(`'${verbArgument}' does not fit ${task.CompletionAuthority} work`, 'feedback cannot approve it: resume (new Run + independent review), block or return', `tt eval ${id} resume "what changes"`);
+      if (!action) fail(`'${verbArgument}' does not fit ${task.CompletionAuthority} work`, `feedback cannot approve it: resume (new Run + ${task.CompletionAuthority === 'RunEvidence' ? 'a passing check' : 'independent review'}), block or return`, `tt eval ${id} resume "what changes"`);
       result = await write(`/api/tasks/${encodeURIComponent(id)}/owner-feedback-disposition`, { actor: AGENT, action, reason: notes, ...(action === 'blocked' ? { blocker } : {}), ...(action === 'return-to-owner' ? { ownerStatus } : {}) });
     }
     emit(`${id} -> ${result.task.Status} (${verb})`, { taskId: id, status: result.task.Status, verb });
