@@ -4,7 +4,7 @@
 // named "Hub discovery <two CJK characters> " (non-ASCII characters and spaces).
 //
 //   node scripts/ci-cpsync-repro.mjs              driver: runs every variant in its own process, prints one line each
-//   node scripts/ci-cpsync-repro.mjs cpSync       one variant: cpSync | cp | copyTree | rmSync
+//   node scripts/ci-cpsync-repro.mjs cpSync       one variant: cpSync | cpSyncAscii | cp | copyTree | rmSync
 //
 // One process per variant, so a native crash in one cannot hide the others. The progress markers are written with
 // writeSync, so they survive a crash. The driver also prints the Node version and, on Windows, the ANSI code page
@@ -18,7 +18,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { copyTree } from './lib/copy-tree.mjs';
 
-const variants = ['cpSync', 'cp', 'copyTree', 'rmSync'];
+// cpSyncAscii is the control: the same fs.cpSync into a folder with an ASCII name.
+const variants = ['cpSync', 'cpSyncAscii', 'cp', 'copyTree', 'rmSync'];
 const say = (text) => writeSync(1, `${text}\n`);
 
 function describeExit(result) {
@@ -46,14 +47,16 @@ if (!process.argv[2]) {
     console.error(`unknown variant '${variant}' (use ${variants.join(' | ')})`);
     process.exit(2);
   }
-  const base = mkdtempSync(join(tmpdir(), `Hub discovery ${String.fromCharCode(0x53D1, 0x73B0)} `));
+  say(`start ${variant}`);
+  const base = mkdtempSync(join(tmpdir(), variant === 'cpSyncAscii' ? 'Hub discovery ascii ' : `Hub discovery ${String.fromCharCode(0x53D1, 0x73B0)} `));
+  say('folder created');
   const source = join(base, 'source');
   mkdirSync(join(source, 'nested'), { recursive: true });
   writeFileSync(join(source, 'nested', 'file.txt'), 'hello');
   const target = join(base, 'Fish Game', '.claude', 'skills', 'game-task-hub');
   mkdirSync(dirname(target), { recursive: true });
   say(`before ${variant} in ${base}`);
-  if (variant === 'cpSync') cpSync(source, target, { recursive: true });
+  if (variant === 'cpSync' || variant === 'cpSyncAscii') cpSync(source, target, { recursive: true });
   else if (variant === 'cp') await cp(source, target, { recursive: true });
   else if (variant === 'copyTree') copyTree(source, target);
   else rmSync(source, { recursive: true, force: true });

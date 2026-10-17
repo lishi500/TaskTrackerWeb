@@ -118,7 +118,7 @@ await runSuite('ci-annotate', async () => {
   const repro = spawnSync(process.execPath, [join(here, 'ci-cpsync-repro.mjs')], { encoding: 'utf8', timeout: 120_000 });
   assert.equal(repro.status, 0, repro.stderr);
   assert.match(repro.stdout, /^node v\d+\.\d+\.\d+ \S+ \S+$/m);
-  for (const variant of ['cpSync', 'cp', 'copyTree', 'rmSync']) assert.match(repro.stdout, new RegExp(`^${variant}: (exit \\d+|signal \\w+|could not run)`, 'm'), `a result line for ${variant}`);
+  for (const variant of ['cpSync', 'cpSyncAscii', 'cp', 'copyTree', 'rmSync']) assert.match(repro.stdout, new RegExp(`^${variant}: (exit \\d+|signal \\w+|could not run)`, 'm'), `a result line for ${variant}`);
   assert.match(repro.stdout, /^copyTree: exit 0 /m, 'the replacement copy works on every machine');
 
   console.log('ci-annotate test passed: escaping, digest, one annotation per failing suite within the 10-per-step limit, no command injection from suite output, hung suites, crashed suites rerun with diagnostics, environment notice, cpSync diagnostic, workflow wiring.');
