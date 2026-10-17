@@ -125,7 +125,7 @@ await runSuite('start-init', async () => {
 
   // ---- the server publishes and withdraws .tracker-url / .tracker-pid ------------------
   const fixed = await newInstance({ projectId: 'fixed-port', empty: true });
-  let run = await launch(fixed, { TASK_HUB_TEST_EXIT_AFTER_MS: '1500' });
+  let run = await launch(fixed, { TASK_HUB_TEST_EXIT_AFTER_MS: '3000' });
   await waitFor(() => announced(run), { message: 'the server banner' });
   assert.equal(announced(run), fixed.url, 'instance.port is used when PORT is not set');
   assert.equal(await fixed.readTrackerFile('.tracker-url'), fixed.url);
@@ -138,7 +138,7 @@ await runSuite('start-init', async () => {
 
   // PORT env beats instance.port
   const envPort = await getFreePort();
-  run = await launch(fixed, { PORT: String(envPort), TASK_HUB_TEST_EXIT_AFTER_MS: '1200' });
+  run = await launch(fixed, { PORT: String(envPort), TASK_HUB_TEST_EXIT_AFTER_MS: '3000' });
   await waitFor(() => announced(run), { message: 'the server banner' });
   assert.equal(announced(run), `http://127.0.0.1:${envPort}`);
   assert.equal(await fixed.readTrackerFile('.tracker-url'), `http://127.0.0.1:${envPort}`);
@@ -162,7 +162,7 @@ await runSuite('start-init', async () => {
   run.child.kill('SIGKILL'); // SIGTERM is a clean exit on POSIX (it withdraws the endpoint files)
   await run.exited;
   assert.equal(await fixed.readTrackerFile('.tracker-pid'), String(crashedPid), 'a killed server leaves stale files');
-  run = await launch(fixed, { TASK_HUB_TEST_EXIT_AFTER_MS: '2500' });
+  run = await launch(fixed, { TASK_HUB_TEST_EXIT_AFTER_MS: '6000' });
   await waitFor(() => announced(run), { message: 'a restart after a hard kill' });
   assert.equal(announced(run), fixed.url);
   assert.equal(await fixed.readTrackerFile('.tracker-pid'), String(run.child.pid));
@@ -212,7 +212,7 @@ await runSuite('start-init', async () => {
   await writeFile(derivedConfigPath, JSON.stringify(derivedConfig));
   const preferred = derivePort('derived-fallback');
   await occupy(preferred).catch(() => { /* already busy on this machine: that is the scenario */ });
-  run = await launch(derivedInstance, { TASK_HUB_TEST_EXIT_AFTER_MS: '1500' });
+  run = await launch(derivedInstance, { TASK_HUB_TEST_EXIT_AFTER_MS: '3000' });
   await waitFor(() => announced(run), { message: 'the derived-port banner' });
   const actual = Number(new URL(announced(run)).port);
   assert.notEqual(actual, preferred, 'the busy preferred port is skipped');
@@ -227,7 +227,7 @@ await runSuite('start-init', async () => {
   delete reservedConfig.instance.port;
   await writeFile(reservedConfigPath, JSON.stringify(reservedConfig));
   const reservedPreferred = derivePort('derived-reserved');
-  run = await launch(reservedInstance, { TASK_HUB_TEST_LISTEN_EACCES: String(reservedPreferred), TASK_HUB_TEST_EXIT_AFTER_MS: '1500' });
+  run = await launch(reservedInstance, { TASK_HUB_TEST_LISTEN_EACCES: String(reservedPreferred), TASK_HUB_TEST_EXIT_AFTER_MS: '3000' });
   await waitFor(() => announced(run), { message: 'the banner after a reserved derived port' });
   assert.notEqual(Number(new URL(announced(run)).port), reservedPreferred, 'a reserved derived port is skipped like a busy one');
   await run.exited;

@@ -160,13 +160,18 @@ const normalizeUrl = (text) => String(text).trim().replace(/\/+$/, '').replace('
 
 async function probe(url) {
   try {
-    const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(2000) });
+    const response = await fetch(`${url}/api/health`, { headers: NO_POOL, signal: AbortSignal.timeout(2000) });
     const body = await response.json();
     return body?.tool === 'task-hub' ? body : undefined;
   } catch {
     return undefined;
   }
 }
+
+// Every request opens its own connection. tt runs git (spawnSync) between requests, and a pooled keep-alive socket
+// that the Hub closed in the meantime (its keep-alive timeout is 5 s) would fail the next request with ECONNRESET.
+// Slow machines (Windows runners) are slow enough to hit that.
+const NO_POOL = { Connection: 'close' };
 
 let server; // { url, health }
 
@@ -226,7 +231,7 @@ async function http(method, path, body) {
   try {
     response = await fetch(`${url}${path}`, {
       method,
-      headers: method === 'GET' ? {} : { 'Content-Type': 'application/json', Origin: url },
+      headers: method === 'GET' ? { ...NO_POOL } : { 'Content-Type': 'application/json', Origin: url, ...NO_POOL },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
     });
@@ -518,7 +523,7 @@ commands.evidence = async ({ positional, flags }) => {
     const name = flags.name ?? (names.includes(accepted) ? accepted : names.includes('last-check.md') ? 'last-check.md' : names[0]);
     if (!names.includes(name)) fail(`${run.runId} has no artifact '${clip(name, 60)}'`, `it has: ${names.join(', ')}`, `tt evidence ${id} --name ${names[0]}`);
     const base = (await ensureUp()).url;
-    const response = await fetch(`${base}/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(run.runId)}/artifacts/${name.split('/').map(encodeURIComponent).join('/')}`, { signal: AbortSignal.timeout(30_000) });
+    const response = await fetch(`${base}/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(run.runId)}/artifacts/${name.split('/').map(encodeURIComponent).join('/')}`, { headers: NO_POOL, signal: AbortSignal.timeout(30_000) });
     if (!response.ok) fail(`cannot read ${name}`, `HTTP ${response.status}`, `tt show ${id}`);
     const bytes = Buffer.from(await response.arrayBuffer());
     let text = bytes.subarray(0, MAX_EVIDENCE_BYTES).toString('utf8');
@@ -690,7 +695,7 @@ async function storeArtifact(id, runId, name, content) {
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 409 || !/already exists/.test(error.message)) throw error;
     // Artifacts are immutable. Same content = a repeated `tt done`; different content gets a new name.
-    const existing = await fetch(`${(await ensureUp()).url}${path}/${name.split('/').map(encodeURIComponent).join('/')}`).then((response) => response.text()).catch(() => undefined);
+    const existing = await fetch(`${(await ensureUp()).url}${path}/${name.split('/').map(encodeURIComponent).join('/')}`, { headers: NO_POOL }).then((response) => response.text()).catch(() => undefined);
     if (existing === content) return name;
     const dot = name.lastIndexOf('.');
     const alternative = dot > 0 ? `${name.slice(0, dot)}-2${name.slice(dot)}` : `${name}-2`;

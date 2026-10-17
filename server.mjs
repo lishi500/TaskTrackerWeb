@@ -3261,12 +3261,6 @@ function withdrawEndpoint() {
 
 process.on('exit', withdrawEndpoint);
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(signal, () => process.exit(0));
-// Test-only: Windows has no catchable SIGTERM, so tests ask the server to take its
-// normal clean-exit path (process.exit) to verify the endpoint files are removed.
-if (process.env.NODE_ENV === 'test' && Number(process.env.TASK_HUB_TEST_EXIT_AFTER_MS) > 0) {
-  setTimeout(() => process.exit(0), Number(process.env.TASK_HUB_TEST_EXIT_AFTER_MS));
-}
-
 let candidatePort = port;
 let portAttempts = 0;
 
@@ -3276,6 +3270,12 @@ server.on('listening', () => {
   publishEndpoint();
   console.log(`Task tracker is available at http://${host}:${activePort}`);
   console.log(`CSV source of truth: ${trackerPath}`);
+  // Test-only: Windows has no catchable SIGTERM, so tests ask the server to take its normal clean-exit path
+  // (process.exit) to verify the endpoint files are removed. Counted from the moment the server listens, so
+  // a slow start on a busy machine cannot use up the time the test needs for its assertions.
+  if (process.env.NODE_ENV === 'test' && Number(process.env.TASK_HUB_TEST_EXIT_AFTER_MS) > 0) {
+    setTimeout(() => process.exit(0), Number(process.env.TASK_HUB_TEST_EXIT_AFTER_MS));
+  }
 });
 
 // Windows reserves ranges of ports for Hyper-V, WSL2 and Docker ("excluded port ranges"); binding inside

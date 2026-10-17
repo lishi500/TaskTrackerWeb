@@ -171,9 +171,11 @@ export const mutation = (url, payload, headers = {}) => ({
   body: JSON.stringify(payload),
 });
 
-// fetch + tolerant body parsing: { response, status, body (JSON or text), text }
+// fetch + tolerant body parsing: { response, status, body (JSON or text), text }.
+// No connection reuse: a suite that blocks its event loop in spawnSync for longer than the Hub's 5 s keep-alive
+// timeout would reuse a socket the Hub has closed meanwhile and fail with ECONNRESET. A slow runner does exactly that.
 export async function call(url, path, options = {}) {
-  const response = await fetch(`${url}${path}`, options);
+  const response = await fetch(`${url}${path}`, { ...options, headers: { Connection: 'close', ...options.headers } });
   const text = await response.text();
   let body = text;
   try { body = JSON.parse(text); } catch { /* not JSON */ }

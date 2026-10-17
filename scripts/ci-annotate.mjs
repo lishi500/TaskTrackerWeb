@@ -16,7 +16,6 @@ import { mkdtempSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, readFile
 import { createServer } from 'node:net';
 import os from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 // Workflow-command escaping: the data part escapes % CR LF; a property (title) also escapes : and ,
 export const escapeData = (text) => String(text).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
@@ -124,4 +123,5 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
+// Run as a script (not when the test imports it). Compared by file name: drive-letter case and short paths differ on Windows runners.
+if (/ci-annotate\.mjs$/i.test(process.argv[1] ?? '')) await main();
