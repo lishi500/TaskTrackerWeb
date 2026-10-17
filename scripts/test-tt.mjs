@@ -310,7 +310,7 @@ await runSuite('tt', async () => {
 
   // ---- a killed server leaves a stale lock and stale files: tt just works again -----------------------------------
   const pidBefore = Number(await instance.readTrackerFile('.tracker-pid'));
-  process.kill(pidBefore);
+  process.kill(pidBefore, 'SIGKILL'); // a hard kill on every OS: SIGTERM would let a POSIX server withdraw its files
   await waitFor(async () => !(await fetch(`${instance.url}/api/health`, { signal: AbortSignal.timeout(500) }).then(() => true, () => false)), { message: 'the killed server to go away' });
   writeFileSync(`${instance.trackerPath}.lock`, JSON.stringify({ pid: pidBefore, host: hostname(), createdAt: new Date().toISOString(), token: 'dead' }));
   assert.match(ok(tt(['doctor'])).out, /^warn lock task_tracker\.csv\.lock held \d+s by pid \d+;/m, 'doctor reports the leftover lock');

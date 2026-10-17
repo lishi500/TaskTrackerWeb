@@ -10,14 +10,14 @@ import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { storyReviewErrors } from '../.agents/skills/game-task-hub/scripts/taskset.mjs';
-import { call, createInstance, createSandbox, runSuite, startHub, taskRow } from './lib/test-support.mjs';
+import { call, createInstance, createSandbox, runSuite, skipNote, startHub, taskRow } from './lib/test-support.mjs';
 
 const parent = join(tmpdir(), 'Hub story 测试');
 mkdirSync(parent, { recursive: true });
 const cleanEnv = { ...process.env };
 for (const name of ['TT_URL', 'TT_DIR', 'TT_AGENT', 'TT_REVIEWER']) delete cleanEnv[name];
 const hasGit = spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0;
-if (!hasGit) console.log('note: git is not installed here, so the GITREV / diff range checks are skipped');
+if (!hasGit) skipNote('GITREV events and the diff range need git, which is not installed here');
 
 const instances = [];
 const sandboxes = [];

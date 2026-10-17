@@ -10,7 +10,7 @@ import { createServer as createNetServer } from 'node:net';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { call, createInstance, getFreePort, repoRoot, runSuite, waitFor } from './lib/test-support.mjs';
+import { call, createInstance, getFreePort, repoRoot, runSuite, skipNote, waitFor } from './lib/test-support.mjs';
 import { derivePort, nextPortInRange, parsePortNumber } from './lib/hub-port.mjs';
 
 const instances = [];
@@ -144,11 +144,22 @@ await runSuite('start-init', async () => {
   assert.equal(await fixed.readTrackerFile('.tracker-url'), `http://127.0.0.1:${envPort}`);
   await run.exited;
 
+  // SIGTERM is a graceful stop on POSIX: the server takes its clean-exit path and withdraws the files
+  if (process.platform === 'win32') {
+    skipNote('SIGTERM graceful stop (Windows has no catchable SIGTERM; the clean-exit path itself is covered above through TASK_HUB_TEST_EXIT_AFTER_MS)');
+  } else {
+    const polite = await launch(fixed);
+    await waitFor(() => announced(polite), { message: 'the server banner' });
+    polite.child.kill('SIGTERM');
+    assert.equal(await polite.exited, 0, 'SIGTERM is a clean stop');
+    assert.deepEqual((await readdir(fixed.trackerDir)).filter((name) => name.startsWith('.tracker-')), [], 'a SIGTERM stop removes both files');
+  }
+
   // kill -9 style: the files stay behind, and the next start simply replaces them
   run = await launch(fixed);
   await waitFor(() => announced(run), { message: 'the server banner' });
   const crashedPid = run.child.pid;
-  run.child.kill();
+  run.child.kill('SIGKILL'); // SIGTERM is a clean exit on POSIX (it withdraws the endpoint files)
   await run.exited;
   assert.equal(await fixed.readTrackerFile('.tracker-pid'), String(crashedPid), 'a killed server leaves stale files');
   run = await launch(fixed, { TASK_HUB_TEST_EXIT_AFTER_MS: '2500' });
@@ -227,7 +238,7 @@ await runSuite('start-init', async () => {
   assert.equal(Number(await started.readTrackerFile('.tracker-pid')), pid, 'and does not replace the running server');
 
   // hard kill, then --detach recovers from the stale files
-  process.kill(pid);
+  process.kill(pid, 'SIGKILL');
   await waitFor(async () => !(await fetch(`${started.url}/api/health`, { signal: AbortSignal.timeout(500) }).then(() => true, () => false)), { message: 'the killed server to go away' });
   assert.equal(await started.readTrackerFile('.tracker-pid'), String(pid), 'stale pid file after a hard kill');
   const restarted = started.node('scripts/start.mjs', ['--detach']);

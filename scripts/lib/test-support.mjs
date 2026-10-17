@@ -95,6 +95,15 @@ export function getFreePort() {
   });
 }
 
+// A case that cannot run on this OS (or machine) says so: test-all.mjs lists every "SKIP: reason" line.
+export const skipNote = (reason) => console.log(`SKIP: ${reason}`);
+
+// A whole suite that is inherently specific to another OS stops cleanly (exit 0) and says why.
+export function skipSuite(reason) {
+  skipNote(reason);
+  process.exit(0);
+}
+
 export const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
 
 export async function waitFor(check, { timeoutMs = 10_000, intervalMs = 50, message = 'condition' } = {}) {
