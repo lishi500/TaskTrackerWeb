@@ -34,5 +34,5 @@ try {
   assert.equal(await readFile(join(instance, 'tracker', 'task_tracker.csv'), 'utf8'), 'TaskID,Status\nINSTANCE-001,Ready\n');
   console.log('template-sync test passed: check is non-mutating; apply updates only declared generic paths and preserves instance state/config.');
 } finally {
-  await rm(sandbox, { recursive: true, force: true });
+  await rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).catch(() => { /* a busy temp folder is not a test failure */ });
 }

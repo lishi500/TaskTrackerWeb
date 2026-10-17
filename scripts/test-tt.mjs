@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, rmdirSync, unlinkSync, utimesSync, writ
 import { readFile } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { call, createInstance, mutation, runSuite, sleep, waitFor } from './lib/test-support.mjs';
+import { call, createInstance, mutation, runSuite, waitFor } from './lib/test-support.mjs';
 
 const parent = join(tmpdir(), 'Hub 测试 空格');
 mkdirSync(parent, { recursive: true });
@@ -211,8 +211,9 @@ await runSuite('tt', async () => {
   result = ok(tt(['start']));
   assert.equal(result.lines[0], 'started T-002: run T-002-R0001, profile logic, agent claude', 'start without an id takes the next claimable task');
   assert.match(result.lines[1], /^acceptance: 按住 Space 浮标向岸边移动/);
-  await sleep(1_100);
   writeFileSync(checkFile, '# Check\n[PASS] parse\n[PASS] test (3 tests)\n');
+  const ahead = new Date(Date.now() + 5_000); // newer than the Run without waiting for the clock
+  utimesSync(checkFile, ahead, ahead);
   result = ok(tt(['done', 'T-002']));
   assert.equal(result.lines[0], 'T-002 -> In Review (run T-002-R0001, verified; evidence: last-check.md)', 'a fresh reports/last-check.md is attached automatically; summary has a default');
   const doneJson = JSON.parse(ok(tt(['review', 'T-002', 'approve', '检查通过', '--as', 'fixed-reviewer', '--json'])).out);
@@ -337,5 +338,5 @@ await runSuite('tt', async () => {
     try { if (process.platform === 'win32') rmdirSync(link); else unlinkSync(link); } catch { /* not created */ }
   }
   await instance.dispose();
-  rmSync(gameDir, { recursive: true, force: true });
+  try { rmSync(gameDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* a busy temp folder is not a test failure */ }
 });

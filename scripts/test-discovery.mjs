@@ -157,5 +157,5 @@ await runSuite('discovery', async () => {
   console.log('discovery test passed: TT_DIR, tracker.json, .tt-dir, sibling -Tracker and the tt.mjs location, in that order, with a copied skill and no links; broken pointers explained by doctor.');
 }, async () => {
   for (const instance of instances) await instance.dispose();
-  rmSync(parent, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
+  try { rmSync(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* a busy temp folder is not a test failure */ }
 });

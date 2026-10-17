@@ -255,5 +255,5 @@ try {
 } finally {
   child.kill('SIGTERM');
   await once(child, 'exit').catch(() => {});
-  await rm(sandbox, { recursive: true, force: true });
+  await rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).catch(() => { /* a busy temp folder is not a test failure */ });
 }

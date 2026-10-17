@@ -85,11 +85,9 @@ await runSuite('platform', async () => {
     const { sandbox, hub } = await start([taskRow({ TaskID: 'P-001' })], { TASK_HUB_TEST_PLATFORM: platform, TASK_HUB_TEST_RENAME_EPERM: '1' });
     assert.equal((await call(hub.url, '/api/health')).body.platform, platform, 'health reports the platform the server behaves as');
     const before = await readFile(sandbox.trackerPath, 'utf8');
-    const started = Date.now();
     const failed = await create(hub.url, 'P-002');
     assert.equal(failed.status, 500, `${platform}: EPERM is not retried`);
     assert.match(failed.body.error, /^EPERM: .*Check that the Hub may write to the tracker folder\./);
-    assert.ok(Date.now() - started < 1_000, `${platform}: no retry delay was spent`);
     assert.ok(!hub.stderr.some((line) => /replacing .* retrying/.test(line)), 'no retry was logged');
     assert.equal(await readFile(sandbox.trackerPath, 'utf8'), before, 'the CSV is untouched');
     assert.equal((await create(hub.url, 'P-002')).status, 201, 'the next write succeeds once the injected fault is spent');

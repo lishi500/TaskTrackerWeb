@@ -36,6 +36,16 @@ export function csvText(rows, { eol = '\n', bom = false } = {}) {
   return `${bom ? '\uFEFF' : ''}${[header, ...rows].map((row) => row.map(csvCell).join(',')).join(eol)}${eol}`;
 }
 
+// Remove a temp folder. On Windows a file can stay busy for a moment after its process has exited
+// (antivirus, indexer), so retry; leftovers in the temp folder must never fail a test.
+export async function removeDirectory(path) {
+  try {
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (error) {
+    console.error(`note: could not remove ${path} (${error?.code ?? error?.message}); leaving it behind`);
+  }
+}
+
 // A throw-away instance directory under the OS temp dir. dispose() removes it;
 // callers that created junctions inside must remove the links themselves first.
 export async function createSandbox(prefix, rows = []) {
@@ -46,7 +56,7 @@ export async function createSandbox(prefix, rows = []) {
     dir,
     trackerPath,
     async writeTracker(nextRows = rows, options) { await writeFile(trackerPath, csvText(nextRows, options), 'utf8'); },
-    async dispose() { await rm(dir, { recursive: true, force: true }); },
+    async dispose() { await removeDirectory(dir); },
   };
   await sandbox.writeTracker(rows);
   return sandbox;
@@ -149,7 +159,7 @@ export async function createInstance({ parent = tmpdir(), name = 'task-tracker-i
     },
     async dispose() {
       await instance.stopServer();
-      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 });
+      await removeDirectory(root);
     },
   };
   return instance;
@@ -178,6 +188,11 @@ export async function runSuite(name, body, cleanup = async () => {}) {
     console.error(`${name} FAILED:`, error);
     process.exitCode = 1;
   } finally {
-    await cleanup();
+    // A cleanup problem (a server that is slow to die, a busy temp folder) must not turn a passing suite red.
+    try {
+      await cleanup();
+    } catch (error) {
+      console.error(`${name}: cleanup problem (ignored): ${error?.code ?? ''} ${error?.message ?? error}`);
+    }
   }
 }

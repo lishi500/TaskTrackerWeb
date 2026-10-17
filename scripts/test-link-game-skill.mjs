@@ -143,5 +143,5 @@ try {
   console.log(`link-game-skill test passed on ${process.platform}: ${process.platform === 'win32' ? 'junction without admin' : 'symlink'}, idempotent, foreign/real targets refused, git exclude, clean failure.`);
 } finally {
   for (const link of createdLinks) removeLink(link);
-  rmSync(sandbox, { recursive: true, force: true });
+  try { rmSync(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* a busy temp folder is not a test failure */ }
 }
