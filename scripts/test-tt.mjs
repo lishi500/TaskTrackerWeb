@@ -225,7 +225,9 @@ await runSuite('tt', async () => {
   assert.equal(ok(tt(['admit', 'T-003'])).out.trim(), 'T-003 -> Ready');
   assert.match(tt(['admit', 'BUG-1']).err, /Serial lane is occupied by T-003 \(Ready\)/);
   assert.match(tt(['admit', 'BUG-1']).err, /try: tt show T-003/);
-  assert.equal(ok(tt(['block', 'T-003', '缺少鱼线美术资源'])).out.trim(), 'T-003 -> Blocked (缺少鱼线美术资源)');
+  assert.equal(ok(tt(['new', 'W-001', 'an', 'unquoted', 'multi', 'word', 'title', '--accept', 'the whole title is kept'])).out.trim(), 'created W-001 (Task, Backlog)');
+  assert.equal((await call(instance.url, '/api/tasks/W-001/packet')).body.task.Task, 'an unquoted multi word title', 'words after the id form the title');
+  assert.equal(ok(tt(['block', 'T-003', '缺少', '鱼线', '美术资源'])).out.trim(), 'T-003 -> Blocked (缺少 鱼线 美术资源)', 'an unquoted blocker keeps all its words');
   assert.equal(ok(tt(['unblock', 'T-003'])).out.trim(), 'T-003 -> Ready');
   ok(tt(['start', 'T-003']));
   assert.match(tt(['done', 'T-003', '--outcome', 'blocked']).err, /^tt: a blocked Run needs --blocker/);

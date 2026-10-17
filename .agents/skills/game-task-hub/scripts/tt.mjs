@@ -364,7 +364,8 @@ commands.next = async () => {
 
 commands.new = async ({ positional, flags }) => {
   needArgs('new', positional, 2, 'ID "title" --accept "..."');
-  const [id, title] = positional;
+  const [id] = positional;
+  const title = positional.slice(1).join(' '); // an unquoted multi-word title must not be cut to its first word
   const type = flags.type ?? 'Task';
   if (!['Task', 'Bug', 'Story'].includes(type)) fail(`--type ${type} is not valid`, 'use Task, Bug or Story', `tt new ${id} "${title}" --type Task --accept "..."`);
   const accept = textArg(flags.accept);
@@ -405,7 +406,10 @@ const transition = (name, path, buildBody, describe) => async ({ positional, fla
 commands.admit = transition('admit', 'admit', (_p, flags) => ({ agent: AGENT, targetStatus: 'Ready', reason: flags.reason ?? 'admitted with tt' }), (id, result) => `${id} -> ${result.task.Status}`);
 commands.park = transition('park', 'park', (_p, flags) => ({ agent: AGENT, reason: flags.reason ?? 'parked with tt' }), (id, result) => `${id} -> ${result.task.Status}`);
 commands.unblock = transition('unblock', 'unblock', (_p, flags) => ({ agent: AGENT, reason: flags.reason ?? 'dependencies are done (tt unblock)' }), (id, result) => `${id} -> ${result.task.Status}`);
-commands.block = transition('block', 'block', (positional, flags) => ({ agent: AGENT, blocker: textArg(positional[1]), evidence: flags.reason ?? textArg(positional[1]) }), (id, result) => `${id} -> ${result.task.Status} (${clip(result.task.Blocker, 80)})`);
+commands.block = transition('block', 'block', (positional, flags) => {
+  const blocker = textArg(positional.slice(1).join(' '));
+  return { agent: AGENT, blocker, evidence: flags.reason ?? blocker };
+}, (id, result) => `${id} -> ${result.task.Status} (${clip(result.task.Blocker, 80)})`);
 
 commands.start = async ({ positional, flags }) => {
   needArgs('start', positional, 1, 'ID');
@@ -663,10 +667,10 @@ commands.import = async ({ positional, flags }) => {
   let admitted = '';
   if (flags['admit-first']) {
     // First runnable executable task: not a Story, not already started, dependencies Done (or none).
-    const known = new Map([...existing]);
-    for (const item of plan.creates) known.set(item.id, { taskId: item.id, status: 'Backlog', taskType: item.kind });
-    const runnable = parsed.items.find((item) => item.kind !== 'Story' && known.get(item.id)?.status === 'Backlog'
-      && item.depends.every((dependency) => known.get(dependency)?.status === 'Done'));
+    const statusOf = new Map([...existing].map(([taskId, task]) => [taskId, task.status]));
+    for (const item of plan.creates) statusOf.set(item.id, 'Backlog');
+    const runnable = parsed.items.find((item) => item.kind !== 'Story' && statusOf.get(item.id) === 'Backlog'
+      && item.depends.every((dependency) => statusOf.get(dependency) === 'Done'));
     if (!runnable) lines.push('admit-first: no runnable Backlog task (every task waits for a dependency)');
     else {
       try {
