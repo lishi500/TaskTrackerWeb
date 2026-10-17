@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 
 import { createServer } from 'node:http';
-import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { hostname as osHostname } from 'node:os';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 
 const toolDir = dirname(fileURLToPath(import.meta.url));
 const configPath = resolve(process.env.TASK_HUB_CONFIG ?? join(toolDir, 'task-hub.config.json'));
-const config = JSON.parse(await readFile(configPath, 'utf8'));
+const stripBom = (text) => (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+const config = JSON.parse(stripBom(await readFile(configPath, 'utf8')));
 const instance = config.instance ?? {};
 const trackerPath = process.env.TRACKER_CSV
   ? resolve(process.env.TRACKER_CSV)
@@ -63,6 +65,46 @@ const testClaimFailureTask = process.env.TASK_HUB_TEST_FAIL_CLAIM_TASK ?? '';
 let testClaimAfterTrackerFailureRemaining = process.env.NODE_ENV === 'test'
   && process.env.TASK_HUB_TEST_FAIL_CLAIM_AFTER_TRACKER === '1' ? 1 : 0;
 const testClaimAfterTrackerFailureTask = process.env.TASK_HUB_TEST_FAIL_CLAIM_AFTER_TRACKER_TASK ?? '';
+// Test-only: make the next N rename() calls fail with EPERM (a transient
+// antivirus / indexer / reader handle on Windows) to exercise the retry loop.
+let testRenameFailuresRemaining = process.env.NODE_ENV === 'test'
+  ? Number(process.env.TASK_HUB_TEST_RENAME_EPERM ?? 0) || 0 : 0;
+
+const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
+// Errors Windows raises while another process briefly holds a file open.
+const transientFileCodes = new Set(['EPERM', 'EBUSY', 'EACCES']);
+// 8 attempts, ~1.9 s in total: enough for a scanner or indexer to let go.
+const renameRetryDelaysMs = [15, 30, 60, 120, 240, 480, 960];
+
+// Atomic replace that survives short-lived handles on the destination, the
+// cause of HTTP 500 on ~2% of writes under concurrent readers on Windows.
+async function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if (testRenameFailuresRemaining > 0) {
+        testRenameFailuresRemaining -= 1;
+        throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM', syscall: 'rename' });
+      }
+      await rename(from, to);
+      return;
+    } catch (error) {
+      if (!transientFileCodes.has(error?.code) || attempt >= renameRetryDelaysMs.length) throw error;
+      console.warn(`task-hub: ${error.code} replacing ${basename(to)} (attempt ${attempt + 1}/${renameRetryDelaysMs.length + 1}); retrying`);
+      await sleep(renameRetryDelaysMs[attempt]);
+    }
+  }
+}
+
+async function readTextWithRetry(path) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await readFile(path, 'utf8');
+    } catch (error) {
+      if (!transientFileCodes.has(error?.code) || attempt >= 4) throw error;
+      await sleep(15 * 2 ** attempt);
+    }
+  }
+}
 
 function parseCsv(source) {
   const rows = [];
@@ -177,7 +219,9 @@ async function readRawTracker() {
     error.statusCode = 503;
     throw error;
   }
-  const source = await readFile(trackerPath, 'utf8');
+  // Excel's "CSV UTF-8" (and some editors) prepend a BOM; it would otherwise
+  // glue itself to the first header cell and hide the TaskID column.
+  const source = stripBom(await readTextWithRetry(trackerPath));
   const trackerRevision = createHash('sha256').update(source).digest('hex');
   let rows;
   try {
@@ -435,31 +479,111 @@ async function replaceTracker(header, records) {
   const temporaryPath = `${trackerPath}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, encodeCsv(rows), { encoding: 'utf8', mode: existing.mode });
-    await rename(temporaryPath, trackerPath);
+    await renameWithRetry(temporaryPath, trackerPath);
   } finally {
     await unlink(temporaryPath).catch(() => {});
   }
 }
 
-async function withTrackerLock(action) {
-  const lockPath = `${trackerPath}.lock`;
-  let lock;
+// ---- Lock files ------------------------------------------------------------
+// A lock file records its holder as { pid, host, createdAt, token }. A killed
+// server used to leave a bare lock behind and every later write answered 409
+// until someone deleted it by hand. Now a lock is replaced automatically when
+// its holder is provably gone (same host, pid not running) or older than 120 s;
+// when it is genuinely busy the 409 names the holder and how long it has held it.
+const lockStaleAfterMs = 120_000;
+const unreadableLockStaleAfterMs = 10_000;
+const lockHostName = osHostname();
+let staleLockTakeover = Promise.resolve();
+
+function processIsAlive(pid) {
   try {
-    lock = await open(lockPath, 'wx');
+    process.kill(pid, 0);
+    return true;
   } catch (error) {
-    if (error?.code === 'EEXIST') {
-      const conflict = new Error('Tracker is being updated by another process. Reload and try again.');
-      conflict.statusCode = 409;
-      throw conflict;
-    }
+    return error?.code === 'EPERM';
+  }
+}
+
+async function inspectLock(lockPath) {
+  let text;
+  let info;
+  try {
+    [text, info] = await Promise.all([readFile(lockPath, 'utf8'), stat(lockPath)]);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
     throw error;
   }
+  let holder;
+  try { holder = JSON.parse(text); } catch { holder = undefined; }
+  const readable = Number.isInteger(holder?.pid) && typeof holder?.createdAt === 'string' && !Number.isNaN(Date.parse(holder.createdAt));
+  const ageMs = Date.now() - (readable ? Date.parse(holder.createdAt) : info.mtimeMs);
+  let staleReason = '';
+  if (!readable) {
+    // Legacy empty locks (older servers) and half-written files: judge by mtime only.
+    if (ageMs > unreadableLockStaleAfterMs) staleReason = 'unreadable lock file';
+  } else if (ageMs > lockStaleAfterMs) {
+    staleReason = 'older than 120 s';
+  } else if (holder.host === lockHostName && !processIsAlive(holder.pid)) {
+    staleReason = `holder pid ${holder.pid} is not running`;
+  }
+  return { text, ageMs, holder: readable ? holder : undefined, staleReason };
+}
+
+function lockHolderText(inspected) {
+  const seconds = `${Math.max(0, Math.round(inspected.ageMs / 1000))}s ago`;
+  return inspected.holder ? `pid ${inspected.holder.pid} on ${inspected.holder.host}, taken ${seconds}` : `unknown holder, created ${seconds}`;
+}
+
+async function acquireLock(lockPath, busyMessage) {
+  const token = randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, host: lockHostName, createdAt: new Date().toISOString(), token });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await writeFile(lockPath, payload, { flag: 'wx' });
+      return token;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    const inspected = await inspectLock(lockPath);
+    if (!inspected) continue;
+    if (!inspected.staleReason) throw httpError(409, busyMessage(lockHolderText(inspected)), 'locked');
+    // Serialize takeovers inside this process and re-check right before
+    // removing, so two requests can never delete each other's fresh lock.
+    const takeover = staleLockTakeover.then(async () => {
+      const again = await inspectLock(lockPath);
+      if (again?.staleReason && again.text === inspected.text) {
+        console.warn(`task-hub: replacing stale lock ${basename(lockPath)} (${again.staleReason})`);
+        await unlink(lockPath).catch(() => {});
+      }
+    });
+    staleLockTakeover = takeover.catch(() => {});
+    await takeover;
+  }
+  throw httpError(409, busyMessage('lock is changing hands'), 'locked');
+}
+
+async function releaseLock(lockPath, token) {
+  try {
+    // Never remove a lock that was taken over while this holder was stuck.
+    if (JSON.parse(await readFile(lockPath, 'utf8')).token !== token) return;
+  } catch {
+    return;
+  }
+  await unlink(lockPath).catch(() => {});
+}
+
+async function withFileLock(lockPath, busyMessage, action) {
+  const token = await acquireLock(lockPath, busyMessage);
   try {
     return await action();
   } finally {
-    await lock.close().catch(() => {});
-    await unlink(lockPath).catch(() => {});
+    await releaseLock(lockPath, token);
   }
+}
+
+async function withTrackerLock(action) {
+  return withFileLock(`${trackerPath}.lock`, (holder) => `Tracker is being updated by another process (${holder}). Retry in a moment.`, action);
 }
 
 async function withToolchainIssueLock(action) {
@@ -470,45 +594,12 @@ async function withToolchainIssueLock(action) {
   }
   const lockPath = `${toolchainIssueEventsPath}.lock`;
   await mkdir(dirname(lockPath), { recursive: true });
-  let lock;
-  try {
-    lock = await open(lockPath, 'wx');
-  } catch (error) {
-    if (error?.code === 'EEXIST') {
-      const conflict = new Error('Toolchain issues are being updated by another request. Reload and try again.');
-      conflict.statusCode = 409;
-      throw conflict;
-    }
-    throw error;
-  }
-  try {
-    return await action();
-  } finally {
-    await lock.close().catch(() => {});
-    await unlink(lockPath).catch(() => {});
-  }
+  return withFileLock(lockPath, (holder) => `Toolchain issues are being updated by another request (${holder}). Retry in a moment.`, action);
 }
 
 async function withRunLock(taskId, runId, action) {
-  const directory = recordDirectory(taskId, runId);
-  const lockPath = join(directory, '.run.lock');
-  let lock;
-  try {
-    lock = await open(lockPath, 'wx');
-  } catch (error) {
-    if (error?.code === 'EEXIST') {
-      const conflict = new Error(`Run '${runId}' is being updated by another request. Reload and try again.`);
-      conflict.statusCode = 409;
-      throw conflict;
-    }
-    throw error;
-  }
-  try {
-    return await action();
-  } finally {
-    await lock.close().catch(() => {});
-    await unlink(lockPath).catch(() => {});
-  }
+  const lockPath = join(recordDirectory(taskId, runId), '.run.lock');
+  return withFileLock(lockPath, (holder) => `Run '${runId}' is being updated by another request (${holder}). Retry in a moment.`, action);
 }
 
 function summarize(records) {
@@ -763,6 +854,33 @@ function httpError(statusCode, message, hubCode) {
   return error;
 }
 
+// Replace absolute paths in an unexpected error message: API clients must not
+// learn where the tracker lives (the full error stays in the server log).
+function scrubPaths(message) {
+  let text = String(message);
+  const roots = [[toolDir, '<hub>'], [trackerPath ? dirname(trackerPath) : '', '<tracker>']].filter(([root]) => root);
+  for (const [root, label] of roots) {
+    for (const variant of new Set([root, root.replaceAll('\\', '/'), root.replaceAll('/', '\\')])) text = text.split(variant).join(label);
+  }
+  return text
+    .replace(/[A-Za-z]:[\\/][^\s'"<>|]*/g, '<path>')
+    .replace(/\\\\[^\s'"<>|]+/g, '<path>')
+    .replace(/(?<![\w.:-])\/(?:[\w.-]+\/)+[\w.-]*/g, '<path>');
+}
+
+// What an API client may see for a failure. Errors we raise ourselves
+// (statusCode set) are written for clients. Anything else is unexpected: show
+// the system error code (clients retry on EPERM/EBUSY) but never raw paths.
+function publicErrorMessage(error) {
+  if (error?.statusCode) return String(error.message);
+  const code = /^E[A-Z0-9]+$/.test(String(error?.code ?? '')) ? error.code : '';
+  if (code) {
+    const advice = transientFileCodes.has(code) ? ' Another program (antivirus, indexer, editor) is holding a tracker file; retry in a moment.' : '';
+    return `${code}: the tracker could not complete a file operation${error.syscall ? ` (${error.syscall})` : ''}.${advice}`;
+  }
+  return scrubPaths(error?.message || 'Unexpected server error.');
+}
+
 // A request target is always a path. new URL('//x', base) would read it as a
 // protocol-relative reference (host "x"), so leading slashes are collapsed.
 function parseRequestUrl(request) {
@@ -955,12 +1073,22 @@ function newTaskRecord(header, body, timestamp, records) {
   return Object.fromEntries(header.map((column) => [column, values[column] ?? '']));
 }
 
+// Windows cannot create a file or folder named after a legacy device, with or
+// without an extension (CON, nul.txt, COM1.x ...). Task and Run ids become
+// folder names under tracker/task-records, so they must not look like one.
+const windowsReservedNames = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+
 function safePathSegment(value, label) {
   const normalized = String(value ?? '').trim();
+  if (!normalized) throw httpError(400, `${label} is required.`, 'invalid-id');
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(normalized)) {
-    const error = new Error(`${label} must use only letters, digits, dot, underscore or hyphen.`);
-    error.statusCode = 400;
-    throw error;
+    throw httpError(400, `${label} must use only letters, digits, dot, underscore or hyphen, at most 128 characters (got '${normalized.slice(0, 40)}').`, 'invalid-id');
+  }
+  if (/^\.+$/.test(normalized) || normalized.endsWith('.')) {
+    throw httpError(400, `${label} '${normalized}' cannot consist only of dots or end with '.': Windows cannot store such a folder name.`, 'invalid-id');
+  }
+  if (windowsReservedNames.test(normalized)) {
+    throw httpError(400, `${label} '${normalized}' is a reserved Windows device name (CON PRN AUX NUL COM1-9 LPT1-9); choose another id, for example '${normalized}-1'.`, 'invalid-id');
   }
   return normalized;
 }
@@ -1071,7 +1199,7 @@ async function writeRun(run) {
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
-    await rename(temporaryPath, path);
+    await renameWithRetry(temporaryPath, path);
   } finally {
     await unlink(temporaryPath).catch(() => {});
   }
@@ -1103,7 +1231,7 @@ async function writeCloseIntent(taskId, runId, intent) {
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, `${JSON.stringify(intent, null, 2)}\n`, 'utf8');
-    await rename(temporaryPath, path);
+    await renameWithRetry(temporaryPath, path);
   } finally {
     await unlink(temporaryPath).catch(() => {});
   }
@@ -1125,7 +1253,7 @@ async function writeClaimIntent(taskId, runId, intent) {
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, `${JSON.stringify(intent, null, 2)}\n`, 'utf8');
-    await rename(temporaryPath, path);
+    await renameWithRetry(temporaryPath, path);
   } finally {
     await unlink(temporaryPath).catch(() => {});
   }
@@ -1362,6 +1490,17 @@ function parseRunPath(requestPath) {
     runId: decodeURIComponent(match[2]),
     operation: match[3],
   } : undefined;
+}
+
+// Identity comparison used for review independence: trim, Unicode-compatibility
+// fold (full-width letters), lower-case, collapse inner whitespace.
+function normalizeIdentity(value) {
+  return String(value ?? '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+// Name inside "REVIEW-CLAIM: <reviewer> <ISO timestamp>" (names may contain spaces).
+function reviewClaimant(claim) {
+  return /^REVIEW-CLAIM: (.+) \d{4}-\d{2}-\d{2}T\S+$/.exec(String(claim ?? ''))?.[1] ?? '';
 }
 
 function reviewerIdentity(value) {
@@ -1995,16 +2134,24 @@ const server = createServer(async (request, response) => {
           error.statusCode = 409;
           throw error;
         }
-        const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
+        const taskRuns = await listTaskRuns(taskId);
+        const activeRun = taskRuns.find((run) => run.status === 'In Progress');
         if (activeRun) {
           const error = new Error(`Task '${taskId}' has unresolved active Run '${activeRun.runId}' and cannot be reviewed.`);
           error.statusCode = 409;
           throw error;
         }
-        if (!record.Implementer || record.Implementer === reviewer) {
-          const error = new Error('Reviewer must be distinct from the task Implementer.');
-          error.statusCode = 409;
-          throw error;
+        if (!record.Implementer) {
+          throw httpError(409, `Reviewer must be distinct from the task Implementer, but '${taskId}' has no recorded Implementer to compare with.`, 'reviewer-not-independent');
+        }
+        // Independence is judged on normalized names (trim, case, whitespace) against
+        // the current Implementer and every agent that held a Run on this task, so
+        // "IMPL-LOCK" cannot review the work of "impl-lock". Abandoned claims never
+        // produced work and do not count.
+        const implementerNames = [record.Implementer, ...taskRuns.filter((run) => run.status !== 'Abandoned').map((run) => run.agent)].filter(Boolean);
+        const matchingImplementer = implementerNames.find((name) => normalizeIdentity(name) === normalizeIdentity(reviewer));
+        if (matchingImplementer) {
+          throw httpError(409, `Reviewer must be distinct from the task Implementer and every agent that held a Run on it: '${reviewer}' matches '${matchingImplementer}' (names are compared ignoring case and extra spaces). Review with a different name.`, 'reviewer-not-independent');
         }
         const timestamp = new Date().toISOString();
         if (action === 'claim') {
@@ -2019,9 +2166,11 @@ const server = createServer(async (request, response) => {
           const after = await readTracker();
           return { task: after.records.find(({ TaskID }) => TaskID === taskId), trackerRevision: after.trackerRevision };
         }
-        const expectedClaimPrefix = `REVIEW-CLAIM: ${reviewer} `;
-        if (!record.ReviewClaim?.startsWith(expectedClaimPrefix)) {
-          const error = new Error(`Reviewer '${reviewer}' has not claimed task '${taskId}'.`);
+        if (!record.ReviewClaim || normalizeIdentity(reviewClaimant(record.ReviewClaim)) !== normalizeIdentity(reviewer)) {
+          const claimant = reviewClaimant(record.ReviewClaim);
+          const error = new Error(claimant
+            ? `Reviewer '${reviewer}' has not claimed task '${taskId}'; the open claim belongs to '${claimant}'.`
+            : `Reviewer '${reviewer}' has not claimed task '${taskId}'; send action "claim" first.`);
           error.statusCode = 409;
           throw error;
         }
@@ -2510,9 +2659,16 @@ const server = createServer(async (request, response) => {
     }
     response.writeHead(405, { Allow: 'GET, POST', 'X-Content-Type-Options': 'nosniff' }).end();
   } catch (error) {
-    sendJson(response, error.statusCode ?? 500, {
-      error: error.message ?? 'Unexpected server error.',
-      ...(error.dependencyAudit ? { dependencyAudit: error.dependencyAudit } : {}),
+    const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    if (statusCode >= 500) console.error(`task-hub: ${request.method} ${String(request.url).slice(0, 200)} failed:`, error);
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
+    sendJson(response, statusCode, {
+      error: publicErrorMessage(error),
+      ...(error?.hubCode ? { code: error.hubCode } : {}),
+      ...(error?.dependencyAudit ? { dependencyAudit: error.dependencyAudit } : {}),
     });
   }
 });
