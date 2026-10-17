@@ -9,7 +9,9 @@
 // digest (first failing assertion + last 15 lines of its output), one overall error, and a ::notice that
 // describes the machine (OS, user, temp folder, git, symlinks, bindable ports) because "passes here, fails
 // on the runner" is almost always about the machine. GitHub allows 10 error annotations per step, so at
-// most 4 suites get a digest and a FAIL line.
+// most 4 suites get a digest and a FAIL line. A suite that crashed (signal, NTSTATUS exit code, no output)
+// was rerun by test-all with Node's diagnostic switches: what that run printed and the head of the report
+// Node wrote become two ::warning annotations per crashed suite ("<suite> rerun", "<suite> report").
 
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, readFileSync } from 'node:fs';
@@ -21,13 +23,14 @@ import { join } from 'node:path';
 export const escapeData = (text) => String(text).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 export const escapeProperty = (text) => escapeData(text).replace(/:/g, '%3A').replace(/,/g, '%2C');
 
-// Keep the start (what failed) and the end (where it stopped) of an over-long message.
-export const clipMessage = (text, limit = 2900) => {
+// Keep the start (what failed) and the end (where it stopped) of an over-long message; keep = 'head' keeps only the start.
+export const clipMessage = (text, limit = 2900, keep = 'both') => {
   const value = String(text);
-  return value.length <= limit ? value : `${value.slice(0, 900)}\n...\n${value.slice(-(limit - 905))}`;
+  if (value.length <= limit) return value;
+  return keep === 'head' ? `${value.slice(0, limit - 4)}\n...` : `${value.slice(0, 900)}\n...\n${value.slice(-(limit - 905))}`;
 };
 
-export const command = (level, title, message, limit = 2900) => `::${level} title=${escapeProperty(title)}::${escapeData(clipMessage(message, limit))}`;
+export const command = (level, title, message, limit = 2900, keep = 'both') => `::${level} title=${escapeProperty(title)}::${escapeData(clipMessage(message, limit, keep))}`;
 
 const ungutter = (line) => line.replace(/^\s*\| ?/, '');
 
@@ -51,7 +54,19 @@ export function buildAnnotations(text) {
       if (line.startsWith('### ')) blocks.push({ title: line.slice(4), lines: [] });
       else blocks.at(-1)?.lines.push(ungutter(line));
     }
-    for (const block of blocks.slice(0, 4)) commands.push(command('error', block.title, block.lines.join('\n')));
+    for (const block of blocks.slice(0, 4)) {
+      // A crashed suite carries what its diagnostic rerun printed; that goes into warnings (their own quota of 10 per step).
+      const rerunAt = block.lines.findIndex((line) => line.startsWith('rerun with diagnostics:'));
+      const main = rerunAt < 0 ? block.lines : block.lines.slice(0, rerunAt);
+      commands.push(command('error', block.title, main.join('\n')));
+      if (rerunAt >= 0) {
+        const suite = block.title.split(' ')[0];
+        const rerun = block.lines.slice(rerunAt);
+        const reportAt = rerun.findIndex((line) => line.startsWith('report ('));
+        commands.push(command('warning', `${suite} rerun`, (reportAt < 0 ? rerun : rerun.slice(0, reportAt)).join('\n')));
+        if (reportAt >= 0) commands.push(command('warning', `${suite} report`, rerun.slice(reportAt).join('\n'), 2900, 'head'));
+      }
+    }
     if (blocks.length > 4) commands.push(command('error', 'more failures', `${blocks.length - 4} more suite(s) failed: ${blocks.slice(4).map((block) => block.title.split(' ')[0]).join(', ')}`));
   }
 
@@ -124,4 +139,4 @@ async function main() {
 }
 
 // Run as a script (not when the test imports it). Compared by file name: drive-letter case and short paths differ on Windows runners.
-if (/ci-annotate\.mjs$/i.test(process.argv[1] ?? '')) await main();
+if (/(^|[\\/])ci-annotate\.mjs$/i.test(process.argv[1] ?? '')) await main();

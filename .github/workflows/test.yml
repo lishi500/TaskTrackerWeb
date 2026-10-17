@@ -22,6 +22,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # DIAGNOSTIC (not a test). One Windows runner once killed test-discovery with exit code 0xC0000409 and no output
+      # at its fs.cpSync call (a destination folder named with non-ASCII characters). This repeats that copy, and the
+      # alternatives, each in its own process, and prints the result as a notice that needs no login to read.
+      - name: "DIAGNOSTIC: fs.cpSync into a non-ASCII folder"
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          output=$(node scripts/ci-cpsync-repro.mjs 2>&1)
+          code=$?
+          output=${output//'%'/'%25'}
+          output=${output//$'\r'/}
+          output=${output//$'\n'/'%0A'}
+          echo "::notice title=cpsync-repro::node $(node -p process.version), driver exit $code%0A$output"
       - name: Syntax check
         shell: bash
         run: node --check server.mjs
