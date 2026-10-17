@@ -15,7 +15,7 @@ const skill = readFileSync(join(skillDirectory, 'SKILL.md'), 'utf8');
 // ---- budget and frontmatter ---------------------------------------------------------------
 const lines = skill.replace(/\n$/, '').split('\n');
 assert.ok(lines.length <= 80, `SKILL.md has ${lines.length} lines (limit 80)`);
-assert.ok(Buffer.byteLength(skill) <= 6_000, `SKILL.md is ${Buffer.byteLength(skill)} bytes; it is read cold by every agent, keep it small`);
+assert.ok(Buffer.byteLength(skill) <= 5_300, `SKILL.md is ${Buffer.byteLength(skill)} bytes (budget about 5 KB); it is read cold by every agent, keep it small`);
 const frontmatter = /^---\nname: (.+)\ndescription: "(.+)"\n---\n/.exec(skill);
 assert.ok(frontmatter, 'SKILL.md needs name and description frontmatter');
 assert.equal(frontmatter[1], 'game-task-hub', 'name equals the folder name');
@@ -46,14 +46,19 @@ for (const mentioned of skill.matchAll(/references\/([a-z-]+\.md)/g)) {
   assert.ok(existsSync(join(skillDirectory, 'references', mentioned[1])), `SKILL.md names references/${mentioned[1]} which does not exist`);
 }
 
+// ---- the review-once-per-Story model is what the agent reads first -----------------------------
+for (const needle of ['`checks`', '`reviewer`', '`owner`', 'RESULT: PASS', 'tt show STORY', 'tt evidence', '--auth checks', 'integration']) {
+  assert.ok(skill.includes(needle), `SKILL.md must explain ${needle}`);
+}
+
 // ---- every `tt <command>` named in the skill is a real command --------------------------------
 const help = spawnSync(process.execPath, [join(skillDirectory, 'scripts', 'tt.mjs'), 'help'], { encoding: 'utf8' }).stdout;
 const known = new Set(['help']);
-for (const line of help.split('\n')) for (const word of line.matchAll(/(?:^|[|\s])(up|down|url|doctor|status|ls|show|next|import|new|admit|park|block|unblock|start|event|art|done|review|issue|eval)(?=[\s|[]|$)/g)) known.add(word[1]);
+for (const line of help.split('\n')) for (const word of line.matchAll(/(?:^|[|\s])(up|down|url|doctor|status|ls|show|next|import|new|admit|park|block|unblock|start|event|art|done|review|issue|eval|evidence)(?=[\s|[]|$)/g)) known.add(word[1]);
 for (const [, command] of skill.matchAll(/`tt ([a-z]+)/g)) {
   assert.ok(known.has(command), `SKILL.md uses "tt ${command}", which is not a tt command`);
 }
-for (const command of ['next', 'start', 'event', 'done', 'review', 'import', 'new', 'ls', 'show', 'status', 'admit', 'park', 'block', 'unblock', 'art', 'issue', 'eval', 'up', 'down', 'url', 'doctor']) {
+for (const command of ['next', 'start', 'event', 'done', 'review', 'import', 'new', 'ls', 'show', 'status', 'admit', 'park', 'block', 'unblock', 'art', 'issue', 'eval', 'evidence', 'up', 'down', 'url', 'doctor']) {
   assert.ok(new RegExp(`\`tt ${command}\\b|tt ${command}\\b`).test(skill), `SKILL.md does not document tt ${command}`);
 }
 

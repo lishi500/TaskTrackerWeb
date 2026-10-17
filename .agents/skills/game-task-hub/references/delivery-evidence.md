@@ -15,6 +15,10 @@ Keep one short contract for a coherent player outcome, referenced by its Story a
 
 An integration-acceptance Task can depend on implementation tasks. Never put its Story in DependsOn. Technical tasks can pass without proving the whole slice; make that limit explicit. A Bug captures a distinct defect, not every failed command during development.
 
+## Evidence of a `checks` task, and the Story review
+
+A `checks` task needs no evidence index: its Run artifact is the project check's report (`reports/last-check.md`), which holds one `RESULT: PASS (...)` or `RESULT: FAIL (...)` line; the Hub accepts the task on the first and refuses the second. Because nobody reviews such a task on its own, the Story's integration-acceptance task carries the claim for the whole slice: its Acceptance names the player path across the Story's tasks, and its Run evidence runs that path (see the table below for what a given claim needs). The one reviewer reads `tt show STORY` (children, auto-accepted flags, git diff range) and `tt evidence ID`, compares them with the Story's Acceptance, and decides once.
+
 ## Evidence index (Run artifact)
 
 ```text
