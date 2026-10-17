@@ -86,7 +86,9 @@ await mkdir(trackerDir, { recursive: true });
 await writeFile(configPath, `${JSON.stringify({
   version: 1,
   instance: { projectId, projectName: projectName.trim(), tracker: 'tracker/task_tracker.csv', mode: 'managed-csv', port },
-  workflow: { serialLane: true, ownerGateTaskPattern: '^GATE-' },
+  // runEvidencePattern: what a check artifact must contain for a "checks" task to close straight to
+  // Done (tools/check.ps1 writes reports/last-check.md with "RESULT: PASS (...)" / "RESULT: FAIL (...)").
+  workflow: { serialLane: true, ownerGateTaskPattern: '^GATE-', runEvidencePattern: '^RESULT: PASS\\b' },
 }, null, 2)}\n`);
 // The skeleton may be checked out with CRLF on Windows; the Hub writes LF.
 const skeleton = (await readFile(templatePath, 'utf8')).replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');

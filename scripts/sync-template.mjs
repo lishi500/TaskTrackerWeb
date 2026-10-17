@@ -30,6 +30,8 @@ const sharedPaths = [
   'scripts/test-agent-api.mjs',
   'scripts/test-start-init.mjs',
   'scripts/test-link-game-skill.mjs',
+  'scripts/test-platform.mjs',
+  'scripts/test-run-evidence.mjs',
   'scripts/test-taskset.mjs',
   'scripts/test-tt.mjs',
   'scripts/test-skill.mjs',

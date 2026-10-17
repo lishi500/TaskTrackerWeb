@@ -19,7 +19,7 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseTaskSet, planImport } from './taskset.mjs';
 
-const TT_VERSION = '1.4.0'; // must equal server.mjs toolVersion (test-tt.mjs checks)
+const TT_VERSION = '1.5.0'; // must equal server.mjs toolVersion (test-tt.mjs checks)
 const AGENT = (process.env.TT_AGENT || 'claude').trim();
 const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
 

@@ -9,6 +9,7 @@
   },
   "workflow": {
     "serialLane": true,
-    "ownerGateTaskPattern": "^GATE-"
+    "ownerGateTaskPattern": "^GATE-",
+    "runEvidencePattern": "^RESULT: PASS\\b"
   }
 }

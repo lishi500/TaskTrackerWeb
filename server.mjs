@@ -23,7 +23,7 @@ const taskRecordsDir = trackerPath ? join(dirname(trackerPath), 'task-records') 
 const toolchainIssueEventsPath = trackerPath ? join(dirname(trackerPath), 'toolchain_issue_events.jsonl') : undefined;
 // Reported by GET /api/health; the skill's tt.mjs carries the same number and
 // scripts/test-agent-api.mjs fails if the two ever differ.
-const toolVersion = '1.4.0';
+const toolVersion = '1.5.0';
 const startedAt = new Date().toISOString();
 // Stable id of this instance (hash of its tracker path, never the path itself)
 // so a second launch can recognise "already running" without leaking locations.
@@ -56,6 +56,22 @@ const serialLaneEnabled = process.env.TASK_HUB_SERIAL_LANE
   ? process.env.TASK_HUB_SERIAL_LANE === 'true'
   : workflow.serialLane === true;
 const ownerGateTaskPattern = new RegExp(workflow.ownerGateTaskPattern ?? '^GATE-');
+// Completion by Run evidence (CompletionAuthority=RunEvidence, importer/CLI alias "checks"): a
+// verified close is accepted without independent review when the Run holds a text artifact that
+// matches this pattern (multiline) and none that reports RESULT: FAIL. tools/check.ps1 writes
+// reports/last-check.md with one "RESULT: PASS (...)" or "RESULT: FAIL (...)" line. A missing
+// key means the default, so instances created before the key existed keep working.
+const defaultRunEvidencePattern = '^RESULT: PASS\\b';
+const runEvidencePatternSource = workflow.runEvidencePattern ?? defaultRunEvidencePattern;
+let runEvidencePattern;
+try {
+  if (typeof runEvidencePatternSource !== 'string' || !runEvidencePatternSource.trim()) throw new Error('it must be a non-empty string');
+  runEvidencePattern = new RegExp(runEvidencePatternSource, 'm');
+} catch (error) {
+  console.error(`task-hub: workflow.runEvidencePattern in task-hub.config.json is not usable (${error.message}); it must be a regular expression such as ${defaultRunEvidencePattern}`);
+  process.exit(1);
+}
+const runEvidenceFailPattern = /^RESULT: FAIL\b/m;
 const ownerInputStatuses = new Set([
   'Awaiting Owner',
   'Awaiting Owner Gate',
@@ -70,7 +86,7 @@ const taskCreationColumns = [
 ];
 const legacyTaskCreationColumns = taskCreationColumns.map((column) => column === 'CompletionAuthority' ? 'ReviewRequired' : column);
 const taskTypes = new Set(['Task', 'Bug', 'Story']);
-const completionAuthorities = new Set(['IndependentReviewerAgent', 'DecisionOwner', 'NotApplicable']);
+const completionAuthorities = new Set(['IndependentReviewerAgent', 'RunEvidence', 'DecisionOwner', 'NotApplicable']);
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -196,7 +212,81 @@ function isStory(record) {
 
 function derivedStoryStatus(records, story) {
   const children = records.filter((record) => !isStory(record) && record.ParentID === story.TaskID);
-  return children.length > 0 && children.every(({ Status }) => Status === 'Done') ? 'Done' : 'Backlog';
+  if (!(children.length > 0 && children.every(({ Status }) => Status === 'Done'))) return 'Backlog';
+  // A Story whose Tasks completed on machine-checked evidence is not Done until its integration
+  // review exists (it is one of the children, so all-Done then means it passed review too).
+  const review = storyReviewState(records, story);
+  return review && !review.covering.length ? 'Backlog' : 'Done';
+}
+
+// ---- Review once per Story --------------------------------------------------------------
+// RunEvidence ("checks") Tasks complete on machine-checked Run evidence. Every Story that has
+// some must therefore also have an integration-acceptance Task (IndependentReviewerAgent) that
+// depends, directly or through other Tasks, on all of them: that Task is the Story's one
+// independent review. tt import / tt new / tt doctor and the dashboard report violations.
+function dependencyClosure(recordsById, taskId) {
+  const reached = new Set();
+  const pending = [taskId];
+  while (pending.length) {
+    const current = recordsById.get(pending.pop());
+    if (!current) continue;
+    for (const dependencyId of taskDependencies(current)) {
+      if (reached.has(dependencyId)) continue;
+      reached.add(dependencyId);
+      pending.push(dependencyId);
+    }
+  }
+  return reached;
+}
+
+function storyReviewState(records, story, recordsById = new Map(records.map((record) => [record.TaskID, record]))) {
+  const children = records.filter((record) => !isStory(record) && record.ParentID === story.TaskID);
+  const checks = children.filter(completesOnRunEvidence);
+  if (!checks.length) return undefined;
+  const reviewers = children.filter(requiresIndependentReviewer);
+  const coverage = reviewers.map((reviewer) => {
+    const reach = dependencyClosure(recordsById, reviewer.TaskID);
+    return { reviewer, missing: checks.filter((check) => !reach.has(check.TaskID)).map(({ TaskID }) => TaskID) };
+  });
+  const covering = coverage.filter(({ missing }) => !missing.length).map(({ reviewer }) => reviewer);
+  const closest = [...coverage].sort((left, right) => left.missing.length - right.missing.length)[0];
+  return { story, checks, reviewers, covering, missing: covering.length ? [] : (closest?.missing ?? checks.map(({ TaskID }) => TaskID)) };
+}
+
+// Stories whose integration review is still open, and Stories that break the invariant.
+function storyReviewReport(records) {
+  const recordsById = new Map(records.map((record) => [record.TaskID, record]));
+  const open = [];
+  const gaps = [];
+  for (const story of records.filter(isStory)) {
+    const review = storyReviewState(records, story, recordsById);
+    if (!review) continue;
+    const ids = (tasks) => tasks.map(({ TaskID }) => TaskID);
+    if (!review.covering.length) {
+      gaps.push({
+        storyId: story.TaskID,
+        title: story.Task,
+        checks: ids(review.checks),
+        reviewers: ids(review.reviewers),
+        missing: review.missing,
+        message: review.reviewers.length
+          ? `Story ${story.TaskID}: no reviewer Task depends on all checks Tasks (missing: ${review.missing.join(', ')}); add one that does.`
+          : `Story ${story.TaskID} has checks Tasks (${ids(review.checks).join(', ')}) but no reviewer Task; add an integration-acceptance Task with Authority: reviewer that depends on them.`,
+      });
+    } else if (!review.covering.some(({ Status }) => Status === 'Done')) {
+      const integration = review.covering[0];
+      open.push({
+        storyId: story.TaskID,
+        title: story.Task,
+        milestone: story.Milestone,
+        integrationTaskId: integration.TaskID,
+        integrationStatus: integration.Status,
+        checksDone: review.checks.filter(({ Status }) => Status === 'Done').length,
+        checksTotal: review.checks.length,
+      });
+    }
+  }
+  return { open, gaps };
 }
 
 // A Story is an organizational scope, so its only workflow-like signal is
@@ -231,6 +321,16 @@ function completionAuthority(record) {
 
 function requiresIndependentReviewer(record) {
   return !isStory(record) && completionAuthority(record) === 'IndependentReviewerAgent';
+}
+
+function completesOnRunEvidence(record) {
+  return !isStory(record) && completionAuthority(record) === 'RunEvidence';
+}
+
+// Work an agent claims with a Run: every executable task except DecisionOwner (human) work.
+// RunEvidence tasks share the serial lane and its arm/advance rules with reviewed tasks.
+function isAgentWork(record) {
+  return requiresIndependentReviewer(record) || completesOnRunEvidence(record);
 }
 
 function assertExecutableTask(record, action) {
@@ -669,6 +769,7 @@ function summarize(records) {
     currentWork,
     blockers,
     dependencyWaits,
+    storyReview: storyReviewReport(records),
   };
 }
 
@@ -762,7 +863,7 @@ const serialLaneStatuses = new Set(['Ready', 'In Progress', 'In Review']);
 
 function serialLaneOccupants(records, excludedTaskId = '') {
   if (!serialLaneEnabled) return [];
-  return records.filter((record) => record.TaskID !== excludedTaskId && requiresIndependentReviewer(record) && serialLaneStatuses.has(record.Status));
+  return records.filter((record) => record.TaskID !== excludedTaskId && isAgentWork(record) && serialLaneStatuses.has(record.Status));
 }
 
 function assertSerialLaneAvailable(records, taskId) {
@@ -930,7 +1031,7 @@ function summarizeToolchainIssues(events) {
 }
 
 function armImmediateSuccessor(records, predecessor, timestamp) {
-  if (!serialLaneEnabled || !requiresIndependentReviewer(predecessor) || !['In Progress', 'In Review'].includes(predecessor.Status)) return [];
+  if (!serialLaneEnabled || !isAgentWork(predecessor) || !['In Progress', 'In Review'].includes(predecessor.Status)) return [];
   const candidates = records.filter((record) => !isStory(record) && record.Status === 'Backlog'
     && taskDependencies(record).includes(predecessor.TaskID)
     && dependenciesOtherThan(record, predecessor.TaskID).every((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status === 'Done'));
@@ -967,7 +1068,7 @@ function advanceImmediateSuccessor(records, predecessor, timestamp) {
     && allDependenciesDone(records, record));
   if (candidates.length !== 1) return [];
   const candidate = candidates[0];
-  if (requiresIndependentReviewer(candidate)) {
+  if (isAgentWork(candidate)) {
     if (serialLaneOccupants(records, candidate.TaskID).length) return [];
     candidate.Status = 'Ready';
     candidate.Blocker = '';
@@ -1164,7 +1265,7 @@ function requestedTaskType(value) {
 function requestedCompletionAuthority(value) {
   const selected = creationText(value, 'completionAuthority', { required: true, maxLength: 64 });
   if (!completionAuthorities.has(selected)) {
-    const error = new Error('completionAuthority must be IndependentReviewerAgent, DecisionOwner or NotApplicable.');
+    const error = new Error('completionAuthority must be IndependentReviewerAgent, RunEvidence, DecisionOwner or NotApplicable.');
     error.statusCode = 400;
     throw error;
   }
@@ -1651,6 +1752,27 @@ async function recoverTaskPendingCloses(taskId) {
   }
 }
 
+// The Run of a RunEvidence task may close as verified (straight to Done) only if one of its text
+// artifacts matches workflow.runEvidencePattern (default ^RESULT: PASS\b, multiline) and none
+// reports "RESULT: FAIL". Artifacts are immutable, so a failing check attached to a Run cannot
+// be overwritten: such a Run can only be closed blocked, then a new Run started.
+async function evaluateRunEvidence(taskId, runId) {
+  const passing = [];
+  const failing = [];
+  for (const { name } of await listRunArtifacts(taskId, runId)) {
+    const text = stripBom(await readFile(artifactPath(taskId, runId, name).path, 'utf8'));
+    if (runEvidenceFailPattern.test(text)) failing.push(name);
+    if (runEvidencePattern.test(text)) passing.push(name);
+  }
+  if (failing.length) {
+    throw httpError(422, `Run '${runId}' holds an artifact that reports "RESULT: FAIL" (${failing.join(', ')}), so '${taskId}' cannot be accepted on evidence. Fix the cause and run the project check again in a new Run, or close this Run as blocked or incomplete.`, 'run-evidence-failed');
+  }
+  if (!passing.length) {
+    throw httpError(422, `'${taskId}' completes on Run evidence: no text artifact of Run '${runId}' matches ${runEvidencePattern}. Run the project check so reports/last-check.md contains "RESULT: PASS", attach it (tt done does), or close as incomplete.`, 'run-evidence-missing');
+  }
+  return { artifact: passing[0], artifacts: passing };
+}
+
 async function artifactUsage(taskId, runId) {
   const files = await listRunArtifacts(taskId, runId);
   return { count: files.length, bytes: files.reduce((total, file) => total + file.bytes, 0) };
@@ -1804,6 +1926,7 @@ const server = createServer(async (request, response) => {
         pid: process.pid,
         instanceId,
         platform: currentPlatform(),
+        runEvidencePattern: runEvidencePatternSource,
         ...(trackerError ? { trackerError } : {}),
       });
       return;
@@ -2162,7 +2285,7 @@ const server = createServer(async (request, response) => {
           error.statusCode = 409;
           throw error;
         }
-        if (requiresIndependentReviewer(record)) assertSerialLaneAvailable(records, taskId);
+        if (isAgentWork(record)) assertSerialLaneAvailable(records, taskId);
         const dependencies = taskDependencies(record);
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) {
@@ -2343,13 +2466,18 @@ const server = createServer(async (request, response) => {
             return { run: currentRun, task: currentRecord, trackerRevision: current.trackerRevision };
           }
           const beforeRecord = Object.fromEntries(current.header.map((name) => [name, currentRecord[name] ?? '']));
-        if (outcome === 'verified' && !requiresIndependentReviewer(currentRecord)) {
-          const error = new Error(`Only IndependentReviewerAgent work can close as verified. ${taskId} must return to an owner-facing status for a DecisionOwner decision.`);
+        // RunEvidence work completes on its own machine-checked evidence and never waits In Review;
+        // a Run without a passing check (or with a failing one) is refused with 422 before anything changes.
+        const autoAccepted = outcome === 'verified' && completesOnRunEvidence(currentRecord)
+          ? await evaluateRunEvidence(taskId, runId)
+          : undefined;
+        if (outcome === 'verified' && !autoAccepted && !requiresIndependentReviewer(currentRecord)) {
+          const error = new Error(`Only IndependentReviewerAgent or RunEvidence work can close as verified. ${taskId} must return to an owner-facing status for a DecisionOwner decision.`);
           error.statusCode = 409;
           throw error;
         }
         if (outcome === 'verified') {
-          currentRecord.Status = 'In Review';
+          currentRecord.Status = autoAccepted ? 'Done' : 'In Review';
           currentRecord.Blocker = '';
         } else if (outcome === 'blocked') {
           if (!blocker) {
@@ -2374,6 +2502,10 @@ const server = createServer(async (request, response) => {
           disarmImmediateSuccessor(current.records, currentRecord, timestamp, `predecessor Run closed as ${outcome}`);
         }
         currentRecord.Evidence = currentRecord.Evidence ? `${currentRecord.Evidence}\nRUN ${runId} ${outcome}: ${summary}` : `RUN ${runId} ${outcome}: ${summary}`;
+        if (autoAccepted) {
+          appendEvidence(currentRecord, `auto-accepted: RunEvidence (${runId}, artifact ${autoAccepted.artifact})`);
+          advanceImmediateSuccessor(current.records, currentRecord, timestamp);
+        }
         currentRecord.Updated = timestamp;
           const runClosure = {
             status: outcome,
@@ -2443,7 +2575,7 @@ const server = createServer(async (request, response) => {
         }
         assertExecutableTask(record, 'be reviewed');
         if (!requiresIndependentReviewer(record)) {
-          const error = new Error(`Only IndependentReviewerAgent work can be independently reviewed. ${taskId} uses ${completionAuthority(record)}.`);
+          const error = new Error(`Only IndependentReviewerAgent work can be independently reviewed. ${taskId} uses ${completionAuthority(record)}${completesOnRunEvidence(record) ? ' (it completes on Run evidence; independent review happens once, at the Story integration Task)' : ''}.`);
           error.statusCode = 409;
           throw error;
         }
@@ -2679,7 +2811,7 @@ const server = createServer(async (request, response) => {
         if (!dependencies.length) { const error = new Error(`Cannot dependency-unblock ${taskId}; it has no dependencies.`); error.statusCode = 409; throw error; }
         const unfinished = dependencies.filter((dependencyId) => records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
         if (unfinished.length) { const error = new Error(`Cannot unblock ${taskId}; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error; }
-        if (requiresIndependentReviewer(record)) assertSerialLaneAvailable(records, taskId);
+        if (isAgentWork(record)) assertSerialLaneAvailable(records, taskId);
         const timestamp = new Date().toISOString();
         // A completed blocked Run may retain Implementer for historical attribution.
         // Its Run is no longer an active claim; successful maintenance clears that
@@ -2761,7 +2893,7 @@ const server = createServer(async (request, response) => {
           const error = new Error(`Cannot admit ${taskId} as Ready; unfinished dependencies: ${unfinished.join(', ')}.`); error.statusCode = 409; throw error;
         }
         if (targetStatus === 'Ready') {
-          if (requiresIndependentReviewer(record)) assertSerialLaneAvailable(records, taskId);
+          if (isAgentWork(record)) assertSerialLaneAvailable(records, taskId);
         } else if (serialLaneEnabled) {
           const activeDependencies = dependencies.filter((dependencyId) => ['In Progress', 'In Review'].includes(records.find(({ TaskID }) => TaskID === dependencyId)?.Status));
           const otherUnfinished = dependencies.filter((dependencyId) => dependencyId !== activeDependencies[0] && records.find(({ TaskID }) => TaskID === dependencyId)?.Status !== 'Done');
@@ -2802,7 +2934,7 @@ const server = createServer(async (request, response) => {
         if (!authority) { const error = new Error(`Authority task '${authorityTaskId}' was not found.`); error.statusCode = 404; throw error; }
         assertExecutableTask(record, 'enter an owner wait');
         assertExecutableTask(authority, 'act as an owner-wait authority');
-        if (requiresIndependentReviewer(record) || record.Status !== 'Backlog' || record.ReviewClaim || record.Implementer) {
+        if (completionAuthority(record) !== 'DecisionOwner' || record.Status !== 'Backlog' || record.ReviewClaim || record.Implementer) {
           const error = new Error(`Only an unclaimed DecisionOwner Backlog task can enter an owner wait. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
         }
         if (authority.Status !== 'In Progress' || authority.Implementer !== agent || !taskDependencies(record).includes(authorityTaskId)) {
@@ -2896,8 +3028,8 @@ const server = createServer(async (request, response) => {
         const record = records.find(({ TaskID }) => TaskID === taskId);
         if (!record) { const error = new Error(`Task '${taskId}' was not found.`); error.statusCode = 404; throw error; }
         assertExecutableTask(record, 'receive an owner-feedback disposition');
-        if (record.Status !== 'Awaiting Agent Evaluation' || !requiresIndependentReviewer(record) || record.ReviewClaim) {
-          const error = new Error(`Only an unclaimed IndependentReviewerAgent task awaiting Agent action can receive this disposition. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
+        if (record.Status !== 'Awaiting Agent Evaluation' || !isAgentWork(record) || record.ReviewClaim) {
+          const error = new Error(`Only an unclaimed IndependentReviewerAgent or RunEvidence task awaiting Agent action can receive this disposition. ${taskId} is not eligible.`); error.statusCode = 409; throw error;
         }
         const activeRun = (await listTaskRuns(taskId)).find((run) => run.status === 'In Progress');
         if (activeRun) {
