@@ -80,7 +80,7 @@ tt review T-003 approve "核对了验收条件" --as NAME  # 每个 Story 一次
 | `import FILE [--dry-run] [--admit-first]` | 按任务集格式批量创建（幂等，已存在的 ID 跳过且不修改；循环依赖/未知依赖/缺少集成验收任务在写入前报错） |
 | `new ID "标题" --accept "…" [--type Task\|Bug\|Story] [--parent S] [--deps "A;B"] [--auth reviewer\|checks\|owner] [--prio P1] [--milestone M] [--stream X] [--spec PATH]` | 创建单个工作项（Backlog）；Story 缺少覆盖全部 checks 任务的 reviewer 任务时，输出 `warning:`（不拒绝，因为计划总要先建 checks 任务） |
 | `admit` · `park` · `block ID "原因"` · `unblock` | 状态流转 |
-| `start [ID] [--profile …] [--scope …] [--expect …]` | 领取；省略 ID 时领取 `next` 给出的任务；必要时先 admit，并打印验收与 SpecRef（同一 Agent 重复执行是幂等的，打印已有 Run）；在 git 仓库里把当前 HEAD 记为 Run 事件 `GITREV base=<sha>` |
+| `start [ID] [--profile …] [--scope …] [--expect …]` | 领取；省略 ID 时领取 `next` 给出的任务（没有已 admit 的任务且**恰好一个** Backlog 任务依赖都已 Done 时，就 admit 并领取它；0 个或多个候选时拒绝并列出，不替你选）；必要时先 admit，并打印验收与 SpecRef（同一 Agent 重复执行是幂等的，打印已有 Run）；在 git 仓库里把当前 HEAD 记为 Run 事件 `GITREV base=<sha>` |
 | `event ID [RUN] TYPE RESULT "说明"` · `art ID [RUN] NAME FILE\|-` | 事件与文本证据（≤ 128 KB，同名不同内容会自动改名） |
 | `done [ID] ["摘要"] [--next] [--evidence FILE]… [--no-evidence] [--outcome verified\|blocked\|incomplete\|awaiting-human] [--blocker …] [--owner-status …]` | 先存证据再关闭 Run；`reports/last-check.md` 比 Run 开始时间新时自动附加；`DecisionOwner` 任务默认 `awaiting-human`。省略 ID = 本 Agent 唯一的活跃 Run（第一个词若像任务 ID 但 Hub 不认识则报错，否则整句作摘要）。**checks 任务**先在本地预检：含 `RESULT: FAIL` 的文件不会上传，没有 `RESULT: PASS` 行则拒绝并告诉你该运行什么；通过则直接 `Done`，输出 `auto-accepted` 并打印下一个任务（`--next` 则在同一条命令里直接领取它，等于再执行一次 `start`，一串 checks 任务每个只需一条命令）。关闭前记录 `GITREV head=<sha> dirty=<bool>` |
 | `review ID approve\|reject\|block "说明" [--as NAME]` | claim + decision 一步完成；评审名默认 `reviewer-xxxx`（或 `TT_REVIEWER`），与实现者重名（忽略大小写/空格）会被本地和服务器同时拒绝 |

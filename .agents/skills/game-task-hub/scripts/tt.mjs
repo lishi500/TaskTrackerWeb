@@ -630,12 +630,24 @@ async function startTask(id, flags) {
   };
 }
 
+// No id: the next claimable task; or, when nothing is admitted and exactly ONE Backlog task is runnable (its
+// dependencies are Done), that task (startTask admits it first). With 0 or 2+ candidates tt does not choose.
+function pickNext(upcoming) {
+  if (upcoming.next) return upcoming.next.taskId;
+  return upcoming.runnableBacklog?.length === 1 ? upcoming.runnableBacklog[0] : '';
+}
+
 commands.start = async ({ positional, flags }) => {
   let id = positional[0];
   if (!id) {
     const upcoming = await guarded('start', {}, () => get('/api/next'));
-    if (!upcoming.next) fail('there is nothing to start', clip(upcoming.reason, 300), 'tt next, or tt start ID to admit a specific Backlog task');
-    id = upcoming.next.taskId;
+    id = pickNext(upcoming);
+    if (!id) {
+      const candidates = upcoming.runnableBacklog ?? [];
+      fail('there is nothing to start', clip(upcoming.reason, 300), candidates.length > 1
+        ? `tt start ID with one of: ${candidates.slice(0, 6).join(', ')} (${candidates.length} Backlog tasks are runnable, so tt does not choose)`
+        : 'tt next, or tt start ID to admit a specific Backlog task');
+    }
   }
   const started = await guarded(`start ${id}`, { id }, () => startTask(id, flags));
   emit(started.lines, started.data);
@@ -819,7 +831,7 @@ commands.done = async ({ positional, flags }) => {
       const following = await get('/api/next');
       if (!flags.next && following.next) { upcoming = describeNext(following.next); lines.push(upcoming); }
       if (flags.next) {
-        startNext = following.next?.taskId ?? '';
+        startNext = pickNext(following);
         if (!startNext) lines.push(`next: nothing to start - ${clip(following.reason, 200)}`);
       }
     } else if (status === 'In Review') {

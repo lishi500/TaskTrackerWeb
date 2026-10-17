@@ -10,7 +10,7 @@ The Hub owns task state; never edit `tracker/task_tracker.csv`, Run files or eve
 ## Standard flow
 ```text
 tt import docs/tasks/<milestone>.md --admit-first   once per plan; existing ids are skipped
-tt start [T-001]                no id = next claimable task; opens a Run, prints acceptance + spec
+tt start [T-001]                no id = next task (or the only runnable Backlog one); opens a Run, prints acceptance + spec
 tt done ["what changed"] [--next]   attaches reports/last-check.md; no id = your one active Run; --next starts the next task
 tt review T-009 approve|reject|block "notes" --as NAME     only the Story's integration task
 ```

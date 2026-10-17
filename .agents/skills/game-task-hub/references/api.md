@@ -20,7 +20,7 @@ await fetch(`${base}/api/tasks/T-001/admit`, { method: 'POST', headers: { 'Conte
 | --- | --- |
 | `/api/health` | `{ok, tool, toolVersion, projectId, projectName, trackerRevision, serialLane, runEvidencePattern, platform, startedAt, pid, trackerError?}` (200 even when the tracker is unusable: `ok:false`) |
 | `/api/tasks?status=&milestone=&type=&parent=&limit=` | `{trackerRevision, total, count, truncated, tasks:[{taskId, taskType, status, milestone, parentId, dependsOn, blocker, title, priority, completionAuthority, activeRun}]}`; `status` may be a comma list; unknown parameters are a 400 |
-| `/api/next` | `{trackerRevision, next:{...task, acceptance, specRef}\|null, reason, blockedBy?}` |
+| `/api/next` | `{trackerRevision, next:{...task, acceptance, specRef}\|null, reason, blockedBy?, runnableBacklog?}`; `runnableBacklog` (ids, best first) lists the Backlog tasks whose dependencies are Done while nothing is admitted or active: `tt start` without an id admits and starts it when it is the only one |
 | `/api/tasks/ID/packet` | task record, dependencies, reverse dependencies, Runs, `context.story` (parent Story). For a Story, `context` also has `children` (authority, dependsOn, Runs with artifact names and `autoAccepted`), `review` (`state` open\|complete\|gap, integration task) and `gitRange` (`base`, `head` + `dirty`) taken from the Run events `GITREV base=SHA` / `GITREV head=SHA dirty=BOOL` that `tt start` / `tt done` record (`tt show STORY` prints it) |
 | `/api/tasks/ID/runs`, `/runs/RUN`, `/runs/RUN/artifacts/NAME` | Runs with artifact list; one Run with its events; one artifact (always served as text) |
 | `/api/dependency-audit` | read-only graph report, always 200 (`valid:false` lists the problems) |

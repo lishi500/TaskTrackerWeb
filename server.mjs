@@ -857,9 +857,11 @@ function nextWork(records, runIds) {
       ? `Blocked: ${shown.map((record) => `${record.TaskID}${record.Blocker ? ` - ${record.Blocker.replace(/[.\s]+$/, '')}` : ''}`).join('; ')}.`
       : `Waiting on a predecessor: ${shown.map(({ TaskID }) => TaskID).join(', ')}.`);
   }
+  let runnableBacklog = [];
   if (!holders.length && !ownerWaits.length && !evaluations.length) {
     const backlog = executable.filter(({ Status }) => Status === 'Backlog').sort(byPriority);
-    const runnable = backlog.find((record) => allDependenciesDone(records, record));
+    runnableBacklog = backlog.filter((record) => allDependenciesDone(records, record));
+    const [runnable] = runnableBacklog;
     if (runnable) {
       reasons.push(`Nothing is admitted. The next runnable Backlog task is ${runnable.TaskID}: "tt start ${runnable.TaskID}" admits and starts it.`);
     } else if (backlog.length) {
@@ -870,7 +872,14 @@ function nextWork(records, runIds) {
       reasons.push(executable.length ? `All ${doneCount} executable task(s) are Done${doneCount === executable.length ? '' : ` (${executable.length - doneCount} in other states)`}.` : 'No executable tasks exist yet: create them with "tt import FILE" or "tt new".');
     }
   }
-  return { next: null, reason: reasons.slice(0, 4).join(' | '), ...(holders.length ? { blockedBy: holders } : {}) };
+  // runnableBacklog: every Backlog task whose dependencies are Done, best first, listed only when nothing is
+  // admitted or active. `tt start` without an id admits and starts it when it is the only one.
+  return {
+    next: null,
+    reason: reasons.slice(0, 4).join(' | '),
+    ...(holders.length ? { blockedBy: holders } : {}),
+    ...(runnableBacklog.length ? { runnableBacklog: runnableBacklog.map(({ TaskID }) => TaskID) } : {}),
+  };
 }
 
 const serialLaneStatuses = new Set(['Ready', 'In Progress', 'In Review']);

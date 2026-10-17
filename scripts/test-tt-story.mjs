@@ -331,6 +331,30 @@ await runSuite('tt-story', async () => {
   // a single active Run of somebody else is not closed implicitly
   assert.match(ttOpen(['done', 'x', '--no-evidence'], { cwd: plainDir, env: { TT_AGENT: 'agent-c' } }).err, /^tt: A-1 is claimed by agent-a, not by agent-c - tt done without an id only closes your own Run - try: tt done A-1 "summary" \(TT_AGENT names you\)/);
 
+  // ---- tt start without an id: the ONE runnable Backlog task is admitted and started; with 0 or 2+ candidates tt does not choose ------------------------
+  const lone = await createInstance({ parent, name: 'Tracker lone ', projectId: 'tt-story-lone', projectName: 'Lone' });
+  instances.push(lone);
+  const ttLone = ttFor(lone);
+  result = ttLone(['start'], { cwd: gameDir });
+  assert.equal(result.status, 1, 'an empty tracker has nothing to start');
+  assert.match(result.err, /^tt: there is nothing to start - No executable tasks exist yet/);
+  writeFileSync(join(gameDir, 'plans', 'lone.md'), planFile.replaceAll('S-1', 'S-L').replaceAll('T-1', 'L-1').replaceAll('T-2', 'L-2').replaceAll('T-3', 'L-3'));
+  ok(ttLone(['import', 'plans/lone.md'], { cwd: gameDir })); // no --admit-first: everything stays Backlog
+  assert.equal((await call(lone.url, '/api/tasks/L-1/packet')).body.task.Status, 'Backlog');
+  result = ok(ttLone(['start'], { cwd: gameDir }));
+  assert.equal(result.lines[0], 'started L-1: run L-1-R0001 (admitted first), profile logic, agent claude', 'L-1 is the only task whose dependencies are Done');
+  assert.equal((await call(lone.url, '/api/tasks/L-2/packet')).body.task.Status, 'Blocked', 'the serial lane armed the successor as usual');
+  const twin = await createInstance({ parent, name: 'Tracker twin ', projectId: 'tt-story-twin', projectName: 'Twin' });
+  instances.push(twin);
+  const ttTwin = ttFor(twin);
+  writeFileSync(join(gameDir, 'plans', 'twin.md'), 'Milestone: M1\n## S-T: Twin\n- Acceptance: both work\n### B-1: First\n- Acceptance: a\n### B-2: Second\n- Acceptance: b\n');
+  ok(ttTwin(['import', 'plans/twin.md'], { cwd: gameDir }));
+  result = ttTwin(['start'], { cwd: gameDir });
+  assert.equal(result.status, 1, 'two runnable Backlog tasks: tt does not choose');
+  assert.match(result.err, /^tt: there is nothing to start - Nothing is admitted\. The next runnable Backlog task is B-1: .* - try: tt start ID with one of: B-1, B-2 \(2 Backlog tasks are runnable, so tt does not choose\)/);
+  assert.deepEqual(JSON.parse(ok(ttTwin(['ls', '--status', 'Backlog', '--type', 'Task', '--json'], { cwd: gameDir })).out).tasks.map((task) => task.taskId), ['B-1', 'B-2'], 'nothing was admitted by the refusal');
+  assert.equal(ok(ttTwin(['start', 'B-2'], { cwd: gameDir })).lines[0], 'started B-2: run B-2-R0001 (admitted first), profile logic, agent claude', 'naming the task still works');
+
   // ---- tt done --next: a chain of checks tasks costs one call per task ---------------------------------------------------------------------------
   const chain = await createInstance({ parent, name: 'Tracker chain ', projectId: 'tt-story-chain', projectName: 'Chain' });
   instances.push(chain);

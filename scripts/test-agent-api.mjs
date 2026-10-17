@@ -168,10 +168,20 @@ await runSuite('agent-api', async () => {
     assert.match((await call(url, '/api/next')).body.reason, /^Blocked: K-001 - Godot binary missing\./);
   });
   await withHub([taskRow({ TaskID: 'G-001', Status: 'Done' }), taskRow({ TaskID: 'G-002', Status: 'Backlog', DependsOn: 'G-001', Priority: 'P2' }), taskRow({ TaskID: 'G-003', Status: 'Backlog', DependsOn: 'G-001', Priority: 'P0' })], {}, async (url) => {
-    assert.match((await call(url, '/api/next')).body.reason, /^Nothing is admitted\. The next runnable Backlog task is G-003: "tt start G-003" admits and starts it\.$/);
+    const next = (await call(url, '/api/next')).body;
+    assert.match(next.reason, /^Nothing is admitted\. The next runnable Backlog task is G-003: "tt start G-003" admits and starts it\.$/);
+    assert.deepEqual(next.runnableBacklog, ['G-003', 'G-002'], 'every runnable Backlog task, best first');
+  });
+  await withHub([taskRow({ TaskID: 'J-001', Status: 'Done' }), taskRow({ TaskID: 'J-002', Status: 'Backlog', DependsOn: 'J-001' }), taskRow({ TaskID: 'J-003', Status: 'Backlog', DependsOn: 'J-002' })], {}, async (url) => {
+    assert.deepEqual((await call(url, '/api/next')).body.runnableBacklog, ['J-002'], 'only the task whose dependencies are Done');
+  });
+  await withHub([taskRow({ TaskID: 'J-004', Status: 'In Progress', Implementer: 'someone' }), taskRow({ TaskID: 'J-005', Status: 'Backlog' })], {}, async (url) => {
+    assert.equal((await call(url, '/api/next')).body.runnableBacklog, undefined, 'nothing is listed while another task holds the lane');
   });
   await withHub([taskRow({ TaskID: 'H-001', Status: 'Done' }), taskRow({ TaskID: 'H-002', Status: 'Backlog', DependsOn: 'H-003' }), taskRow({ TaskID: 'H-003', Status: 'Deferred' })], {}, async (url) => {
-    assert.match((await call(url, '/api/next')).body.reason, /^Backlog tasks wait for unfinished dependencies: H-002 needs H-003.$/);
+    const waiting = (await call(url, '/api/next')).body;
+    assert.match(waiting.reason, /^Backlog tasks wait for unfinished dependencies: H-002 needs H-003.$/);
+    assert.equal(waiting.runnableBacklog, undefined);
   });
   await withHub([taskRow({ TaskID: 'F-001', Status: 'Done' }), taskRow({ TaskID: 'F-002', Status: 'Done' })], {}, async (url) => {
     assert.equal((await call(url, '/api/next')).body.reason, 'All 2 executable task(s) are Done.');
