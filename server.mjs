@@ -2269,7 +2269,7 @@ const server = createServer(async (request, response) => {
         const requestedName = String(body.name ?? '').trim();
         const content = String(body.content ?? '');
         const byteLength = Buffer.byteLength(content, 'utf8');
-        if (!requestedName) throw httpError(400, 'Missing required field: name. An artifact needs trackerRevision, name (a safe relative path such as evidence.md or logs/editor.log) and content (text, at most 128 KB).', 'missing-field');
+        if (!requestedName) throw httpError(400, 'Missing required field: name. An artifact needs trackerRevision, name (a safe relative path such as evidence.md or logs/engine.log) and content (text, at most 128 KB).', 'missing-field');
         if (!content) throw httpError(400, 'Missing required field: content. Artifacts are text, at most 128 KB; reference large or binary evidence by repository path or HTTPS URL inside an evidence artifact.', 'missing-field');
         if (byteLength > maxArtifactBytes) throw httpError(400, `Artifact content is ${byteLength} bytes; the limit is 128 KB (${maxArtifactBytes} bytes). Trim it or store the large file in the repository and reference its path.`, 'artifact-too-large');
         const artifactResult = await withRunLock(taskId, runId, async () => {

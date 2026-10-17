@@ -72,7 +72,7 @@ Spec: docs/milestones.md#m1       <!-- default SpecRef -->
 
 // ---- field variants ------------------------------------------------------------------------
 {
-  const parsed = parseTaskSet(`Milestone: M2\r\n\r\n## S-A: Story\r\n- Acceptance: a\r\n\r\n### T-010：全角冒号标题\r\n- Type: Bug\r\n- Authority: owner\r\n- Depends: T-001； T-002、T-003, T-004 T-005\r\n- Priority: p2\r\n- Parent: S-OTHER\r\n- Milestone: M9\r\n- Stream: Audio\r\n- Spec: docs/x.md\r\n- Acceptance: 一行\r\n`.replace(/^/, '﻿'));
+  const parsed = parseTaskSet(`Milestone: M2\r\n\r\n## S-A: Story\r\n- Acceptance: a\r\n\r\n### T-010：全角冒号标题\r\n- Type: Bug\r\n- Authority: owner\r\n- Depends: T-001； T-002、T-003, T-004 T-005\r\n- Priority: p2\r\n- Parent: S-OTHER\r\n- Milestone: M9\r\n- Stream: Audio\r\n- Spec: docs/x.md\r\n- Acceptance: 一行\r\n`.replace(/^/, '\uFEFF'));
   assert.deepEqual(parsed.errors, []);
   const bug = parsed.items[1];
   assert.deepEqual([bug.id, bug.kind, bug.title, bug.authority, bug.ownerRole, bug.priority, bug.parent, bug.milestone, bug.stream, bug.spec],

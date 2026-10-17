@@ -33,7 +33,7 @@ function csvCell(value) {
 }
 
 export function csvText(rows, { eol = '\n', bom = false } = {}) {
-  return `${bom ? '﻿' : ''}${[header, ...rows].map((row) => row.map(csvCell).join(',')).join(eol)}${eol}`;
+  return `${bom ? '\uFEFF' : ''}${[header, ...rows].map((row) => row.map(csvCell).join(',')).join(eol)}${eol}`;
 }
 
 // A throw-away instance directory under the OS temp dir. dispose() removes it;

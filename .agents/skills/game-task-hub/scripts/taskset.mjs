@@ -37,8 +37,8 @@ const KNOWN_FIELDS = new Map([
 
 const collapse = (text) => String(text).replace(/\s+/g, ' ').trim();
 // Join a wrapped continuation line; between two CJK characters no space belongs there.
-const CJK_END = /[　-鿿＀-￯]$/;
-const CJK_START = /^[　-鿿＀-￯]/;
+const CJK_END = /[\u3000-\u9FFF\uFF00-\uFFEF]$/;
+const CJK_START = /^[\u3000-\u9FFF\uFF00-\uFFEF]/;
 const joinWrapped = (left, right) => {
   const next = collapse(right);
   return CJK_END.test(left) && CJK_START.test(next) ? left + next : collapse(`${left} ${next}`);
@@ -55,7 +55,7 @@ export function splitList(value) {
 
 export function parseTaskSet(source, { docPath = '' } = {}) {
   // Blank out HTML comments but keep the line count, so error line numbers stay right.
-  const text = String(source).replace(/^﻿/, '').replace(/<!--[\s\S]*?-->/g, (match) => match.replace(/[^\n]/g, ''));
+  const text = String(source).replace(/^\uFEFF/, '').replace(/<!--[\s\S]*?-->/g, (match) => match.replace(/[^\n]/g, ''));
   const lines = text.split(/\r?\n/);
   const header = {};
   const items = [];

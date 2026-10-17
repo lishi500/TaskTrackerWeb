@@ -180,7 +180,7 @@ await runSuite('windows-robustness', async () => {
 
     let runId = await startRun('impl-lock');
     assert.equal((await closeRun(runId)).status, 200);
-    for (const reviewer of ['impl-lock', 'IMPL-LOCK', '  Impl-Lock  ', 'ＩMPL-LOCK', 'iMpL-lOcK']) {
+    for (const reviewer of ['impl-lock', 'IMPL-LOCK', '  Impl-Lock  ', '\uFF29MPL-LOCK', 'iMpL-lOcK']) {
       const result = await review(reviewer, { action: 'claim' });
       assert.equal(result.status, 409, `${JSON.stringify(reviewer)} must not review impl-lock`);
       assert.match(result.body.error, /distinct from the task Implementer and every agent that held a Run/);

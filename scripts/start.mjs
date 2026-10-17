@@ -26,7 +26,7 @@ if (unknown.length) {
   process.exit(1);
 }
 
-const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^﻿/, ''));
+const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^\uFEFF/, ''));
 const trackerPath = process.env.TRACKER_CSV ? resolve(process.env.TRACKER_CSV) : resolve(root, config.instance?.tracker ?? 'tracker/task_tracker.csv');
 const trackerDirectory = dirname(trackerPath);
 const urlFile = join(trackerDirectory, '.tracker-url');

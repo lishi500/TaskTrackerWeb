@@ -61,7 +61,7 @@ function instance() {
   if (!existsSync(join(root, 'server.mjs')) || !existsSync(join(root, 'task-hub.config.json'))) {
     fail('cannot find the tracker instance', `${root} has no server.mjs and task-hub.config.json (tt.mjs resolved to ${here})`, 'set TT_DIR to the <Game>-Tracker folder');
   }
-  const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^﻿/, ''));
+  const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^\uFEFF/, ''));
   const trackerDir = dirname(resolve(root, config.instance?.tracker ?? 'tracker/task_tracker.csv'));
   const port = config.instance?.port ?? derivePort(config.instance?.projectId || 'uninitialized');
   located = { root, config, trackerDir, projectId: config.instance?.projectId ?? '', port, urlFile: join(trackerDir, '.tracker-url'), pidFile: join(trackerDir, '.tracker-pid') };
@@ -241,7 +241,7 @@ function parseArgs(argv) {
 // a leading "@" that is not an existing file stays literal.
 function textArg(value) {
   if (typeof value === 'string' && value.startsWith('@') && value.length > 1 && existsSync(value.slice(1)) && statSync(value.slice(1)).isFile()) {
-    return readFileSync(value.slice(1), 'utf8').replace(/^﻿/, '').trim();
+    return readFileSync(value.slice(1), 'utf8').replace(/^\uFEFF/, '').trim();
   }
   return value;
 }
@@ -461,7 +461,7 @@ function readArtifactText(source) {
   }
   if (buffer.includes(0)) fail(`${source} is not a text file`, 'artifacts are UTF-8 text', 'attach a text summary and reference the binary by its repository path');
   if (buffer.length > MAX_ARTIFACT_BYTES) fail(`${source} is ${buffer.length} bytes`, `an artifact is limited to ${MAX_ARTIFACT_BYTES} bytes (128 KB)`, 'attach the relevant excerpt (for example the failing lines) and reference the full file by path');
-  return buffer.toString('utf8').replace(/^﻿/, '');
+  return buffer.toString('utf8').replace(/^\uFEFF/, '');
 }
 
 async function storeArtifact(id, runId, name, content) {

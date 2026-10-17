@@ -89,7 +89,7 @@ await writeFile(configPath, `${JSON.stringify({
   workflow: { serialLane: true, ownerGateTaskPattern: '^GATE-' },
 }, null, 2)}\n`);
 // The skeleton may be checked out with CRLF on Windows; the Hub writes LF.
-const skeleton = (await readFile(templatePath, 'utf8')).replace(/^﻿/, '').replace(/\r\n/g, '\n');
+const skeleton = (await readFile(templatePath, 'utf8')).replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
 await writeFile(trackerPath, args.empty ? `${skeleton.split('\n')[0]}\n` : skeleton);
 await writeFile(join(trackerDir, 'task_events.jsonl'), '');
 await mkdir(join(trackerDir, 'task-records'), { recursive: true });
