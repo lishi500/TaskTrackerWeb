@@ -1,4 +1,4 @@
-# Game Task Hub V1.3
+# Game Task Hub V1.4
 
 ## Purpose
 
@@ -32,8 +32,11 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - Controlled planned-task creation endpoint: a named Agent may add a complete, auditable `Backlog` task with a creation reason. The Hub validates the full proposed dependency graph atomically; creation never exposes a task as `Ready` or fabricates execution/review history.
 - Work-item typing: `Task`, `Bug`, and non-executable `Story`. A Story holds scope only; its status is derived as `Done` exactly when it has one or more direct Task/Bug children and all are `Done`, otherwise `Backlog`. Task/Bug may name a Story parent and retain ordinary execution semantics. Milestone remains a grouping field, not a work-item type.
 - Toolchain health board: Agents append Task/Run-linked reports with stable failure keys; the dashboard aggregates duplicate infrastructure failures across work, preserves all history, and lets an owner ACK only the current unacknowledged reports.
-- Repository-relative text artifact paths such as `logs/editor.log`; binary or large evidence remains a repository/HTTPS reference rather than an upload.
+- Repository-relative text artifact paths such as `logs/engine.log`; binary or large evidence remains a repository/HTTPS reference rather than an upload.
 - Dependency-graph audit endpoint: a deterministic, read-only report catches unknown or duplicate Task IDs, missing references, self/duplicate dependencies and dependency cycles before they become scheduling deadlocks.
+- Compact agent reads: `GET /api/health` (liveness, version, current `trackerRevision`), `GET /api/tasks` (filtered one-object-per-task list without the Evidence log) and `GET /api/next` (the claimable Ready task with its acceptance, or the reason there is none: what holds the serial lane and which command moves it).
+- Agent CLI `tt` (`.agents/skills/game-task-hub/scripts/tt.mjs`): discovers the instance and URL, starts the server when it is down, sends the required headers, re-reads `trackerRevision` before every write and retries stale/locked/`EPERM` responses, and exposes the whole lifecycle as short commands. `tt import` creates Stories and Tasks from a task-set markdown document (idempotent, validated before any write). It adds no workflow rule: every transition still goes through the HTTP contract below.
+- Stable endpoint discovery: the server listens on a fixed port (`PORT` environment variable, else `instance.port` in `task-hub.config.json`, else a port in 4300-4999 derived from `instance.projectId`) and itself writes `tracker/.tracker-url` and `tracker/.tracker-pid` after it listens, removing them on a clean exit. A second launch for the same instance reports the running URL and exits 0.
 
 ## Workflow safety rules
 
@@ -52,6 +55,10 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 - A dependency revision is not an admission shortcut: it accepts only `Backlog` or `Blocked` tasks with no active Run or review claim; a historical `Implementer` retained by a closed blocked Run is not an active claim. It replaces the complete semicolon-delimited `DependsOn` list, requires a changed list and appends old/new lists plus the reason to Evidence. It atomically rejects unknown IDs, self/duplicate edges and cycles, preserving the CSV on failure. It cannot revise an admitted `Ready`, active, reviewed or completed task.
 - A planned-work-item creation is not an admission shortcut: it requires the standard 19-column tracker schema, a unique safe Task ID, complete task contract and named creation reason; its only initial status is `Backlog`. Unknown dependencies, duplicate Task IDs and dependency cycles fail the atomic mutation. The caller must separately apply project Gate policy and use `/admit` before the task can be claimed.
 - A planned-work-item creation requires the standard 19-column schema including `TaskType` and `CompletionAuthority`. Story must have no parent/dependencies and use `NotApplicable`; Task/Bug must use `IndependentReviewerAgent` or `DecisionOwner`, may have only an existing Story as parent, and cannot depend on a Story. Story cannot enter admit, Run, review, block, owner-wait, evaluation or owner-feedback disposition transitions. Its status is a cached projection of direct Task/Bug completion: it is `Done` only when the direct child set is non-empty and all are `Done`, and returns to `Backlog` when a direct child is created. A read projects this without writing; the next authorized task mutation persists any correction with Evidence. The primary milestone view nests direct children below their Story, displays the direct `Done / total` count and excludes Story from operational status counts. This is scope completion, never product acceptance.
+- Local-only guards: while bound to loopback, a request whose `Host` is not `127.0.0.1`, `localhost` or `[::1]` is refused with 403 (DNS-rebinding guard). A mutation's `Origin` must be `http://127.0.0.1:P`, `http://localhost:P` or `http://[::1]:P` for the server port `P` (a configured non-loopback bind host is also accepted, as before). Agent-written artifacts are served as plain text under `Content-Security-Policy: sandbox`; HTML/SVG/XML never execute with the dashboard origin.
+- Windows durability: the atomic CSV/Run/intent replace retries `rename` on `EPERM`/`EBUSY`/`EACCES` (8 attempts, about 2 s in total). Lock files record `{pid, host, createdAt, token}`; a lock whose holder pid is not running on the same host, or that is older than 120 s (10 s when unreadable), is replaced automatically, and a lock that is genuinely held answers 409 naming the holder and its age. The CSV is read with any UTF-8 BOM removed and CRLF accepted, and always written with LF and no BOM. Task and Run ids must not be Windows device names (`CON PRN AUX NUL COM1-9 LPT1-9`, any case, with or without an extension), must not consist only of dots and must not end with a dot.
+- Reviewer independence compares normalized names (trim, Unicode compatibility fold, case, inner whitespace) against the task's `Implementer` and every agent that held a non-abandoned Run on it; the claim and the decision must come from the same normalized reviewer.
+- Error contract: client mistakes are 4xx with a message that names the missing or invalid field and, where useful, the expected format, plus a machine-readable `code`: an empty, `null`, non-object, invalid JSON or non-UTF-8 body, malformed %-encoding, an unknown or comma-separated dependency (`DependsOn` is joined by `;`), a missing Run or artifact, a missing `agent`/`reviewer`/`actor` field. `trackerRevision is required` is 400 and `trackerRevision is stale (current: X)` is 409. An unexpected 500 never contains an absolute path (the full error stays in the server log).
 - `failureKey` identifies the failure class, not a single stack trace. ACK records the total reports seen at that moment; a later report becomes a new active count while the acknowledged count remains visible for recurrence context.
 
 ## Acceptance
@@ -65,17 +72,26 @@ An Agent execution is a child **Run** under `tracker/task-records/<TaskID>/<Task
 7. Generic pre-claim block and dependency-unblock transitions retain evidence but do not silently apply game-specific workflow policy.
 8. Serial mode exposes at most one active Agent task and only one armed successor; ambiguous branches and future work remain Backlog.
 9. A dependency audit identifies malformed CSV structure, unknown/self/duplicate dependencies, duplicate Task IDs and deterministic cycle paths; normal reads and mutations reject an invalid graph without modifying it.
-10. `node scripts/start.mjs` selects a loopback port; `node scripts/test-managed-runs.mjs`, `node scripts/test-serial-lane.mjs` and `node scripts/test-dependency-audit.mjs` verify isolated Run/review, serial-transition and dependency-integrity contracts.
+10. `node scripts/start.mjs` starts the Hub on its fixed port and prints the URL as its first line (`--detach` runs it in the background); `node scripts/test-managed-runs.mjs`, `node scripts/test-serial-lane.mjs` and `node scripts/test-dependency-audit.mjs` verify isolated Run/review, serial-transition and dependency-integrity contracts.
 11. A contract revision rejects incomplete, unchanged, claimed or active-task edits; an allowed revision atomically retains status/history while recording the complete changed contract and reason.
 12. Planned-work-item creation preserves a valid dependency graph, starts only in `Backlog`, records provenance and remains subject to normal admission.
 13. A Story can organize child Task/Bug items but cannot be made executable; its derived `Done` tracks only direct-child scope completion and returns to `Backlog` when new direct work is planned; Milestone remains an independent grouping dimension.
 14. Reports sharing a toolchain failure key aggregate across tasks; ACK clears only the active alert count, and a later report retains the acknowledged history.
 15. Owner feedback cannot strand an executable task: `DecisionOwner` work is resolved through owner-evaluation; `IndependentReviewerAgent` work receives an auditable disposition to resume, block, or return it to an owner-facing state. Resume requires a fresh Run and independent review before `Done`.
+16. On Windows the dashboard loads `styles.css` and `app.js` with the right content types, directory and device-name requests are 404, and path traversal is refused (`scripts/test-static-assets.mjs`).
+17. A killed server never wedges the tracker: a lock whose holder is gone is replaced, a transient `EPERM` on the CSV replace is retried, a BOM/CRLF CSV is readable, and reserved device names are not accepted as ids (`scripts/test-windows-robustness.mjs`).
+18. Cross-origin, wrong-Host, malformed and incomplete requests get a specific 4xx rather than a 500 (`scripts/test-http-hardening.mjs`); `GET /api/health`, `/api/tasks` and `/api/next` are covered by `scripts/test-agent-api.mjs`.
+19. The port is fixed per project, the discovery files follow the server's life cycle, and a second launch does not create a second server (`scripts/test-start-init.mjs`).
+20. `link-game-skill.mjs` links through a junction without administrator rights, is idempotent, refuses foreign targets and real directories, and leaves no empty directories on failure (`scripts/test-link-game-skill.mjs`).
+21. `tt` completes the lifecycle end to end (import, start, event, artifact, done with evidence, independent review, owner-gate outcome, parallel writers, a killed server, a junction-linked skill) from a path containing spaces and Chinese characters (`scripts/test-tt.mjs`, `scripts/test-taskset.mjs`).
 
 ## API contract
 
 ```text
+GET  /api/health
 GET  /api/instance
+GET  /api/tasks?status=&milestone=&type=&parent=&limit=
+GET  /api/next
 GET  /api/tasks/<TaskID>/packet
 GET  /api/dependency-audit
 GET  /api/toolchain-issues
@@ -100,6 +116,10 @@ POST /api/tasks/<TaskID>/owner-evaluation
 POST /api/tasks/<TaskID>/owner-feedback-disposition
 POST /api/feedback
 ```
+
+`GET /api/health` returns `{ ok, tool: "task-hub", toolVersion, projectId, projectName, trackerRevision, serialLane, startedAt, pid, instanceId, trackerError? }` with status 200 whenever the server is up; `ok:false` with `trackerError` means the CSV is missing or fails the audit (`trackerRevision` is null only when it is unreadable). `GET /api/tasks` returns `{ trackerRevision, total, count, truncated, tasks:[{ taskId, taskType, status, milestone, parentId, dependsOn, blocker, title, priority, completionAuthority, activeRun }] }`; `status` accepts a comma-separated list, matching is case-insensitive, `limit` is 1-2000 (default 500) and an unknown query parameter is a 400. `GET /api/next` returns `{ trackerRevision, next, reason, blockedBy? }`: `next` is the highest-priority (then file order) `Ready` Task/Bug whose dependencies are Done, with `acceptance` and `specRef`; otherwise it is `null` and `reason` lists what is In Review, In Progress, waiting for the owner or blocked, or which Backlog task could be started next.
+
+The task-set markdown read by `tt import` is a planning document, not a state store: a `# Tasks` title, a header (`Milestone`, `Stream`, `Lane: slice|prototype`, `Spec`), `## ID: title` Stories and `### ID: title` Tasks (`- Type: Bug` for a Bug) with `Depends`, `Authority: reviewer|owner`, `Priority`, `Acceptance`, `Spec`, `Parent` and informational fields that are never imported. Ids match `[A-Z][A-Z0-9]*-[A-Za-z0-9-]+`. The importer creates Stories first, then Tasks in dependency order, as `Backlog` through `POST /api/tasks`; existing ids are skipped and never modified; a cycle, an unknown dependency, a missing acceptance or a `Lane: prototype` document stops the import before anything is written.
 
 `/close` takes `outcome`, `summary`, current `trackerRevision`, and `blocker` for `blocked`. For `awaiting-human`, it additionally takes `ownerStatus` exactly equal to `Awaiting Owner` or `Awaiting Owner Gate`. `/review` first takes `{ action: "claim", reviewer }`, then `{ action: "decision", reviewer, decision, notes }`; a blocked decision also needs `blocker`. `/unblock` requires `agent` and a concrete `reason`; callers must perform project-specific eligibility checks before using it. `/owner-evaluation` accepts `agent`, `decision` (`approved`, `blocked`, `deferred`, `return-to-owner`) and evidence-bearing `notes`; it is only available after owner feedback for `CompletionAuthority=DecisionOwner` work.
 

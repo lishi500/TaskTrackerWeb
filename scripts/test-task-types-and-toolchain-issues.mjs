@@ -178,15 +178,15 @@ try {
   const csvBeforeIssues = await readFile(trackerPath, 'utf8');
 
   const reportOne = await request('/api/toolchain-issues', mutation({
-    taskId: 'TYPE-001', reporter: 'unity-agent', failureKey: 'unity.cli.editor-play-timeout', toolchain: 'unity-cli',
-    operation: 'editor_play', summary: 'Unity command timed out before play-mode evidence was available.', evidenceRef: 'logs/editor.log',
+    taskId: 'TYPE-001', reporter: 'tool-agent', failureKey: 'godot.headless.import-timeout', toolchain: 'godot-cli',
+    operation: 'headless_import', summary: 'Engine command timed out before play-mode evidence was available.', evidenceRef: 'logs/engine.log',
   }));
   assert.equal(reportOne.response.status, 201);
   assert.equal(reportOne.body.issue.unacknowledgedCount, 1);
 
   const reportTwo = await request('/api/toolchain-issues', mutation({
-    taskId: 'TYPE-CHILD-001', reporter: 'unity-agent', failureKey: 'unity.cli.editor-play-timeout', toolchain: 'unity-cli',
-    operation: 'editor_play', summary: 'Unity command timed out before play-mode evidence was available.',
+    taskId: 'TYPE-CHILD-001', reporter: 'tool-agent', failureKey: 'godot.headless.import-timeout', toolchain: 'godot-cli',
+    operation: 'headless_import', summary: 'Engine command timed out before play-mode evidence was available.',
   }));
   assert.equal(reportTwo.response.status, 201);
   assert.equal(reportTwo.body.issue.unacknowledgedCount, 2);
@@ -197,19 +197,19 @@ try {
   assert.equal(beforeAck.body.issues[0].totalReportCount, 2);
 
   const eventsBeforeStaleAck = await readFile(join(sandbox, 'toolchain_issue_events.jsonl'), 'utf8');
-  const missingCountAck = await request('/api/toolchain-issues/unity.cli.editor-play-timeout/ack', mutation({
+  const missingCountAck = await request('/api/toolchain-issues/godot.headless.import-timeout/ack', mutation({
     acknowledger: 'owner', notes: 'An ACK must describe the reports actually inspected.',
   }));
   assert.equal(missingCountAck.response.status, 400);
-  const staleAck = await request('/api/toolchain-issues/unity.cli.editor-play-timeout/ack', mutation({
+  const staleAck = await request('/api/toolchain-issues/godot.headless.import-timeout/ack', mutation({
     acknowledger: 'owner', notes: 'This page saw one report before a second one arrived.', expectedReportCount: 1,
   }));
   assert.equal(staleAck.response.status, 409);
   assert.equal(await readFile(join(sandbox, 'toolchain_issue_events.jsonl'), 'utf8'), eventsBeforeStaleAck);
   assert.equal((await request('/api/toolchain-issues')).body.issues[0].unacknowledgedCount, 2);
 
-  const acknowledged = await request('/api/toolchain-issues/unity.cli.editor-play-timeout/ack', mutation({
-    acknowledger: 'owner', notes: 'Investigate the Unity command runner before scheduling more play-mode verification.', expectedReportCount: 2,
+  const acknowledged = await request('/api/toolchain-issues/godot.headless.import-timeout/ack', mutation({
+    acknowledger: 'owner', notes: 'Investigate the engine command runner before scheduling more play-mode verification.', expectedReportCount: 2,
   }));
   assert.equal(acknowledged.response.status, 200);
   assert.equal(acknowledged.body.issue.unacknowledgedCount, 0);
@@ -217,8 +217,8 @@ try {
   assert.equal((await request('/api/toolchain-issues')).body.issues.length, 0);
 
   const recurrence = await request('/api/toolchain-issues', mutation({
-    taskId: 'BUG-CHILD-001', reporter: 'unity-agent', failureKey: 'unity.cli.editor-play-timeout', toolchain: 'unity-cli',
-    operation: 'editor_play', summary: 'Unity command timed out again after the prior investigation.',
+    taskId: 'BUG-CHILD-001', reporter: 'tool-agent', failureKey: 'godot.headless.import-timeout', toolchain: 'godot-cli',
+    operation: 'headless_import', summary: 'Engine command timed out again after the prior investigation.',
   }));
   assert.equal(recurrence.response.status, 201);
   assert.equal(recurrence.body.issue.unacknowledgedCount, 1);
@@ -230,24 +230,24 @@ try {
   assert.equal(history.body.issues[0].unacknowledgedCount, 1);
   assert.equal(history.body.issues[0].acknowledgedReportCount, 2);
 
-  const recurrenceAck = await request('/api/toolchain-issues/unity.cli.editor-play-timeout/ack', mutation({
+  const recurrenceAck = await request('/api/toolchain-issues/godot.headless.import-timeout/ack', mutation({
     acknowledger: 'owner', notes: 'The recurring failure is acknowledged and routed for a new diagnostic pass.', expectedReportCount: 3,
   }));
   assert.equal(recurrenceAck.response.status, 200);
   assert.equal(recurrenceAck.body.issue.unacknowledgedCount, 0);
   assert.equal(recurrenceAck.body.issue.acknowledgedReportCount, 3);
-  const duplicateAck = await request('/api/toolchain-issues/unity.cli.editor-play-timeout/ack', mutation({
+  const duplicateAck = await request('/api/toolchain-issues/godot.headless.import-timeout/ack', mutation({
     acknowledger: 'owner', notes: 'There is no newer report to acknowledge.', expectedReportCount: 3,
   }));
   assert.equal(duplicateAck.response.status, 409);
 
   const badOrigin = await request('/api/toolchain-issues', mutation({
-    taskId: 'TYPE-001', reporter: 'unity-agent', failureKey: 'unity.cli.bad-origin', toolchain: 'unity-cli',
-    operation: 'editor_play', summary: 'Must be rejected before it becomes an event.',
+    taskId: 'TYPE-001', reporter: 'tool-agent', failureKey: 'godot.headless.bad-origin', toolchain: 'godot-cli',
+    operation: 'headless_import', summary: 'Must be rejected before it becomes an event.',
   }, 'http://example.test'));
   assert.equal(badOrigin.response.status, 403);
 
-  const unknownAck = await request('/api/toolchain-issues/unity.cli.unknown/ack', mutation({ acknowledger: 'owner', notes: 'No matching alert.', expectedReportCount: 1 }));
+  const unknownAck = await request('/api/toolchain-issues/godot.headless.unknown/ack', mutation({ acknowledger: 'owner', notes: 'No matching alert.', expectedReportCount: 1 }));
   assert.equal(unknownAck.response.status, 404);
   assert.equal(await readFile(trackerPath, 'utf8'), csvBeforeIssues, 'Reports and ACKs must not change task state or its revision.');
 

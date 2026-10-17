@@ -17,7 +17,7 @@ Hub 将 `DependsOn` 视为一个必须无环的任务图，而不是只在 UI �
 对于通过编辑器或脚本在 Hub 外修改 CSV 的情况，使用只读审计接口：
 
 ```bash
-curl http://127.0.0.1:4173/api/dependency-audit
+curl "$(cat tracker/.tracker-url)/api/dependency-audit"   # PowerShell: curl.exe (Get-Content tracker\.tracker-url)/api/dependency-audit
 ```
 
 它始终返回 `200` 和结构化报告，即使 CSV 已不合法；`valid: false` 时检查 `csvErrors`（包括 `task-type`、`story-structure`、`story-parent`、`story-dependency`）、`unknownDependencies`、`selfDependencies`、`duplicateTaskIds`、`duplicateDependencies` 与 `cycles`。每个环会以稳定的 TaskID 路径表示，例如 `TASK-001 -> TASK-002 -> TASK-003 -> TASK-001`。普通 API 读取和所有写入则拒绝这类 CSV，并在 `422` 响应中附同一份 `dependencyAudit`，防止图错误演变为无提示的等待死锁。
@@ -27,17 +27,74 @@ CSV 仍应只由 Hub 写入。外部批量迁移或人工维护不可避免时�
 ## 新建和启动实例
 
 ```bash
-node scripts/init-instance.mjs --project-id my-game --project-name "My Game"
-node scripts/start.mjs
+node scripts/init-instance.mjs --project-id my-game --project-name "My Game" --empty --port 4321
+node scripts/start.mjs --detach      # 后台启动，只打印 URL；之后任何 tt 命令也会自动启动服务
 ```
 
-启动脚本默认只监听 loopback 并选择可用端口。需要稳定 URL 时可用 `PORT=4300 node scripts/start.mjs`；`TRACKER_CSV` 仅用于迁移或隔离测试，不能把一套实例伪装成多项目 Tracker。
+- `--empty` 只写 CSV 表头（不带示例行）；省略时会复制 skeleton 示例行，真实使用前需替换。`--port` 省略时由 `project-id` 在 4300–4999 内稳定推导（该端口当下被占用则顺延到下一个空闲端口），并写入 `task-hub.config.json` 的 `instance.port`。
+- **端口固定**：优先级为环境变量 `PORT` > `instance.port` > 由 `projectId` 推导的稳定端口，所以同一项目每次启动 URL 都不变（不再随机）。`TRACKER_CSV` 仅用于迁移或隔离测试，不能把一套实例伪装成多项目 Tracker。
+- **URL 发现**：服务监听成功后自己写入 `tracker/.tracker-url`（URL）和 `tracker/.tracker-pid`，正常退出时删除；被强杀留下的旧文件会在下次启动时被覆盖。无论用 `start.mjs`、`node server.mjs` 还是别的方式启动都一样。`start.mjs` 的第一行输出就是 URL；`--detach` 在后台运行（日志在 `tracker/server.log`）并在服务可用后只打印 URL；对同一实例重复启动只会打印正在运行的 URL。这些运行时文件由 `tracker/.gitignore` 忽略。
+- 服务只监听 loopback。绑定回环地址时，`Host` 头不是 `127.0.0.1`、`localhost`、`[::1]` 会返回 403（防 DNS rebinding）；写请求的 `Origin` 同样接受这三种写法（端口须一致）。Dockerfile 里的 `HOST=0.0.0.0` 没有任何认证，只应在容器内使用，并把端口只发布到本机：`docker run -p 127.0.0.1:4173:4173 ...`。
 
 让游戏仓库内的 Agent 使用此实例的当前 Skill：
 
 ```bash
-node scripts/link-game-skill.mjs /absolute/path/to/game-repository
+node scripts/link-game-skill.mjs /absolute/path/to/game-repository [--agents] [--no-claude] [--force]
 ```
+
+Windows 上创建**目录 junction**（不需要管理员权限或开发者模式），默认链接到 `<game>/.claude/skills/game-task-hub`（Claude Code 读取的位置）；`--agents` 额外链接 `<game>/.agents/skills/game-task-hub`（Codex）。重复执行是幂等的；目标已经是指向别处的链接时需要 `--force` 才会改指；真实目录/文件永远不会被替换；失败时不会留下空目录。链接路径会写入 `<game>/.git/info/exclude`。
+
+## Agent 命令行 `tt`
+
+Agent 不需要手写 HTTP。`tt`（零依赖、Node ≥ 22）位于 Skill 内 `.agents/skills/game-task-hub/scripts/tt.mjs`（实例根目录另有入口 `scripts/tt.mjs`），通过自身真实路径（会跟随 junction）定位实例，读取 `tracker/.tracker-url`（环境变量 `TT_URL`、`TT_DIR` 可覆盖），服务未启动时自动后台启动；自动补全 `Origin`/`Content-Type`，**每次写入前重读 `trackerRevision`**，对 409（revision 过期、锁被占用）和 Windows 的 `EPERM`/`EBUSY` 自动重试（最多 6 次）；中文参数与输出按 UTF-8 处理。输出是简短的单行文本，`--json` 输出原始 JSON；错误格式为 `tt: <出了什么问题> - <原因> - try: <下一条命令>`，退出码 1。
+
+标准流程（一个任务，约 5 条命令）：
+
+```text
+tt import docs/tasks/m1.md --admit-first          # 从任务集 Markdown 创建 Story/Task 并 admit 第一个可执行任务
+tt start T-001                                    # 必要时先 admit，再开启 Run
+tt event T-001 note ok "抛物线完成"                # 可选
+tt done T-001 "完成抛竿并验证" --evidence reports/last-check.md   # -> In Review
+tt review T-001 approve "核对了验收条件"            # 独立评审人；通过后打印下一个任务
+```
+
+| 命令 | 作用 |
+| --- | --- |
+| `up` · `down` · `url` · `status [--brief]` · `doctor` | 服务生命周期、概况、自检（过期锁、BOM/CRLF、版本不一致） |
+| `ls [--status S] [--milestone M] [--type T] [--parent ID]` · `show ID` · `next` | 列表（每行一个任务）、紧凑任务包（≤ 40 行）、下一个可领取任务或"为什么没有" |
+| `import FILE [--dry-run] [--admit-first]` | 按任务集格式批量创建（幂等，已存在的 ID 跳过且不修改；循环依赖/未知依赖在写入前报错） |
+| `new ID "标题" --accept "…" [--type Task\|Bug\|Story] [--parent S] [--deps "A;B"] [--auth reviewer\|owner] [--prio P1] [--milestone M] [--stream X] [--spec PATH]` | 创建单个工作项（Backlog） |
+| `admit` · `park` · `block ID "原因"` · `unblock` | 状态流转 |
+| `start ID [--profile …] [--scope …] [--expect …]` | 领取（同一 Agent 重复执行是幂等的，打印已有 Run） |
+| `event ID [RUN] TYPE RESULT "说明"` · `art ID [RUN] NAME FILE\|-` | 事件与文本证据（≤ 128 KB，同名不同内容会自动改名） |
+| `done ID ["摘要"] [--evidence FILE]… [--no-evidence] [--outcome verified\|blocked\|incomplete\|awaiting-human] [--blocker …] [--owner-status …]` | 先存证据再关闭 Run；`reports/last-check.md` 比 Run 开始时间新时自动附加；`DecisionOwner` 任务默认 `awaiting-human` |
+| `review ID approve\|reject\|block "说明" [--as NAME]` | claim + decision 一步完成；评审名默认 `reviewer-xxxx`（或 `TT_REVIEWER`），与实现者重名（忽略大小写/空格）会被本地和服务器同时拒绝 |
+| `issue ID "摘要" --key K --toolchain T --op O` | 工具链故障上报（稳定 key，如 `godot.headless.import-timeout`） |
+
+环境变量：`TT_AGENT`（实现者名，默认 `claude`）、`TT_REVIEWER`、`TT_URL`、`TT_DIR`。文本参数写成 `"@文件.md"` 时从文件读取。PowerShell 5.1 若把中文输出显示成 `?`，先执行 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`；Git Bash 无此问题。
+
+**任务集格式**（`docs/tasks/<milestone>.md`，`tt import` 读取；导入后任务*状态*以 Hub 为准，文档只保留任务*意图*）：
+
+```markdown
+# Tasks: M1 原型
+Milestone: M1
+Stream: 玩法                  <!-- 默认 Workstream，可选 -->
+Lane: slice                   <!-- slice 进入 Hub；prototype 只是清单，tt import 会拒绝 -->
+Spec: docs/milestones.md#m1   <!-- Story 的默认 SpecRef，可选 -->
+
+## S-FISH: 抛竿与收线原型        <!-- "## ID: 标题" = Story -->
+- Acceptance: 玩家可观察的整体结果（一段话）
+- Spec: docs/systems/cast-reel.md
+
+### T-001: 抛竿动作              <!-- "### ID: 标题" = Task；加 "- Type: Bug" 为 Bug；父级 = 最近的前一个 Story 或 "- Parent:" -->
+- Depends: T-000; T-002         <!-- 可选，";" 或 "," 分隔 -->
+- Authority: reviewer           <!-- reviewer（默认，独立评审）| owner（人类试玩/取舍） -->
+- Priority: P1
+- Acceptance: 玩家可观察的结果
+- Effort / Profile / Why / Decisions / Uncertainty: 仅作文档备注，不进入 Hub
+```
+
+规则：ID 形如 `T-001`（`[A-Z][A-Z0-9]*-[A-Za-z0-9-]+`，Windows 保留名不可用）；任务 `SpecRef` 默认是 `<文档路径>#<小写 ID>`；多行值折叠为一行；先建 Story，再按 `Depends` 拓扑序建 Task；全部以 Backlog 创建，`--admit-first` 额外 admit 第一个可执行任务；全文件检查通过后才开始写入。
 
 ## 升级既有实例
 
@@ -64,7 +121,7 @@ node scripts/sync-template.mjs --target /absolute/path/to/existing-game-tracker 
 
 ## 状态、Run 与审查
 
-Agent 先读取 `GET /api/tasks/<TaskID>/packet`。packet 给出任务、依赖/反向依赖、既有 Run 与当前 `trackerRevision`；所有任务写操作必须使用这个 revision、`Content-Type: application/json` 与同源 `Origin`。
+Agent 先读取 `GET /api/tasks/<TaskID>/packet`。packet 给出任务、依赖/反向依赖、既有 Run 与当前 `trackerRevision`；所有任务写操作必须使用这个 revision、`Content-Type: application/json` 与同源 `Origin`（`127.0.0.1`、`localhost`、`[::1]` 加同一端口均视为同源）。缺少 `trackerRevision` 返回 400（`trackerRevision is required`），过期返回 409（`trackerRevision is stale (current: …)`，附当前值）。
 
 这里的 revision 要求适用于任务写入；工具链事件使用独立的并发契约，见下文。任务包的 `packet.context.story` 带入已解析的父 Story 目标、Acceptance、SpecRef 与 Milestone；读取 Story 时，`context.children` 给出直接 Task/Bug 子项。Story 状态在读取时由同一 CSV 的直属子项投影，且只会随授权写入持久化，不会因 GET 改写 CSV；它不将 Story 变成执行依赖。将切片的行为契约放进 SpecRef，并设置明确的集成验收 Task；Story 的 `Done` 不能代替整体玩家路径验收。
 
@@ -75,9 +132,9 @@ Agent 先读取 `GET /api/tasks/<TaskID>/packet`。packet 给出任务、依赖/
 - `incomplete` → 保持 `In Progress`，并记录缺失证据；
 - `awaiting-human` → 调用者必须显式提供 `ownerStatus: "Awaiting Owner"` 或 `"Awaiting Owner Gate"`；模板不会根据 Task ID 猜测项目流程。
 
-Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用的 `Abandoned` Run，CSV 已提交但 Run 未收尾时会在后续操作前恢复。文本 artifact 每份最多 128 KB、每 Run 最多 32 份/512 KB；可用安全相对路径如 `logs/editor.log`、`test-results.xml`、`evidence.md`。二进制、大型构建产物或截图应在 evidence 中记录仓库相对路径或 HTTPS 引用。
+Run claim/close 均保存可恢复 intent；预提交中断会留下不可复用的 `Abandoned` Run，CSV 已提交但 Run 未收尾时会在后续操作前恢复。文本 artifact 每份最多 128 KB、每 Run 最多 32 份/512 KB；可用安全相对路径如 `logs/engine.log`、`test-results.xml`、`evidence.md`。二进制、大型构建产物或截图应在 evidence 中记录仓库相对路径或 HTTPS 引用。
 
-独立审查使用 `POST /api/tasks/<TaskID>/review`：reviewer 先 `action: "claim"`，再提交 `action: "decision"` 及 `approved`、`rejected` 或 `blocked`。reviewer 必须不同于 `Implementer`；批准才会进入 `Done`，可修复的拒绝回到 `Ready`，阻断审查需要具体 blocker。在 serial lane 中，批准只自动推进唯一且依赖齐全的直接后继；多个候选保持 `Backlog`，由有权限的调用方按项目 Gate 显式 admit，不会批量解锁。
+独立审查使用 `POST /api/tasks/<TaskID>/review`：reviewer 先 `action: "claim"`，再提交 `action: "decision"` 及 `approved`、`rejected` 或 `blocked`。reviewer 必须不同于 `Implementer` 以及所有曾在该任务上持有 Run 的 Agent（比较前先 trim、折叠空白、忽略大小写与全角差异，所以 `IMPL-LOCK` 不能评审 `impl-lock` 的任务；被放弃的 claim 不计）；批准才会进入 `Done`，可修复的拒绝回到 `Ready`，阻断审查需要具体 blocker。在 serial lane 中，批准只自动推进唯一且依赖齐全的直接后继；多个候选保持 `Backlog`，由有权限的调用方按项目 Gate 显式 admit，不会批量解锁。
 
 状态语义分开使用：`Blocked` 表示已经纳入近期执行链、但有具体可行动的前置/环境/规则阻碍；`Backlog` 表示已规划但尚未纳入近期执行链的工作，不能出现在 blocker 监控里，也不能领取。不要把“未来 Milestone 尚未开放”写成 `Blocked`。
 
@@ -103,23 +160,49 @@ Owner 反馈仍只作为原始 Evidence 写入，并转为 `Awaiting Agent Evalu
 
 ## 工具链问题看板
 
-`tracker/toolchain_issue_events.jsonl` 是跨任务工具链健康事件的追加式权威，不是第二套任务状态。Agent 在某一 Task/Run 上遇到可复现的工具链故障时，调用 `POST /api/toolchain-issues`，至少提供 `{ taskId, runId?, failureKey, reporter, toolchain, operation, summary }`；`failureKey` 必须是稳定小写标识符，例如 `unity.cli.editor-play-timeout`，不能用含时间戳、绝对路径或原始错误全文的字符串。
+`tracker/toolchain_issue_events.jsonl` 是跨任务工具链健康事件的追加式权威，不是第二套任务状态。Agent 在某一 Task/Run 上遇到可复现的工具链故障时，调用 `POST /api/toolchain-issues`，至少提供 `{ taskId, runId?, failureKey, reporter, toolchain, operation, summary }`；`failureKey` 必须是稳定小写标识符，例如 `godot.headless.import-timeout`，不能用含时间戳、绝对路径或原始错误全文的字符串。
 
 看板按 `failureKey` 聚合多个任务的报告。Owner 使用 `POST /api/toolchain-issues/<failureKey>/ack` 提交 `{ acknowledger, notes, expectedReportCount }`，其中 `expectedReportCount` 必须是刚查看的该问题 `totalReportCount`。缺少/非法计数返回 400；期间有新报告则返回 409 且不写 ACK，需刷新并查看新报告后再确认。旧 ACK 调用方必须补充此字段；报告接口不变。ACK 是确认/处理动作，不等于已经修复，也不改变任务状态或解除 blocker。
 
 ACK 后问题从默认看板隐藏但历史不删除；同一 key 重现时显示 `1 (5)`，分别表示 1 个新报告和此前已 ACK 的 5 个报告。使用页面“包含已 ACK 的历史”或 `GET /api/toolchain-issues?includeAcknowledged=true` 可审计历史聚合项。报警源读取失败会明确显示不可用，任务看板仍可加载；不可用不显示为零报警。一次命令的轮询不是多次故障报告，告警计数也不是独立根因数。
+
+## Windows 注意事项
+
+这些问题在 Windows 上实测出现过，现在都有回归测试：
+
+- **网页样式**：静态资源的目录包含判断改为与路径分隔符无关（之前 `/app.js`、`/styles.css` 在 Windows 上返回 403，页面没有样式）；目录、设备名（`NUL`、`CON`）一律 404，路径穿越仍被拒绝。
+- **写入健壮性**：原子替换（rename）遇到杀毒软件/索引器/读取方的短暂句柄（`EPERM`/`EBUSY`/`EACCES`）时最多重试 8 次（约 2 秒）；锁文件记录 `{pid, host, createdAt}`，持有者进程已不存在（或锁超过 120 秒）时自动替换，真正被占用时的 409 会写明持有者与时长，不再需要手动删除 `.lock`。
+- **CSV**：读取时去掉 UTF-8 BOM（Excel 的 "CSV UTF-8"）并接受 CRLF；写入统一为 LF、无 BOM。仓库带 `.gitattributes`（`* text=auto eol=lf`），避免 `core.autocrlf=true` 把 shebang 和 skeleton 变成 CRLF。
+- **TaskID / RunID**：会成为 `tracker/task-records/` 下的目录名，所以拒绝 Windows 设备名（`CON PRN AUX NUL COM1-9 LPT1-9`，大小写不限、可带扩展名）、以 `.` 结尾或全是点的 ID。
+- **错误信息**：客户端错误一律返回 4xx 并指出缺少/非法的字段，不再返回 500（空/`null` 请求体、非 UTF-8 请求体、非法 `%` 编码、未知依赖、缺少的 Run/artifact、缺少 `agent`/`reviewer` 字段）；`DependsOn` 相关错误提示用 `;` 分隔；意外的 500 不会泄露绝对路径。
+- **PowerShell 5.1**：`curl.exe -d` 和 `Invoke-RestMethod` 会弄坏 JSON 引号和中文，请用 `tt`、Node `fetch` 或 UTF-8 文件；`.ps1` 脚本必须是纯 ASCII（或带 BOM）。
 
 ## 验证
 
 ```bash
 node --check server.mjs
 node --check public/app.js
+node scripts/test-all.mjs             # 依次运行下面所有测试，每个套件一个进程，任何失败则退出码为 1
+```
+
+也可单独运行：
+
+```bash
 node scripts/test-managed-runs.mjs
 node scripts/test-serial-lane.mjs
 node scripts/test-dependency-audit.mjs
 node scripts/test-task-types-and-toolchain-issues.mjs
 node scripts/test-delivery-context.mjs
 node scripts/test-template-sync.mjs
+node scripts/test-static-assets.mjs        # Windows 静态资源、Content-Type、路径穿越
+node scripts/test-windows-robustness.mjs   # rename 重试、陈旧/占用锁、BOM+CRLF、保留名、评审身份归一化
+node scripts/test-http-hardening.mjs       # Origin 别名、Host 校验、无 500 的客户端错误、revision 必填/过期、artifact 与错误安全
+node scripts/test-agent-api.mjs            # /api/health、/api/tasks 过滤、/api/next 原因
+node scripts/test-start-init.mjs           # 固定端口、.tracker-url/.tracker-pid、start --detach、init --empty/--port
+node scripts/test-link-game-skill.mjs      # junction、幂等、拒绝外部目标/真实目录、git exclude
+node scripts/test-taskset.mjs              # 任务集解析、排序、错误
+node scripts/test-tt.mjs                   # tt 端到端（含带空格和中文的路径、并行写入、强杀服务、junction）
+node scripts/test-skill.mjs                # Skill 预算（≤ 80 行）、链接只在 Skill 目录内、命令与接口、错误码文档不漂移
 ```
 
-所有测试均使用临时 CSV，不会写当前实例的 Tracker；类型/工具链测试验证旧 schema 的两步迁移、Story 执行防护/上下文、跨任务告警聚合、过期 ACK 拒绝与重现计数。交付上下文测试覆盖 Owner/Agent 交接、三种反馈处置、独立审查、Story 的派生完成/重开、正常依赖等待与历史标记不覆盖新 blocker。
+所有测试均使用临时 CSV/临时实例，不会写当前实例的 Tracker；类型/工具链测试验证旧 schema 的两步迁移、Story 执行防护/上下文、跨任务告警聚合、过期 ACK 拒绝与重现计数。交付上下文测试覆盖 Owner/Agent 交接、三种反馈处置、独立审查、Story 的派生完成/重开、正常依赖等待与历史标记不覆盖新 blocker。`scripts/lib/test-support.mjs` 是各测试共用的启动/临时实例辅助模块。

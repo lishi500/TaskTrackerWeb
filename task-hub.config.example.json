@@ -4,6 +4,11 @@
     "projectId": "my-game",
     "projectName": "My Game",
     "tracker": "tracker/task_tracker.csv",
-    "mode": "managed-csv"
+    "mode": "managed-csv",
+    "port": 4321
+  },
+  "workflow": {
+    "serialLane": true,
+    "ownerGateTaskPattern": "^GATE-"
   }
 }

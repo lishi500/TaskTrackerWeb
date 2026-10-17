@@ -37,7 +37,7 @@ Reference binaries/screenshots/video in durable storage with an unambiguous repo
 | --- | --- | --- |
 | Rule correctness | Critical state transitions and independent expected event/final-state results | Hash consistency alone does not prove the gameplay rule |
 | Actual scene integration | Delivered scene/resources and startup path | Objects assembled only inside a test do not cover serialized scene bindings |
-| Target-device operation | Platform input on the tested build/device and resulting state | Editor injection or install/launch alone cannot prove native input |
+| Target-device operation | Platform input on the tested build/device and resulting state | Input injected by a test harness, or install/launch alone, cannot prove native input |
 | Visible temporal behavior | Input, motion, impact and output over time, tied to logical state | Renderer flags, logs or one frame alone cannot prove the full visible sequence |
 | Understanding or enjoyment | Real participant observations with protocol/build/sample boundaries | Agent opinions are not participant results |
 
