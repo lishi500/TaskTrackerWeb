@@ -12,10 +12,14 @@
 //   - Acceptance: player-observable outcome of the whole slice
 //   ### T-001: Title                         <- "### ID: title" is a Task ("- Type: Bug" makes it a Bug)
 //   - Depends: T-000; T-002                  <- ';' or ',' separated
-//   - Authority: reviewer                    <- reviewer (default) | owner
+//   - Authority: checks                      <- checks = done when the project check passes (RunEvidence)
+//                                               reviewer (default) = independent review | owner = human decision
 //   - Priority: P1                           <- P0..P3, default P1
 //   - Acceptance: one paragraph
 //   - Effort / Profile / Why / Decisions / Uncertainty: informational, stay in the document
+//
+// Review happens once per Story: a Story with at least one `checks` Task needs a `reviewer` Task
+// (the integration-acceptance Task) that depends, directly or through other Tasks, on all of them.
 //
 // The document is the source of task intent; the Hub is the source of task state.
 
@@ -163,8 +167,9 @@ export function parseTaskSet(source, { docPath = '' } = {}) {
     } else {
       const requested = field('authority').toLowerCase().replace(/[\s_-]/g, '');
       if (!requested || ['reviewer', 'independentrevieweragent', 'agent', 'review'].includes(requested)) authority = 'IndependentReviewerAgent';
+      else if (['checks', 'check', 'runevidence', 'evidence'].includes(requested)) authority = 'RunEvidence';
       else if (['owner', 'decisionowner', 'human'].includes(requested)) { authority = 'DecisionOwner'; ownerRole = 'Human decision owner'; }
-      else problem(`Authority must be 'reviewer' or 'owner' (got '${field('authority')}')`, lineOf('authority'));
+      else problem(`Authority must be 'reviewer', 'checks' or 'owner' (got '${field('authority')}')`, lineOf('authority'));
       for (const dependency of depends) {
         if (!isValidId(dependency)) problem(`Depends entry '${dependency.slice(0, 40)}' is not a task id (separate several with ';')`, lineOf('depends'));
         if (dependency === item.id) problem('a task cannot depend on itself', lineOf('depends'));
@@ -199,6 +204,56 @@ export function parseTaskSet(source, { docPath = '' } = {}) {
   return { header: { milestone: header.milestone ?? '', stream: header.stream ?? '', lane, spec: header.spec ?? '' }, items: normalized, errors, docPath };
 }
 
+// Review once per Story. A Story that has at least one `checks` (RunEvidence) Task needs a
+// `reviewer` (IndependentReviewerAgent) Task child that depends, directly or through other Tasks,
+// on all of them: that integration-acceptance Task is the Story's one independent review. Only
+// Stories this import touches are checked (a new Story, or a new child of any Story); the graph
+// is the union of the Hub's tasks (`existing`, as listed by GET /api/tasks) and the new items.
+// Mirrors storyReviewState() in server.mjs; scripts/test-tt-story.mjs keeps the two in agreement.
+export function storyReviewErrors(items, existing) {
+  const nodes = new Map();
+  for (const [id, task] of existing) {
+    nodes.set(id, { id, kind: task.taskType, parent: task.parentId || '', depends: splitList(task.dependsOn ?? ''), authority: task.completionAuthority, line: 0 });
+  }
+  const fresh = items.filter((item) => !existing.has(item.id));
+  for (const item of fresh) nodes.set(item.id, { id: item.id, kind: item.kind, parent: item.parent, depends: item.depends, authority: item.authority, line: item.line });
+
+  const touched = new Map();
+  for (const item of fresh) {
+    if (item.kind === 'Story') touched.set(item.id, item.line);
+    else if (item.parent && !touched.has(item.parent)) touched.set(item.parent, item.line);
+  }
+  const reach = (id) => {
+    const reached = new Set();
+    const pending = [id];
+    while (pending.length) {
+      for (const dependency of nodes.get(pending.pop())?.depends ?? []) {
+        if (!reached.has(dependency)) { reached.add(dependency); pending.push(dependency); }
+      }
+    }
+    return reached;
+  };
+
+  const errors = [];
+  for (const [storyId, line] of touched) {
+    if (nodes.get(storyId)?.kind !== 'Story') continue;
+    const children = [...nodes.values()].filter((node) => node.kind !== 'Story' && node.parent === storyId);
+    const checks = children.filter((node) => node.authority === 'RunEvidence');
+    if (!checks.length) continue;
+    const reviewers = children.filter((node) => node.authority === 'IndependentReviewerAgent');
+    const coverage = reviewers.map((reviewer) => ({ reviewer, missing: checks.filter((check) => !reach(reviewer.id).has(check.id)).map((check) => check.id) }));
+    if (coverage.some(({ missing }) => !missing.length)) continue;
+    const ids = checks.map((check) => check.id);
+    if (!coverage.length) {
+      errors.push({ line, message: `Story ${storyId} has checks Tasks (${ids.join(', ')}) but no reviewer Task: add an integration-acceptance Task ('### ID: title' with '- Authority: reviewer' and '- Depends: ${ids.join('; ')}') so the Story gets its one independent review` });
+    } else {
+      const closest = [...coverage].sort((left, right) => left.missing.length - right.missing.length)[0];
+      errors.push({ line, message: `Story ${storyId}: no reviewer Task depends on all of its checks Tasks (${closest.reviewer.id} is missing ${closest.missing.join(', ')}); add them to its Depends` });
+    }
+  }
+  return errors;
+}
+
 // Decide what to create. `existing` maps taskId -> { taskType }. Returns the
 // ordered creations (Stories first, then Tasks/Bugs in topological order of
 // Depends, document order breaking ties) or errors; nothing is written by this
@@ -226,6 +281,8 @@ export function planImport(parsed, existing, { defaultMilestone = '' } = {}) {
       else if (kind !== 'Story') problem(`Parent ${item.parent} is a ${kind}; a parent must be a Story`);
     }
   }
+
+  errors.push(...storyReviewErrors(items, existing));
 
   // Order: Stories first (document order), then executable items by Depends.
   const ordered = fresh.filter((item) => item.kind === 'Story');

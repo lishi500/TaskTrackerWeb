@@ -126,7 +126,7 @@ Spec: docs/milestones.md#m1       <!-- default SpecRef -->
   assert.match(all, /T-002: Acceptance is required/);
   assert.match(all, /T-002: duplicate id \(first used on line \d+\)/);
   assert.match(all, /T-003: Priority must be P0, P1, P2 or P3 \(got 'urgent'\)/);
-  assert.match(all, /T-003: Authority must be 'reviewer' or 'owner' \(got 'robot'\)/);
+  assert.match(all, /T-003: Authority must be 'reviewer', 'checks' or 'owner' \(got 'robot'\)/);
   assert.match(all, /T-003: a task cannot depend on itself/);
   assert.match(all, /T-003: Depends entry '\(after' is not a task id \(separate several with ';'\)/);
   assert.match(all, /T-003: Type must be Task or Bug \(got 'Epic'\)/);
@@ -171,4 +171,150 @@ for (const id of ['t-001', 'T001', 'CON', 'T-', '-T', 'T-1.', 'T 1', `T-${'1'.re
   assert.deepEqual([again.creates.length, again.skipped, again.errors.length], [0, ['T-1'], 0]);
 }
 
-console.log('taskset test passed: contract format, field variants, CJK/CRLF/BOM, error detection, ordering and skips.');
+// ---- Authority: checks (RunEvidence) -------------------------------------------------------------------
+{
+  for (const spelling of ['checks', 'Checks', 'CHECK', 'RunEvidence', 'run-evidence', 'evidence']) {
+    const parsed = parseTaskSet(`Milestone: M1\n## S-1: s\n- Acceptance: s\n### T-1: x\n- Authority: ${spelling}\n- Acceptance: y\n### T-2: review\n- Depends: T-1\n- Acceptance: z\n`);
+    const plan = planImport(parsed, none);
+    assert.deepEqual(plan.errors, [], spelling);
+    const checks = plan.creates.find((item) => item.id === 'T-1').payload;
+    assert.equal(checks.completionAuthority, 'RunEvidence', spelling);
+    assert.equal(checks.ownerRole, 'Implementation agent');
+    assert.equal(plan.creates.find((item) => item.id === 'T-2').payload.completionAuthority, 'IndependentReviewerAgent', 'the default stays reviewer');
+  }
+}
+
+// ---- Review once per Story: a Story with checks Tasks needs an integration reviewer Task ---------------------
+{
+  const plan = (text, existing = none) => planImport(parseTaskSet(`Milestone: M1\n${text}`), existing);
+  const story = '## S-1: Story\n- Acceptance: s\n';
+  const task = (id, authority, depends = '') => `### ${id}: ${id}\n- Authority: ${authority}\n${depends ? `- Depends: ${depends}\n` : ''}- Acceptance: a\n`;
+  const hub = (taskId, taskType, extra = {}) => [taskId, { taskId, taskType, status: 'Backlog', parentId: '', dependsOn: '', completionAuthority: 'IndependentReviewerAgent', ...extra }];
+  const story1 = hub('S-1', 'Story', { completionAuthority: 'NotApplicable' });
+
+  // the standard shape, direct and transitive coverage
+  assert.deepEqual(plan(story + task('T-1', 'checks') + task('T-2', 'checks') + task('T-3', 'reviewer', 'T-1; T-2')).errors, []);
+  assert.deepEqual(plan(story + task('T-1', 'checks') + task('T-2', 'checks', 'T-1') + task('T-3', 'reviewer', 'T-2')).errors, [], 'transitive: T-3 -> T-2 -> T-1');
+  assert.deepEqual(plan(story + task('T-3', 'reviewer', 'T-2') + task('T-2', 'checks', 'T-1') + task('T-1', 'checks')).errors, [], 'document order does not matter');
+  assert.deepEqual(plan(story + task('T-1', 'reviewer') + task('T-2', 'reviewer', 'T-1')).errors, [], 'a Story without checks Tasks has no extra rule');
+  assert.deepEqual(plan(task('T-1', 'checks')).errors, [], 'a checks Task outside any Story has no Story to review');
+  assert.deepEqual(plan(story + task('T-1', 'checks') + task('T-2', 'checks') + task('T-3', 'reviewer', 'T-1; T-2') + task('T-4', 'owner', 'T-3')).errors, [], 'an owner task after the review is fine');
+
+  // violations: no reviewer, owner-only, partial coverage, wrong story
+  let result = plan(story + task('T-1', 'checks') + task('T-2', 'checks'));
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].line, 2, 'the error points at the Story heading');
+  assert.equal(result.errors[0].message, "Story S-1 has checks Tasks (T-1, T-2) but no reviewer Task: add an integration-acceptance Task ('### ID: title' with '- Authority: reviewer' and '- Depends: T-1; T-2') so the Story gets its one independent review");
+
+  result = plan(story + task('T-1', 'checks') + task('T-2', 'owner', 'T-1'));
+  assert.match(messages(result).join(), /Story S-1 has checks Tasks \(T-1\) but no reviewer Task/, 'an owner decision is not an independent review');
+
+  result = plan(story + task('T-1', 'checks') + task('T-2', 'checks') + task('T-3', 'reviewer', 'T-1'));
+  assert.deepEqual(messages(result), ['Story S-1: no reviewer Task depends on all of its checks Tasks (T-3 is missing T-2); add them to its Depends']);
+
+  result = plan(`${story}${task('T-1', 'checks')}## S-2: Other\n- Acceptance: s\n${task('T-9', 'reviewer', 'T-1')}`);
+  assert.match(messages(result).join(), /Story S-1 has checks Tasks \(T-1\) but no reviewer Task/, 'a reviewer in another Story does not count as the S-1 integration Task');
+
+  result = plan('## S-1: A\n- Acceptance: s\n' + task('T-1', 'checks') + '## S-2: B\n- Acceptance: s\n' + task('T-2', 'checks'));
+  assert.equal(result.errors.length, 2, 'every violating Story is reported');
+  assert.deepEqual(result.errors.map((problem) => problem.line), [2, 7]);
+
+  // the graph includes the Hub: new checks Task under an existing Story, covered or not
+  const existing = new Map([story1, hub('E-1', 'Task', { parentId: 'S-1', completionAuthority: 'RunEvidence' }), hub('E-2', 'Task', { parentId: 'S-1', dependsOn: 'E-1' })]);
+  const addChecks = '### N-1: new\n- Parent: S-1\n- Authority: checks\n- Acceptance: a\n';
+  result = plan(addChecks, existing);
+  assert.match(messages(result).join(), /Story S-1: no reviewer Task depends on all of its checks Tasks \(E-2 is missing N-1\)/);
+  assert.equal(result.errors[0].line, 2, 'an existing Story is reported at the first new child');
+  assert.deepEqual(plan(`${addChecks}### N-2: integration\n- Parent: S-1\n- Depends: N-1; E-2\n- Acceptance: a\n`, existing).errors, [], 'a new integration Task covering old and new checks Tasks');
+  assert.deepEqual(plan('### N-3: unrelated\n- Acceptance: a\n', existing).errors, [], 'a Story this import does not touch is left to tt doctor');
+  assert.deepEqual(plan('### N-4: review only\n- Parent: S-1\n- Depends: E-1\n- Acceptance: a\n', new Map([story1, hub('E-1', 'Task', { parentId: 'S-1', completionAuthority: 'RunEvidence' })])).errors, [], 'a new reviewer Task completes an existing Story');
+}
+
+// ---- the planner's own example (worker L2, task-set-example.md) imports as written ---------------------------
+{
+  const plannerExample = `# Tasks: M2 Fishing Slice
+Milestone: M2
+Stream: Gameplay
+Lane: slice
+Spec: docs/milestones.md#m2
+
+## M2-S1: F-01 Cast, wait and reel
+- Acceptance: Running the project, one button takes the player from Idle through Cast, Wait, Bite and Reel to a Result card and back to Idle, repeatedly. A missed bite is harmless and each of the five fish pulls in a recognisably different way.
+- Spec: docs/systems/cast-reel.md
+
+### M2-T01: Reel mini-game with a tuning resource
+- Authority: checks
+- Priority: P0
+- Acceptance: GUT tests drive the reel state machine through catch, escape and missed-bite paths with no dead end, and zone size, fill rate and drain rate load from a ReelTuning resource.
+- Effort: M
+- Profile: logic
+- Why: F-01 - the reel-in moment is the experiment subject (DD-002).
+- Decisions: DD-002, DD-003
+- Uncertainty: LOW on code, HIGH on feel - the numbers need a human to play.
+- Spec: docs/tech/cast-reel.md
+
+### M2-T02: Five fish with distinct pull patterns
+- Authority: checks
+- Priority: P0
+- Acceptance: A FishSpecies resource per fish (pull pattern, value, difficulty) and a catalog that a GUT test loads; for a fixed seed the steady, burst and drift patterns give distinct marker paths.
+- Effort: S
+- Profile: logic
+- Why: F-02 - each reel must feel different (pillar 1, DD-002).
+- Decisions: DD-002
+- Spec: docs/tech/cast-reel.md
+
+### M2-T03: Integrate and verify the fishing loop in the main scene
+- Depends: M2-T01; M2-T02
+- Authority: reviewer
+- Priority: P0
+- Acceptance: The main scene runs 300 frames headless with no engine errors, a smoke script completes ten cast, bite, reel, result cycles, every result writes one log line (fish, result, rod, seconds), and all five fish appear.
+- Effort: S
+- Profile: runtime
+- Why: F-01, F-02 - integration-acceptance Task of M2-S1, the one independent review of the Story.
+- Decisions: DD-002
+- Spec: docs/tech/cast-reel.md
+
+## M2-S2: F-04 Buy a better rod
+- Acceptance: A player with enough coins buys the second rod at the shop and the next reel visibly plays differently (wider zone); the player can say what changed.
+- Spec: docs/systems/rod-shop.md
+
+### M2-T04: Rod shop with three rods that change the reel
+- Depends: M2-T03
+- Authority: reviewer
+- Priority: P1
+- Acceptance: The shop scene loads, buying deducts coins and swaps the active rod resource, and the reel reads the new parameters (GUT test plus a screenshot of the shop).
+- Effort: M
+- Profile: scene
+- Why: F-04 - every purchase must visibly change the next cast (pillar 3, DD-004). The only implementation Task of its Story, so it is reviewer authority and doubles as the integration-acceptance Task.
+- Decisions: DD-004
+- Spec: docs/tech/rod-shop.md
+
+### M2-T05: Owner playtest of the rod difference
+- Depends: M2-T04
+- Authority: owner
+- Priority: P1
+- Acceptance: The owner plays 20 catches with rod 1 and with rod 2 and records in docs/playtests/ whether the difference was felt and could be described.
+- Effort: S
+- Profile: scene
+- Why: F-04 - whether a purchase is felt is a human judgement (DD-004).
+- Decisions: DD-004
+- Uncertainty: HIGH - taste.
+`;
+  const parsed = parseTaskSet(plannerExample, { docPath: 'docs/tasks/m2.md' });
+  assert.deepEqual(parsed.errors, []);
+  const plan = planImport(parsed, none);
+  assert.deepEqual(plan.errors, [], 'the Story invariant holds for the planner example');
+  assert.deepEqual(plan.creates.map((item) => [item.id, item.payload.completionAuthority]), [
+    ['M2-S1', 'NotApplicable'], ['M2-S2', 'NotApplicable'],
+    ['M2-T01', 'RunEvidence'], ['M2-T02', 'RunEvidence'], ['M2-T03', 'IndependentReviewerAgent'],
+    ['M2-T04', 'IndependentReviewerAgent'], ['M2-T05', 'DecisionOwner'],
+  ]);
+  assert.equal(plan.creates.find((item) => item.id === 'M2-T03').payload.dependsOn, 'M2-T01;M2-T02');
+  assert.equal(plan.creates.find((item) => item.id === 'M2-T01').payload.specRef, 'docs/tech/cast-reel.md');
+  // turning the integration Task into a checks Task makes the same document invalid
+  const broken = plannerExample.replace('Authority: reviewer\n- Priority: P0', 'Authority: checks\n- Priority: P0');
+  assert.notEqual(broken, plannerExample);
+  assert.match(messages(planImport(parseTaskSet(broken), none)).join(), /Story M2-S1 has checks Tasks \(M2-T01, M2-T02, M2-T03\) but no reviewer Task/);
+}
+
+console.log('taskset test passed: contract format, field variants, CJK/CRLF/BOM, error detection, ordering and skips, checks authority, Story review invariant.');

@@ -193,6 +193,8 @@ function hintFor(error, context) {
     return { Backlog: `tt admit ${id}`, Blocked: `tt unblock ${id}`, 'In Progress': `tt done ${id}`, 'In Review': `tt review ${id} approve "notes"` }[match[1]] ?? `tt show ${id}`;
   }
   if (error.code === 'reviewer-not-independent') return `tt review ${id} <approve|reject|block> "notes" --as <a different name>`;
+  if (error.code === 'run-evidence-missing') return `run the project check so reports/last-check.md contains "RESULT: PASS", then tt done ${id} "summary" (or --outcome incomplete)`;
+  if (error.code === 'run-evidence-failed') return `fix the failure, then close this Run as blocked (tt done ${id} "check failed" --outcome blocked --blocker "..."), tt unblock ${id}, tt start ${id} for a fresh Run`;
   if (/has not claimed/.test(message)) return `tt show ${id}`;
   if (/was not found/.test(message) && !/Run|Artifact/.test(message)) return 'tt ls';
   if (error.code === 'unknown-dependency' || error.code === 'invalid-dependency') return 'tt ls (ids are listed in the first column)';
@@ -209,14 +211,14 @@ async function guarded(action, context, work) {
     return await work();
   } catch (error) {
     if (error instanceof ApiError) {
-      fail(`${action} failed`, `HTTP ${error.status}: ${clip(error.message, 320)}`, hintFor(error, context).trim());
+      fail(`${typeof action === 'function' ? action() : action} failed`, `HTTP ${error.status}: ${clip(error.message, 320)}`, hintFor(error, context).trim());
     }
     throw error;
   }
 }
 
 // ---- Argument parsing -------------------------------------------------------------
-const VALUE_FLAGS = new Set(['profile', 'scope', 'expect', 'outcome', 'blocker', 'owner-status', 'run', 'as', 'key', 'toolchain', 'op', 'detail', 'type', 'parent', 'deps', 'accept', 'spec', 'auth', 'prio', 'milestone', 'stream', 'status', 'limit', 'reason', 'evidence']);
+const VALUE_FLAGS = new Set(['profile', 'scope', 'expect', 'outcome', 'blocker', 'owner-status', 'run', 'as', 'key', 'toolchain', 'op', 'detail', 'type', 'parent', 'deps', 'accept', 'spec', 'auth', 'prio', 'milestone', 'stream', 'status', 'limit', 'reason', 'evidence', 'name']);
 const BOOLEAN_FLAGS = new Set(['json', 'brief', 'dry-run', 'admit-first', 'no-evidence', 'help', 'version']);
 
 function parseArgs(argv) {
@@ -258,6 +260,33 @@ async function packetOf(id) {
 
 const activeRunOf = (runs) => [...runs].reverse().find((run) => run.status === 'In Progress');
 const isRunId = (value, id) => typeof value === 'string' && value.startsWith(`${id}-R`) && /-R\d+$/.test(value);
+
+// Git position, best effort. The one independent reviewer of a Story needs to know which commits
+// its Runs span, so `tt start` records the working directory's HEAD as the Run event
+// "GITREV base=<sha>" and `tt done` records "GITREV head=<sha> dirty=<bool>". Outside a git
+// repository, without git, or when the event is refused, nothing happens and nothing fails.
+function gitPosition() {
+  const git = (...args) => spawnSync('git', args, { cwd: process.cwd(), encoding: 'utf8', timeout: 5000, windowsHide: true });
+  const head = git('rev-parse', 'HEAD');
+  const sha = head.status === 0 ? head.stdout.trim() : '';
+  if (!/^[0-9a-f]{7,64}$/.test(sha)) return undefined;
+  const status = git('status', '--porcelain');
+  return { sha, dirty: status.status !== 0 || status.stdout.trim() !== '' }; // unknown counts as dirty
+}
+
+async function recordGit(taskId, runId, kind) {
+  const position = gitPosition();
+  if (!position) return undefined;
+  try {
+    await write(`/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/events`, {
+      type: 'GITREV', result: 'ok', message: kind === 'base' ? `base=${position.sha}` : `head=${position.sha} dirty=${position.dirty}`,
+    });
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    return undefined;
+  }
+  return position;
+}
 
 async function nextLine() {
   const result = await get('/api/next');
@@ -328,6 +357,37 @@ commands.ls = async ({ flags }) => {
   emit(lines, result);
 };
 
+const AUTHORITY_WORD = { IndependentReviewerAgent: 'reviewer', RunEvidence: 'checks', DecisionOwner: 'owner', NotApplicable: '-' };
+
+// Story lines for the one independent reviewer: the integration review state, every child with its
+// authority, latest Run, artifact names and auto-accepted flag, and the git range the Runs recorded.
+function storyLines(packet) {
+  const { children = [], review, gitRange } = packet.context;
+  const lines = [];
+  if (review) {
+    const checksDone = children.filter((child) => child.completionAuthority === 'RunEvidence' && child.status === 'Done').length;
+    lines.push(review.state === 'gap' ? `review: GAP - ${review.message}`
+      : review.state === 'complete' ? `review: complete (${review.integrationTaskId} is Done)`
+        : `review: open - integration task ${review.integrationTaskId} is ${review.integrationStatus}; checks Done ${checksDone}/${review.checks.length}`);
+  }
+  lines.push('children:');
+  for (const child of children) {
+    const run = (child.runs ?? []).at(-1);
+    const names = run?.artifacts ?? [];
+    const shown = names.length > 3 ? `${names.slice(0, 3).join(',')},+${names.length - 3}` : names.join(',');
+    lines.push(`  ${child.taskId}  ${child.status}  ${AUTHORITY_WORD[child.completionAuthority] ?? child.completionAuthority}  ${run ? `${run.runId}  ${shown || 'no artifacts'}${run.autoAccepted ? '  auto-accepted' : ''}` : 'no Run'}`);
+  }
+  if (!children.length) lines.push('  (none)');
+  const short = (entry) => entry.sha.slice(0, 12);
+  if (gitRange?.base && gitRange?.head) lines.push(`diff range ${short(gitRange.base)}..${short(gitRange.head)}${gitRange.head.dirty ? '   (the last tt done had uncommitted changes)' : ''}`);
+  else if (gitRange?.base) lines.push(`diff range ${short(gitRange.base)}..?   (no finished Run recorded a head yet)`);
+  else lines.push('diff range: not recorded (tt records it from a git repository when a task starts and finishes)');
+  if (review?.state === 'open' && review.integrationStatus === 'In Review') {
+    lines.push(`inspect: tt evidence ID [--name NAME]; decide: tt review ${review.integrationTaskId} approve|reject|block "notes" --as NAME`);
+  }
+  return lines;
+}
+
 commands.show = async ({ positional }) => {
   needArgs('show', positional, 1, 'ID');
   const [id] = positional;
@@ -339,12 +399,50 @@ commands.show = async ({ positional }) => {
   if (task.Blocker) lines.push(`blocker: ${clip(task.Blocker, 300)}`);
   lines.push(`deps: ${packet.dependencies.map((dependency) => `${dependency.taskId}=${dependency.status ?? 'MISSING'}`).join(', ') || '-'}`);
   if (packet.reverseDependencies.length) lines.push(`needed by: ${packet.reverseDependencies.slice(0, 12).map((dependent) => `${dependent.taskId}=${dependent.status}`).join(', ')}`);
-  if (task.TaskType === 'Story') lines.push(`children: ${packet.context.children.map((child) => `${child.taskId}=${child.status}`).join(', ') || '-'}`);
-  lines.push(`runs: ${runs.map((run) => `${run.runId}=${run.status}(${run.agent})`).join(', ') || '-'}`);
+  const isStory = task.TaskType === 'Story';
+  if (isStory) lines.push(...storyLines(packet));
+  else lines.push(`runs: ${runs.map((run) => `${run.runId}=${run.status}(${run.agent})`).join(', ') || '-'}`);
   if (packet.context.story) lines.push(`story: ${packet.context.story.taskId} ${clip(packet.context.story.goal, 80)} | ${clip(packet.context.story.acceptance, 200)}`);
   const evidence = String(task.Evidence ?? '').split('\n').filter(Boolean).slice(-3);
   if (evidence.length) lines.push('evidence (last 3):', ...evidence.map((line) => `  ${clip(line, 200)}`));
-  emit(lines.slice(0, 40), { task, packet });
+  emit(lines.slice(0, isStory ? 80 : 40), { task, packet });
+};
+
+// tt evidence ID [--run RUN] [--name NAME]: read one artifact (default: the passing check of the latest
+// Run that has artifacts), cut at 8 KB so a review never floods the agent's context.
+const MAX_EVIDENCE_BYTES = 8192;
+const REPLACEMENT_CHARACTER = String.fromCharCode(0xFFFD);
+
+commands.evidence = async ({ positional, flags }) => {
+  needArgs('evidence', positional, 1, 'ID [--run RUN] [--name NAME]');
+  const [id] = positional;
+  await guarded(`evidence ${id}`, { id }, async () => {
+    const { task } = await packetOf(id);
+    if (task.TaskType === 'Story') fail(`${id} is a Story`, 'evidence belongs to the Runs of its tasks', `tt show ${id} lists them; then tt evidence <task id>`);
+    const { runs } = await get(`/api/tasks/${encodeURIComponent(id)}/runs`);
+    const run = flags.run ? runs.find((candidate) => candidate.runId === flags.run) : [...runs].reverse().find((candidate) => candidate.artifacts?.length);
+    if (!run) fail(flags.run ? `${id} has no Run ${flags.run}` : `${id} has no evidence`, flags.run ? `its Runs: ${runs.map((candidate) => candidate.runId).join(', ') || 'none'}` : 'no Run holds an artifact', `tt show ${id}`);
+    const names = (run.artifacts ?? []).map((artifact) => artifact.name);
+    if (!names.length) fail(`${run.runId} has no artifacts`, 'nothing was attached to it', `tt show ${id}`);
+    let accepted;
+    for (const line of String(task.Evidence ?? '').split('\n')) {
+      const match = /^auto-accepted: RunEvidence \(([^,()]+), artifact (.+)\)$/.exec(line);
+      if (match?.[1] === run.runId) accepted = match[2];
+    }
+    const name = flags.name ?? (names.includes(accepted) ? accepted : names.includes('last-check.md') ? 'last-check.md' : names[0]);
+    if (!names.includes(name)) fail(`${run.runId} has no artifact '${clip(name, 60)}'`, `it has: ${names.join(', ')}`, `tt evidence ${id} --name ${names[0]}`);
+    const base = (await ensureUp()).url;
+    const response = await fetch(`${base}/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(run.runId)}/artifacts/${name.split('/').map(encodeURIComponent).join('/')}`, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) fail(`cannot read ${name}`, `HTTP ${response.status}`, `tt show ${id}`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    let text = bytes.subarray(0, MAX_EVIDENCE_BYTES).toString('utf8');
+    if (bytes.length > MAX_EVIDENCE_BYTES && text.endsWith(REPLACEMENT_CHARACTER)) text = text.slice(0, -1); // a multi-byte character cut in half
+    const truncated = bytes.length > MAX_EVIDENCE_BYTES;
+    const lines = [`evidence ${id} ${run.runId} ${name} (${bytes.length} bytes${name === accepted ? ', the passing check' : ''})`, text.replace(/\s+$/, '')];
+    if (truncated) lines.push(`... truncated: showing ${Buffer.byteLength(text)} of ${bytes.length} bytes; the whole file: ${join(instance().trackerDir, 'task-records', id, run.runId, 'artifacts', ...name.split('/'))}`);
+    if (names.length > 1) lines.push(`artifacts of ${run.runId}: ${names.join(', ')} (tt evidence ${id} --name NAME)`);
+    emit(lines, { taskId: id, runId: run.runId, name, bytes: bytes.length, truncated, text, artifacts: names });
+  });
 };
 
 commands.next = async () => {
@@ -370,8 +468,9 @@ commands.new = async ({ positional, flags }) => {
   if (!['Task', 'Bug', 'Story'].includes(type)) fail(`--type ${type} is not valid`, 'use Task, Bug or Story', `tt new ${id} "${title}" --type Task --accept "..."`);
   const accept = textArg(flags.accept);
   if (!accept) fail('--accept is required', 'the acceptance is what the reviewer judges the work against', `tt new ${id} "${title}" --accept "what can be observed when it works"`);
-  const authority = type === 'Story' ? 'NotApplicable' : (flags.auth ?? 'reviewer') === 'owner' ? 'DecisionOwner' : 'IndependentReviewerAgent';
-  if (flags.auth && !['reviewer', 'owner'].includes(flags.auth)) fail(`--auth ${flags.auth} is not valid`, 'use reviewer or owner', `tt new ${id} "${title}" --auth owner --accept "..."`);
+  const authorities = { reviewer: 'IndependentReviewerAgent', checks: 'RunEvidence', owner: 'DecisionOwner' };
+  if (flags.auth && !authorities[flags.auth]) fail(`--auth ${flags.auth} is not valid`, 'use reviewer (independent review), checks (done when the project check passes) or owner (human decision)', `tt new ${id} "${title}" --auth checks --accept "..."`);
+  const authority = type === 'Story' ? 'NotApplicable' : authorities[flags.auth ?? 'reviewer'];
   const parent = flags.parent ? (await guarded(`new ${id}`, { id }, () => packetOf(flags.parent))) : undefined;
   const dependsOn = (flags.deps ?? '').split(/[;,\s]+/).filter(Boolean).join(';');
   const milestone = flags.milestone ?? parent?.task.Milestone ?? 'M1';
@@ -393,7 +492,8 @@ commands.new = async ({ positional, flags }) => {
       completionAuthority: authority,
     },
   }));
-  emit(`created ${id} (${type}, ${result.task.Status})`, result);
+  // The server answers a created task with warnings while its Story still lacks an integration-acceptance Task.
+  emit([`created ${id} (${type}, ${result.task.Status})`, ...(result.warnings ?? []).map((warning) => `warning: ${warning}`)], result);
 };
 
 const transition = (name, path, buildBody, describe) => async ({ positional, flags }) => {
@@ -443,8 +543,10 @@ commands.start = async ({ positional, flags }) => {
       scope: textArg(flags.scope) ?? clip(task.Task, 300),
       expectedBehavior: textArg(flags.expect) ?? clip(packet.acceptance || task.Acceptance, 3900),
     });
-    emit([`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, ...contract],
-      { taskId: id, runId: result.run.runId, profile, admitted, acceptance: task.Acceptance, specRef: task.SpecRef, task: result.task });
+    const base = await recordGit(id, result.run.runId, 'base');
+    const completion = task.CompletionAuthority === 'RunEvidence' ? ['completes on: a passing project check (tt done attaches reports/last-check.md with "RESULT: PASS"); no review'] : [];
+    emit([`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, ...contract, ...completion],
+      { taskId: id, runId: result.run.runId, profile, admitted, acceptance: task.Acceptance, specRef: task.SpecRef, task: result.task, gitBase: base?.sha ?? null });
   });
 };
 
@@ -522,19 +624,72 @@ function artifactNameFor(file, taken) {
   return candidate;
 }
 
+// A task id looks like T-001 or BUG-7 (the importer's convention). `tt done` takes an optional id first.
+const STRICT_TASK_ID = /^[A-Z][A-Z0-9]*-[A-Za-z0-9-]+$/;
+const DEFAULT_EVIDENCE_PATTERN = '^RESULT: PASS\\b';
+
+// `tt done "summary"` without an id closes the one active Run (of this agent).
+async function soleActiveTask() {
+  const { tasks } = await get(`/api/tasks?${new URLSearchParams({ status: 'In Progress', limit: '50' })}`);
+  const active = tasks.filter((task) => task.activeRun && task.taskType !== 'Story');
+  if (!active.length) fail('there is no active Run to close', 'no task is In Progress', 'tt next, then tt start; or name the task: tt done ID "summary"');
+  if (active.length === 1) return active[0].taskId;
+  const agents = new Map();
+  for (const task of active) agents.set(task.taskId, activeRunOf((await packetOf(task.taskId)).runs)?.agent ?? '');
+  const mine = active.filter((task) => normalizeName(agents.get(task.taskId)) === normalizeName(AGENT));
+  if (mine.length === 1) return mine[0].taskId;
+  fail(mine.length ? `${mine.length} of your tasks are In Progress` : `no active Run belongs to agent '${AGENT}'`,
+    `active: ${active.map((task) => `${task.taskId} (agent ${agents.get(task.taskId) || '?'})`).join(', ')}`, 'tt done ID "summary" (TT_AGENT names you)');
+}
+
+// A RunEvidence task closes straight to Done when its Run holds a passing check. Refuse locally,
+// before anything is uploaded, what the server would refuse: a failing check (its artifact would
+// poison the Run for good), or no passing marker anywhere.
+async function precheckEvidence(id, run, texts) {
+  const failing = texts.find(({ text }) => /^RESULT: FAIL\b/m.test(text));
+  if (failing) {
+    const line = failing.text.split(/\r?\n/).find((candidate) => /^RESULT: FAIL\b/.test(candidate));
+    fail(`${id} cannot close as verified: ${basename(failing.file)} says "${clip(line, 120)}"`, 'a Run with a failing check is refused',
+      `fix the failure and run the project check again; or tt done ${id} "why" --outcome incomplete`);
+  }
+  let pattern;
+  try { pattern = new RegExp((await ensureUp()).health.runEvidencePattern ?? DEFAULT_EVIDENCE_PATTERN, 'm'); } catch { return; }
+  if (texts.some(({ text }) => pattern.test(text))) return;
+  const attached = (await get(`/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(run.runId)}`)).run.artifacts ?? [];
+  if (!attached.length) {
+    fail(`${id} cannot close as verified: no evidence file has a line matching ${pattern.source}`, 'this task completes on a passing check',
+      `run the project check so reports/last-check.md contains "RESULT: PASS", or tt done ${id} "what is missing" --outcome incomplete`);
+  }
+}
+
 commands.done = async ({ positional, flags }) => {
-  needArgs('done', positional, 1, 'ID ["summary"]');
-  const [id] = positional;
-  const summaryArgument = positional[1] ? textArg(positional.slice(1).join(' ')) : '';
-  await guarded(`done ${id}`, { id }, async () => {
-    const { task, runs } = await packetOf(id);
+  const context = {};
+  await guarded(() => `done${context.id ? ` ${context.id}` : ''}`, context, async () => {
+    let id = positional[0] && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(positional[0]) ? positional[0] : undefined;
+    let found;
+    if (id) {
+      try {
+        found = await packetOf(id);
+      } catch (error) {
+        if (!(error instanceof ApiError) || ![400, 404].includes(error.status)) throw error;
+        if (STRICT_TASK_ID.test(id)) fail(`no task '${id}'`, 'tt done takes an optional task id first; this looks like one, but the Hub does not know it', 'tt ls (write the summary as a sentence if it was one)');
+        id = undefined; // not a task: the words are the summary
+      }
+    }
+    const implicit = !id;
+    const summaryArgument = (id ? positional.slice(1) : positional).join(' ');
+    id ??= await soleActiveTask();
+    context.id = id;
+    const { task, runs } = found ?? await packetOf(id);
     if (task.Status !== 'In Progress') fail(`${id} is ${task.Status}, not In Progress`, 'only a task with an active Run can be closed', task.Status === 'Ready' || task.Status === 'Backlog' ? `tt start ${id}` : `tt show ${id}`);
     const run = flags.run ? runs.find((candidate) => candidate.runId === flags.run) : activeRunOf(runs);
     if (!run) fail(`${id} has no ${flags.run ? `Run ${flags.run}` : 'active Run'}`, 'nothing to close', `tt show ${id}`);
+    if (implicit && normalizeName(run.agent) !== normalizeName(AGENT)) fail(`${id} is claimed by ${run.agent}, not by ${AGENT}`, 'tt done without an id only closes your own Run', `tt done ${id} "summary" (TT_AGENT names you)`);
+    const summaryText = summaryArgument ? textArg(summaryArgument) : '';
     const outcome = flags.outcome ?? (task.CompletionAuthority === 'DecisionOwner' ? 'awaiting-human' : 'verified');
     if (!['verified', 'blocked', 'incomplete', 'awaiting-human'].includes(outcome)) fail(`--outcome ${outcome} is not valid`, 'use verified, blocked, incomplete or awaiting-human', `tt done ${id} "summary" --outcome blocked --blocker "why"`);
     if (outcome === 'blocked' && !flags.blocker) fail('a blocked Run needs --blocker', 'say what blocks it, concretely', `tt done ${id} --outcome blocked --blocker "what is missing"`);
-    if (['incomplete', 'awaiting-human'].includes(outcome) && !summaryArgument) fail(`${outcome} needs a summary`, outcome === 'incomplete' ? 'say what is still missing' : 'say what the owner has to decide', `tt done ${id} "summary" --outcome ${outcome}`);
+    if (['incomplete', 'awaiting-human'].includes(outcome) && !summaryText) fail(`${outcome} needs a summary`, outcome === 'incomplete' ? 'say what is still missing' : 'say what the owner has to decide', `tt done ${id} "summary" --outcome ${outcome}`);
 
     // Evidence: explicit files, plus reports/last-check.md when it is newer than the Run.
     const files = [...(flags.evidence ?? [])];
@@ -549,19 +704,32 @@ commands.done = async ({ positional, flags }) => {
         fail(`${id} cannot be closed as verified without evidence`, staleCheck ? 'reports/last-check.md is older than this Run - run the check again' : 'no --evidence file and no reports/last-check.md', `run the project check (it writes reports/last-check.md), or tt done ${id} "summary" --evidence FILE, or --no-evidence`);
       }
     }
+    const texts = files.map((file) => ({ file, text: readArtifactText(file) }));
+    const completesOnChecks = task.CompletionAuthority === 'RunEvidence';
+    if (completesOnChecks && outcome === 'verified' && !flags['no-evidence']) await precheckEvidence(id, run, texts);
     const taken = new Set();
     const stored = [];
-    for (const file of files) stored.push(await storeArtifact(id, run.runId, artifactNameFor(file, taken), readArtifactText(file)));
+    for (const { file, text } of texts) stored.push(await storeArtifact(id, run.runId, artifactNameFor(file, taken), text));
+    await recordGit(id, run.runId, 'head');
 
-    const summary = summaryArgument || (outcome === 'blocked' ? textArg(flags.blocker) : `Verified${stored.length ? `; evidence: ${stored.join(', ')}` : ''}.`);
+    const summary = summaryText || (outcome === 'blocked' ? textArg(flags.blocker) : `Verified${stored.length ? `; evidence: ${stored.join(', ')}` : ''}.`);
     const result = await write(`/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(run.runId)}/close`, {
       outcome,
       summary,
       ...(flags.blocker ? { blocker: textArg(flags.blocker) } : {}),
       ...(outcome === 'awaiting-human' ? { ownerStatus: flags['owner-status'] ?? 'Awaiting Owner' } : {}),
     });
-    const evidenceText = stored.length ? `; evidence: ${stored.join(', ')}` : '';
-    emit(`${id} -> ${result.task.Status} (run ${run.runId}, ${outcome}${evidenceText})`, { taskId: id, runId: run.runId, status: result.task.Status, outcome, evidence: stored });
+    const status = result.task.Status;
+    const autoAccepted = completesOnChecks && outcome === 'verified' && status === 'Done';
+    const lines = [`${id} -> ${status} (run ${run.runId}, ${outcome}${stored.length ? `; evidence: ${stored.join(', ')}` : ''}${autoAccepted ? '; auto-accepted' : ''})`];
+    let upcoming = '';
+    if (status === 'Done') {
+      upcoming = await nextLine();
+      if (upcoming) lines.push(upcoming);
+    } else if (status === 'In Review') {
+      if (task.ParentID) lines.push(`then: independent review (tt show ${task.ParentID}; tt review ${id} approve|reject|block "notes" --as NAME)`);
+    }
+    emit(lines, { taskId: id, runId: run.runId, status, outcome, evidence: stored, autoAccepted, next: upcoming || null });
   });
 };
 
@@ -706,6 +874,13 @@ commands.doctor = async () => {
   note('ok', `server ${url} v${health.toolVersion} pid ${health.pid}${wasUp ? '' : ' (was down, started now)'}`);
   note(health.ok ? 'ok' : 'FAIL', health.ok ? `tracker rev ${String(health.trackerRevision).slice(0, 8)}, dependency graph valid` : `tracker: ${clip(health.trackerError, 240)}`);
   if (health.toolVersion !== TT_VERSION) note('warn', `tt is v${TT_VERSION} but the server is v${health.toolVersion} - sync the template`);
+  if (health.ok) {
+    // Review once per Story: Stories whose checks Tasks no reviewer Task covers can never become Done.
+    const review = (await get('/api/summary').catch(() => ({}))).storyReview ?? { gaps: [], open: [] };
+    for (const gap of review.gaps) note('warn', clip(gap.message, 400));
+    const waiting = review.open.filter((story) => story.integrationStatus === 'In Review');
+    if (waiting.length) note('ok', `integration review waiting for a reviewer: ${waiting.map((story) => `${story.storyId} (tt review ${story.integrationTaskId} ...)`).join(', ')}`);
+  }
   const recorded = readText(where.urlFile);
   if (recorded !== url) note('warn', `tracker/.tracker-url says '${recorded || 'nothing'}' but the server answers at ${url}`);
   const csvPath = join(where.trackerDir, 'task_tracker.csv');
@@ -732,11 +907,12 @@ const HELP = `tt ${TT_VERSION} - Game Task Hub CLI   (agent: ${AGENT}; --json pr
   start [ID] [--profile logic|runtime|scene|package-config|build-export] [--scope "..."] [--expect "..."]   no ID = the next claimable task; prints acceptance + spec
   event ID [RUN] TYPE RESULT "message"      optional progress note on the active Run
   art ID [RUN] NAME FILE|-                  attach text evidence (<= 128 KB)
-  done ID ["summary"] [--evidence FILE]... [--no-evidence] [--outcome verified|blocked|incomplete|awaiting-human] [--blocker "..."] [--owner-status "Awaiting Owner Gate"]
+  done [ID] ["summary"] [--evidence FILE]... [--no-evidence] [--outcome verified|blocked|incomplete|awaiting-human] [--blocker "..."] [--owner-status "Awaiting Owner Gate"]   no ID = your one active Run; a checks task goes straight to Done on RESULT: PASS
   review ID approve|reject|block "notes" [--as NAME] [--blocker "..."]
-  show ID | ls [--status S] [--milestone M] [--type T] [--parent ID] [--limit N] | status [--brief]
+  show ID | ls [--status S] [--milestone M] [--type T] [--parent ID] [--limit N] | status [--brief]   show STORY = children, authorities, artifacts, git range
+  evidence ID [--run RUN] [--name NAME]     print one artifact (cut at 8 KB)
   import FILE [--dry-run] [--admit-first] [--milestone M]
-  new ID "title" --accept "..." [--type Task|Bug|Story] [--parent S] [--deps "A;B"] [--spec PATH] [--auth reviewer|owner] [--prio P1] [--milestone M] [--stream X]
+  new ID "title" --accept "..." [--type Task|Bug|Story] [--parent S] [--deps "A;B"] [--spec PATH] [--auth reviewer|checks|owner] [--prio P1] [--milestone M] [--stream X]
   admit ID | park ID | unblock ID | block ID "what blocks it" | issue ID "summary" --key K --toolchain T --op O [--detail "..."]
   eval ID approve|resume|block|defer|return "notes"   record your reading of owner feedback (task is Awaiting Agent Evaluation)
   up | down | url | doctor                  "@file.md" as a text argument reads that file`;

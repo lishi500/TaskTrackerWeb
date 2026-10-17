@@ -187,7 +187,7 @@ await runSuite('tt', async () => {
   assert.match(tt(['done', 'T-001', '完成']).err, /reports\/last-check\.md is older than this Run - run the check again/);
   writeFileSync(join(gameDir, 'evidence-cast.md'), '# 证据\n- 抛竿手感通过\n');
   result = ok(tt(['done', 'T-001', '抛竿与落点完成并验证', '--evidence', 'evidence-cast.md']));
-  assert.equal(result.out.trim(), 'T-001 -> In Review (run T-001-R0001, verified; evidence: evidence-cast.md)');
+  assert.deepEqual(result.lines, ['T-001 -> In Review (run T-001-R0001, verified; evidence: evidence-cast.md)', 'then: independent review (tt show S-FISH; tt review T-001 approve|reject|block "notes" --as NAME)'], 'a task under a Story points the reviewer at the Story rollup');
   assert.deepEqual((await call(instance.url, '/api/tasks/T-001/runs/T-001-R0001')).body.run.artifacts.map((artifact) => artifact.name).sort(), ['evidence-cast.md', 'notes-2.md', 'notes.md', 'stdin-note.txt']);
   assert.match(tt(['done', 'T-001', 'again']).err, /^tt: T-001 is In Review, not In Progress - only a task with an active Run can be closed - try: tt show T-001/);
   assert.match(ok(tt(['next'])).out, /^none: T-001 is In Review \(implemented by claude\): a different reviewer decides with: tt review T-001 approve\|reject\|block "notes"/);
@@ -214,7 +214,7 @@ await runSuite('tt', async () => {
   await sleep(1_100);
   writeFileSync(checkFile, '# Check\n[PASS] parse\n[PASS] test (3 tests)\n');
   result = ok(tt(['done', 'T-002']));
-  assert.equal(result.out.trim(), 'T-002 -> In Review (run T-002-R0001, verified; evidence: last-check.md)', 'a fresh reports/last-check.md is attached automatically; summary has a default');
+  assert.equal(result.lines[0], 'T-002 -> In Review (run T-002-R0001, verified; evidence: last-check.md)', 'a fresh reports/last-check.md is attached automatically; summary has a default');
   const doneJson = JSON.parse(ok(tt(['review', 'T-002', 'approve', '检查通过', '--as', 'fixed-reviewer', '--json'])).out);
   assert.deepEqual([doneJson.status, doneJson.reviewer, doneJson.decision], ['Done', 'fixed-reviewer', 'approved']);
   assert.equal(doneJson.next, null);
