@@ -233,10 +233,91 @@ await runSuite('run-evidence', async () => {
     }, 'all-Done is not enough while the integration review is missing or does not cover every checks Task');
     const { gaps, open } = (await call(url, '/api/summary')).body.storyReview;
     assert.deepEqual(gaps.map((gap) => gap.storyId), ['G-1', 'G-3', 'G-6']);
-    assert.match(gaps[0].message, /^Story G-1 has checks Tasks \(G-1a\) but no reviewer Task; add an integration-acceptance Task with Authority: reviewer/);
+    assert.match(gaps[0].message, /^Story G-1 has checks Tasks \(G-1a\) but no reviewer Task yet; add the integration-acceptance Task: tt new ID "integration acceptance" --parent G-1 --deps "G-1a" --auth reviewer/);
     assert.deepEqual(gaps[1].missing, ['G-3b']);
     assert.match(gaps[1].message, /no reviewer Task depends on all checks Tasks \(missing: G-3b\)/);
     assert.deepEqual(open.map((entry) => [entry.storyId, entry.integrationTaskId, entry.integrationStatus, entry.checksDone, entry.checksTotal]), [['G-7', 'G-7r', 'Backlog', 0, 1]]);
+  }
+
+  // ---- creating tasks warns (never refuses) while a Story lacks its integration Task ----------------------------------------------
+  {
+    const { url } = await newHub([]);
+    const create = async (taskType, taskId, completionAuthority, extra = {}) => post(url, '/api/tasks', {
+      agent: 'planner', reason: 'plan',
+      newTask: { taskId, taskType, parentId: '', milestone: 'M1', workstream: 'T', task: `Title ${taskId}`, specRef: 'README.md', dependsOn: '', ownerRole: 'Agent', priority: 'P1', acceptance: 'a', completionAuthority, ...extra },
+    });
+    assert.equal((await create('Story', 'W-S', 'NotApplicable')).body.warnings, undefined, 'a new Story has nothing to review yet');
+    const first = await create('Task', 'W-1', 'RunEvidence', { parentId: 'W-S' });
+    assert.equal(first.status, 201, 'the plan order (checks first) must stay possible');
+    assert.equal(first.body.warnings.length, 1);
+    assert.match(first.body.warnings[0], /^Story W-S has checks Tasks \(W-1\) but no reviewer Task yet; add the integration-acceptance Task: tt new ID .* --parent W-S --deps "W-1" --auth reviewer/);
+    const second = await create('Task', 'W-2', 'RunEvidence', { parentId: 'W-S', dependsOn: 'W-1' });
+    assert.match(second.body.warnings[0], /\(W-1, W-2\)/);
+    const partial = await create('Task', 'W-3', 'IndependentReviewerAgent', { parentId: 'W-S', dependsOn: 'W-2' });
+    assert.equal(partial.status, 201);
+    assert.equal(partial.body.warnings, undefined, 'W-3 depends on W-2 which depends on W-1: transitive coverage is enough');
+    const lone = await create('Task', 'W-4', 'RunEvidence', { parentId: 'W-S' });
+    assert.match(lone.body.warnings[0], /no reviewer Task depends on all checks Tasks \(missing: W-4\)/);
+    assert.equal((await create('Task', 'W-5', 'IndependentReviewerAgent')).body.warnings, undefined, 'tasks outside a Story are never warned about');
+    assert.equal((await create('Task', 'W-6', 'RunEvidence')).body.warnings, undefined);
+    assert.equal((await call(url, '/api/summary')).body.storyReview.gaps[0].missing[0], 'W-4');
+  }
+
+  // ---- the Story rollup the one reviewer reads --------------------------------------------------------------------------------------
+  {
+    const { url } = await newHub([
+      story('R-S'),
+      checks('R-1', { ParentID: 'R-S', Status: 'Ready' }),
+      reviewer('R-2', { ParentID: 'R-S', DependsOn: 'R-1' }),
+    ]);
+    const pause = () => new Promise((resolve) => setTimeout(resolve, 15));
+    const gitEvent = (taskId, runId, message, type = 'GITREV') => post(url, `/api/tasks/${taskId}/runs/${runId}/events`, { type, result: 'ok', message });
+    const run1 = await startRun(url, 'R-1');
+    assert.equal((await gitEvent('R-1', run1, 'base=aaaaaaa1')).status, 201);
+    assert.equal((await gitEvent('R-1', run1, 'base=zzz')).status, 201, 'a malformed GITREV is stored but ignored by the rollup');
+    assert.equal((await gitEvent('R-1', run1, 'base=1234567', 'note')).status, 201, 'only GITREV events count');
+    await artifact(url, 'R-1', run1, 'last-check.md', 'RESULT: PASS (1)');
+    assert.equal((await gitEvent('R-1', run1, 'head=bbbbbbb2 dirty=false')).status, 201);
+    assert.equal((await close(url, 'R-1', run1)).body.task.Status, 'Done');
+    await pause();
+    const run2 = await startRun(url, 'R-2');
+    assert.equal((await gitEvent('R-2', run2, 'base=ccccccc3')).status, 201);
+    await artifact(url, 'R-2', run2, 'notes.md', 'integration notes');
+    assert.equal((await gitEvent('R-2', run2, 'head=ddddddd4 dirty=true')).status, 201);
+    assert.equal((await close(url, 'R-2', run2)).body.task.Status, 'In Review');
+
+    const { context } = (await call(url, '/api/tasks/R-S/packet')).body.packet;
+    const byId = Object.fromEntries(context.children.map((child) => [child.taskId, child]));
+    assert.deepEqual(Object.keys(byId), ['R-1', 'R-2']);
+    assert.equal(byId['R-1'].completionAuthority, 'RunEvidence');
+    assert.equal(byId['R-1'].status, 'Done');
+    assert.equal(byId['R-1'].dependsOn, '');
+    assert.equal(byId['R-2'].dependsOn, 'R-1');
+    assert.deepEqual(byId['R-1'].runs, [{ runId: 'R-1-R0001', status: 'verified', agent: 'impl', artifacts: ['last-check.md'], autoAccepted: 'last-check.md' }]);
+    assert.deepEqual(byId['R-2'].runs, [{ runId: 'R-2-R0001', status: 'verified', agent: 'impl', artifacts: ['notes.md'] }], 'reviewer work carries no auto-accepted marker');
+    assert.deepEqual(context.review, { state: 'open', checks: ['R-1'], reviewers: ['R-2'], integrationTaskId: 'R-2', integrationStatus: 'In Review' });
+    assert.equal(context.gitRange.base.sha, 'aaaaaaa1', 'earliest base');
+    assert.equal(context.gitRange.base.taskId, 'R-1');
+    assert.equal(context.gitRange.head.sha, 'ddddddd4', 'latest head');
+    assert.equal(context.gitRange.head.dirty, true);
+    assert.equal(context.gitRange.head.taskId, 'R-2');
+    assert.match(byId['R-1'].acceptance, /Observable acceptance/, 'the reviewer sees what each task promised');
+
+    // a task packet is unchanged, and a Story without checks Tasks has no review block
+    const plain = (await call(url, '/api/tasks/R-2/packet')).body.packet.context;
+    assert.deepEqual(plain.children, []);
+    assert.equal(plain.story.taskId, 'R-S');
+    assert.equal(plain.review, undefined);
+    await post(url, '/api/tasks/R-2/review', { action: 'claim', reviewer: 'rev' });
+    await post(url, '/api/tasks/R-2/review', { action: 'decision', reviewer: 'rev', decision: 'approved', notes: 'ok' });
+    assert.equal((await call(url, '/api/tasks/R-S/packet')).body.packet.context.review.state, 'complete');
+  }
+  {
+    const { url } = await newHub([story('N-S'), taskRow({ TaskID: 'N-1', ParentID: 'N-S', Status: 'Done' })]);
+    const { context } = (await call(url, '/api/tasks/N-S/packet')).body.packet;
+    assert.equal(context.review, null, 'a Story without checks Tasks has no integration-review block');
+    assert.equal(context.gitRange, null, 'no GITREV events: no range');
+    assert.equal(context.children[0].completionAuthority, 'IndependentReviewerAgent');
   }
 
   // ---- configuration: custom pattern, invalid pattern, missing key (= default) -----------------------------------------------

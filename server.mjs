@@ -253,6 +253,23 @@ function storyReviewState(records, story, recordsById = new Map(records.map((rec
   return { story, checks, reviewers, covering, missing: covering.length ? [] : (closest?.missing ?? checks.map(({ TaskID }) => TaskID)) };
 }
 
+const taskIds = (tasks) => tasks.map(({ TaskID }) => TaskID);
+
+function storyGapMessage(review) {
+  const storyId = review.story.TaskID;
+  return review.reviewers.length
+    ? `Story ${storyId}: no reviewer Task depends on all checks Tasks (missing: ${review.missing.join(', ')}); make the integration-acceptance Task depend on them.`
+    : `Story ${storyId} has checks Tasks (${taskIds(review.checks).join(', ')}) but no reviewer Task yet; add the integration-acceptance Task: tt new ID "integration acceptance" --parent ${storyId} --deps "${taskIds(review.checks).join(';')}" --auth reviewer --accept "..."`;
+}
+
+// Warnings returned with a created task: the creation order of a plan cannot satisfy the Story
+// invariant until the integration Task exists, so creation is never refused for it.
+function storyReviewWarnings(records, created) {
+  const story = records.find((candidate) => isStory(candidate) && candidate.TaskID === created.ParentID);
+  const review = story ? storyReviewState(records, story) : undefined;
+  return review && !review.covering.length ? [storyGapMessage(review)] : [];
+}
+
 // Stories whose integration review is still open, and Stories that break the invariant.
 function storyReviewReport(records) {
   const recordsById = new Map(records.map((record) => [record.TaskID, record]));
@@ -261,17 +278,14 @@ function storyReviewReport(records) {
   for (const story of records.filter(isStory)) {
     const review = storyReviewState(records, story, recordsById);
     if (!review) continue;
-    const ids = (tasks) => tasks.map(({ TaskID }) => TaskID);
     if (!review.covering.length) {
       gaps.push({
         storyId: story.TaskID,
         title: story.Task,
-        checks: ids(review.checks),
-        reviewers: ids(review.reviewers),
+        checks: taskIds(review.checks),
+        reviewers: taskIds(review.reviewers),
         missing: review.missing,
-        message: review.reviewers.length
-          ? `Story ${story.TaskID}: no reviewer Task depends on all checks Tasks (missing: ${review.missing.join(', ')}); add one that does.`
-          : `Story ${story.TaskID} has checks Tasks (${ids(review.checks).join(', ')}) but no reviewer Task; add an integration-acceptance Task with Authority: reviewer that depends on them.`,
+        message: storyGapMessage(review),
       });
     } else if (!review.covering.some(({ Status }) => Status === 'Done')) {
       const integration = review.covering[0];
@@ -1831,6 +1845,58 @@ function packetFor(record, records, runs, trackerRevision) {
   };
 }
 
+// What the one independent reviewer of a Story needs in a single read: every child with its
+// authority, Runs, artifact names and the auto-accepted marker, the state of the integration
+// review, and the git range the Runs recorded. tt records the range as Run events
+// "GITREV base=<sha>" (tt start) and "GITREV head=<sha> dirty=<bool>" (tt done); anything
+// else in a message is ignored, so work outside a git repository simply has no range.
+const gitRevisionPattern = /^(base|head)=([0-9a-f]{7,64})(?: dirty=(true|false))?$/;
+const autoAcceptedPattern = /^auto-accepted: RunEvidence \(([^,()]+), artifact (.+)\)$/gm;
+
+async function storyRollup(story, records) {
+  let base;
+  let head;
+  const children = [];
+  for (const child of records.filter((candidate) => !isStory(candidate) && candidate.ParentID === story.TaskID)) {
+    const accepted = new Map([...String(child.Evidence ?? '').matchAll(autoAcceptedPattern)].map((match) => [match[1], match[2]]));
+    const runs = [];
+    for (const run of await listTaskRuns(child.TaskID)) {
+      for (const event of await readRunEvents(child.TaskID, run.runId)) {
+        const match = event.type === 'GITREV' ? gitRevisionPattern.exec(String(event.message ?? '').trim()) : null;
+        if (!match) continue;
+        const seen = { sha: match[2], taskId: child.TaskID, runId: run.runId, timestamp: String(event.timestamp ?? '') };
+        if (match[1] === 'base' && (!base || seen.timestamp < base.timestamp)) base = seen;
+        if (match[1] === 'head' && (!head || seen.timestamp > head.timestamp)) head = { ...seen, dirty: match[3] === 'true' };
+      }
+      runs.push({
+        runId: run.runId,
+        status: run.status,
+        agent: run.agent,
+        artifacts: (await listRunArtifacts(child.TaskID, run.runId)).map(({ name }) => name),
+        ...(accepted.has(run.runId) ? { autoAccepted: accepted.get(run.runId) } : {}),
+      });
+    }
+    children.push({
+      taskId: child.TaskID, taskType: taskType(child), goal: child.Task, acceptance: child.Acceptance, specRef: child.SpecRef,
+      milestone: child.Milestone, status: child.Status, completionAuthority: child.CompletionAuthority, dependsOn: child.DependsOn, runs,
+    });
+  }
+  const state = storyReviewState(records, story);
+  const integration = state?.covering.find(({ Status }) => Status !== 'Done') ?? state?.covering[0];
+  return {
+    children,
+    review: state ? {
+      state: !state.covering.length ? 'gap' : state.covering.some(({ Status }) => Status === 'Done') ? 'complete' : 'open',
+      checks: taskIds(state.checks),
+      reviewers: taskIds(state.reviewers),
+      integrationTaskId: integration?.TaskID ?? null,
+      integrationStatus: integration?.Status ?? null,
+      ...(state.covering.length ? {} : { message: storyGapMessage(state) }),
+    } : null,
+    gitRange: base || head ? { base: base ?? null, head: head ?? null } : null,
+  };
+}
+
 function parseRunPath(requestPath) {
   const match = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/(events|artifacts|close)$/.exec(requestPath);
   return match ? {
@@ -2192,7 +2258,12 @@ const server = createServer(async (request, response) => {
         records.push(record);
         await replaceTracker(header, records);
         const after = await readTracker();
-        return { task: after.records.find(({ TaskID }) => TaskID === record.TaskID), trackerRevision: after.trackerRevision };
+        const warnings = storyReviewWarnings(after.records, record);
+        return {
+          task: after.records.find(({ TaskID }) => TaskID === record.TaskID),
+          trackerRevision: after.trackerRevision,
+          ...(warnings.length ? { warnings } : {}),
+        };
       });
       sendJson(response, 201, result);
       return;
@@ -2206,7 +2277,9 @@ const server = createServer(async (request, response) => {
         sendJson(response, 404, { error: `Task '${taskId}' was not found.` });
         return;
       }
-      sendJson(response, 200, packetFor(record, records, await listTaskRuns(taskId), trackerRevision));
+      const packet = packetFor(record, records, await listTaskRuns(taskId), trackerRevision);
+      if (isStory(record)) Object.assign(packet.packet.context, await storyRollup(record, records));
+      sendJson(response, 200, packet);
       return;
     }
     const runsMatch = /^\/api\/tasks\/([^/]+)\/runs$/.exec(requestPath);
