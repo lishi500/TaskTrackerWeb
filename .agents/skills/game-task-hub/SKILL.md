@@ -11,7 +11,7 @@ The Hub owns task state; never edit `tracker/task_tracker.csv`, Run files or eve
 ```text
 tt import docs/tasks/<milestone>.md --admit-first   once per plan; existing ids are skipped
 tt start [T-001]                no id = next claimable task; opens a Run, prints acceptance + spec
-tt done ["what changed"]        attaches reports/last-check.md; no id = your one active Run; prints the next task
+tt done ["what changed"] [--next]   attaches reports/last-check.md; no id = your one active Run; --next starts the next task
 tt review T-009 approve|reject|block "notes" --as NAME     only the Story's integration task
 ```
 `TT_AGENT=<your name>` (default `claude`). `tt event ID note ok "finding"` is optional.

@@ -305,7 +305,7 @@ async function guarded(action, context, work) {
 
 // ---- Argument parsing -------------------------------------------------------------
 const VALUE_FLAGS = new Set(['profile', 'scope', 'expect', 'outcome', 'blocker', 'owner-status', 'run', 'as', 'key', 'toolchain', 'op', 'detail', 'type', 'parent', 'deps', 'accept', 'spec', 'auth', 'prio', 'milestone', 'stream', 'status', 'limit', 'reason', 'evidence', 'name']);
-const BOOLEAN_FLAGS = new Set(['json', 'brief', 'dry-run', 'admit-first', 'no-evidence', 'help', 'version']);
+const BOOLEAN_FLAGS = new Set(['json', 'brief', 'dry-run', 'admit-first', 'no-evidence', 'next', 'help', 'version']);
 
 function parseArgs(argv) {
   const positional = [];
@@ -374,11 +374,11 @@ async function recordGit(taskId, runId, kind) {
   return position;
 }
 
+const describeNext = (next) => `next: ${next.taskId} ${next.taskType} ${next.priority} ${next.status} "${clip(next.title, 60)}" - tt start ${next.taskId}`;
+
 async function nextLine() {
   const result = await get('/api/next');
-  return result.next
-    ? `next: ${result.next.taskId} ${result.next.taskType} ${result.next.priority} ${result.next.status} "${clip(result.next.title, 60)}" - tt start ${result.next.taskId}`
-    : '';
+  return result.next ? describeNext(result.next) : '';
 }
 
 // ---- Commands -------------------------------------------------------------------------
@@ -599,7 +599,37 @@ commands.block = transition('block', 'block', (positional, flags) => {
 
 // start [ID]: no ID = the next claimable task (what `tt next` shows). Admits a Backlog task first,
 // opens the Run with defaults taken from the task, and prints the acceptance and spec so the agent
-// does not need a separate show/next call to read its contract.
+// does not need a separate show/next call to read its contract. `tt done --next` reuses startTask.
+// startTask returns what to print and throws ApiError for the caller to report.
+async function startTask(id, flags) {
+  const profile = flags.profile ?? 'logic';
+  const { task, runs, packet } = await packetOf(id);
+  const contract = [`acceptance: ${clip(task.Acceptance, 600)}`, `spec: ${clip(task.SpecRef, 200)}`];
+  const active = activeRunOf(runs);
+  if (task.Status === 'In Progress' && active) {
+    if (normalizeName(active.agent) !== normalizeName(AGENT)) fail(`${id} is already claimed by ${active.agent}`, `run ${active.runId} is active`, `tt show ${id}`);
+    return { lines: [`${id} already in progress: run ${active.runId} (agent ${active.agent})`, ...contract], data: { taskId: id, runId: active.runId, resumed: true, acceptance: task.Acceptance, specRef: task.SpecRef } };
+  }
+  let admitted = false;
+  if (task.Status === 'Backlog') {
+    await write(`/api/tasks/${encodeURIComponent(id)}/admit`, { agent: AGENT, targetStatus: 'Ready', reason: 'admitted by tt start' });
+    admitted = true;
+  }
+  const result = await write('/api/runs/start', {
+    taskId: id,
+    agent: AGENT,
+    verificationProfile: profile,
+    scope: textArg(flags.scope) ?? clip(task.Task, 300),
+    expectedBehavior: textArg(flags.expect) ?? clip(packet.acceptance || task.Acceptance, 3900),
+  });
+  const base = await recordGit(id, result.run.runId, 'base');
+  const completion = task.CompletionAuthority === 'RunEvidence' ? ['completes on: a passing project check (tt done attaches reports/last-check.md with "RESULT: PASS"); no review'] : [];
+  return {
+    lines: [`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, ...contract, ...completion],
+    data: { taskId: id, runId: result.run.runId, profile, admitted, acceptance: task.Acceptance, specRef: task.SpecRef, task: result.task, gitBase: base?.sha ?? null },
+  };
+}
+
 commands.start = async ({ positional, flags }) => {
   let id = positional[0];
   if (!id) {
@@ -607,33 +637,8 @@ commands.start = async ({ positional, flags }) => {
     if (!upcoming.next) fail('there is nothing to start', clip(upcoming.reason, 300), 'tt next, or tt start ID to admit a specific Backlog task');
     id = upcoming.next.taskId;
   }
-  const profile = flags.profile ?? 'logic';
-  await guarded(`start ${id}`, { id }, async () => {
-    const { task, runs, packet } = await packetOf(id);
-    const contract = [`acceptance: ${clip(task.Acceptance, 600)}`, `spec: ${clip(task.SpecRef, 200)}`];
-    const active = activeRunOf(runs);
-    if (task.Status === 'In Progress' && active) {
-      if (normalizeName(active.agent) !== normalizeName(AGENT)) fail(`${id} is already claimed by ${active.agent}`, `run ${active.runId} is active`, `tt show ${id}`);
-      emit([`${id} already in progress: run ${active.runId} (agent ${active.agent})`, ...contract], { taskId: id, runId: active.runId, resumed: true, acceptance: task.Acceptance, specRef: task.SpecRef });
-      return;
-    }
-    let admitted = false;
-    if (task.Status === 'Backlog') {
-      await write(`/api/tasks/${encodeURIComponent(id)}/admit`, { agent: AGENT, targetStatus: 'Ready', reason: 'admitted by tt start' });
-      admitted = true;
-    }
-    const result = await write('/api/runs/start', {
-      taskId: id,
-      agent: AGENT,
-      verificationProfile: profile,
-      scope: textArg(flags.scope) ?? clip(task.Task, 300),
-      expectedBehavior: textArg(flags.expect) ?? clip(packet.acceptance || task.Acceptance, 3900),
-    });
-    const base = await recordGit(id, result.run.runId, 'base');
-    const completion = task.CompletionAuthority === 'RunEvidence' ? ['completes on: a passing project check (tt done attaches reports/last-check.md with "RESULT: PASS"); no review'] : [];
-    emit([`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, ...contract, ...completion],
-      { taskId: id, runId: result.run.runId, profile, admitted, acceptance: task.Acceptance, specRef: task.SpecRef, task: result.task, gitBase: base?.sha ?? null });
-  });
+  const started = await guarded(`start ${id}`, { id }, () => startTask(id, flags));
+  emit(started.lines, started.data);
 };
 
 commands.event = async ({ positional }) => {
@@ -750,7 +755,7 @@ async function precheckEvidence(id, run, texts) {
 
 commands.done = async ({ positional, flags }) => {
   const context = {};
-  await guarded(() => `done${context.id ? ` ${context.id}` : ''}`, context, async () => {
+  const closed = await guarded(() => `done${context.id ? ` ${context.id}` : ''}`, context, async () => {
     let id = positional[0] && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(positional[0]) ? positional[0] : undefined;
     let found;
     if (id) {
@@ -809,14 +814,30 @@ commands.done = async ({ positional, flags }) => {
     const autoAccepted = completesOnChecks && outcome === 'verified' && status === 'Done';
     const lines = [`${id} -> ${status} (run ${run.runId}, ${outcome}${stored.length ? `; evidence: ${stored.join(', ')}` : ''}${autoAccepted ? '; auto-accepted' : ''})`];
     let upcoming = '';
+    let startNext = '';
     if (status === 'Done') {
-      upcoming = await nextLine();
-      if (upcoming) lines.push(upcoming);
+      const following = await get('/api/next');
+      if (!flags.next && following.next) { upcoming = describeNext(following.next); lines.push(upcoming); }
+      if (flags.next) {
+        startNext = following.next?.taskId ?? '';
+        if (!startNext) lines.push(`next: nothing to start - ${clip(following.reason, 200)}`);
+      }
     } else if (status === 'In Review') {
       if (task.ParentID) lines.push(`then: independent review (tt show ${task.ParentID}; tt review ${id} approve|reject|block "notes" --as NAME)`);
+      if (flags.next) lines.push(`next: not started - ${id} is In Review (independent review first)`);
     }
-    emit(lines, { taskId: id, runId: run.runId, status, outcome, evidence: stored, autoAccepted, next: upcoming || null });
+    return { lines, startNext, data: { taskId: id, runId: run.runId, status, outcome, evidence: stored, autoAccepted, next: upcoming || null } };
   });
+
+  // --next: claim the following task in the same call. Opt-in, and exactly what tt start would do for it.
+  let started;
+  let startError;
+  if (closed.startNext) {
+    try { started = await startTask(closed.startNext, flags); } catch (error) { startError = error; }
+  }
+  emit([...closed.lines, ...(started?.lines ?? [])], { ...closed.data, ...(started ? { started: started.data } : {}) });
+  if (startError instanceof ApiError) fail(`${closed.data.taskId} is ${closed.data.status}, but starting ${closed.startNext} failed`, `HTTP ${startError.status}: ${clip(startError.message, 240)}`, `tt start ${closed.startNext}`);
+  if (startError) throw startError;
 };
 
 commands.review = async ({ positional, flags }) => {
@@ -1005,7 +1026,7 @@ const HELP = `tt ${TT_VERSION} - Game Task Hub CLI   (agent: ${AGENT}; --json pr
   start [ID] [--profile logic|runtime|scene|package-config|build-export] [--scope "..."] [--expect "..."]   no ID = the next claimable task; prints acceptance + spec
   event ID [RUN] TYPE RESULT "message"      optional progress note on the active Run
   art ID [RUN] NAME FILE|-                  attach text evidence (<= 128 KB)
-  done [ID] ["summary"] [--evidence FILE]... [--no-evidence] [--outcome verified|blocked|incomplete|awaiting-human] [--blocker "..."] [--owner-status "Awaiting Owner Gate"]   no ID = your one active Run; a checks task goes straight to Done on RESULT: PASS
+  done [ID] ["summary"] [--next] [--evidence FILE]... [--no-evidence] [--outcome verified|blocked|incomplete|awaiting-human] [--blocker "..."] [--owner-status "Awaiting Owner Gate"]   no ID = your one active Run; a checks task goes straight to Done on RESULT: PASS; --next also starts the next task
   review ID approve|reject|block "notes" [--as NAME] [--blocker "..."]
   show ID | ls [--status S] [--milestone M] [--type T] [--parent ID] [--limit N] | status [--brief]   show STORY = children, authorities, artifacts, git range
   evidence ID [--run RUN] [--name NAME]     print one artifact (cut at 8 KB)

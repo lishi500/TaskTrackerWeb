@@ -331,7 +331,40 @@ await runSuite('tt-story', async () => {
   // a single active Run of somebody else is not closed implicitly
   assert.match(ttOpen(['done', 'x', '--no-evidence'], { cwd: plainDir, env: { TT_AGENT: 'agent-c' } }).err, /^tt: A-1 is claimed by agent-a, not by agent-c - tt done without an id only closes your own Run - try: tt done A-1 "summary" \(TT_AGENT names you\)/);
 
-  console.log('tt-story test passed: import invariant, checks in two calls, evidence pre-check, GITREV, story rollup, evidence, single review, warnings and doctor.');
+  // ---- tt done --next: a chain of checks tasks costs one call per task ---------------------------------------------------------------------------
+  const chain = await createInstance({ parent, name: 'Tracker chain ', projectId: 'tt-story-chain', projectName: 'Chain' });
+  instances.push(chain);
+  const ttChain = ttFor(chain);
+  const chainPlan = planFile.replaceAll('S-1', 'S-C').replaceAll('T-1', 'C-1').replaceAll('T-2', 'C-2').replaceAll('T-3', 'C-3');
+  writeFileSync(join(gameDir, 'plans', 'chain.md'), chainPlan);
+  ok(ttChain(['import', 'plans/chain.md', '--admit-first'], { cwd: gameDir }));
+  ok(ttChain(['start'], { cwd: gameDir }));
+  writeCheck('RESULT: PASS (chain 1)\n');
+  result = ok(ttChain(['done', 'first done', '--next'], { cwd: gameDir }));
+  assert.equal(result.lines[0], 'C-1 -> Done (run C-1-R0001, verified; evidence: last-check.md; auto-accepted)');
+  assert.equal(result.lines[1], 'started C-2: run C-2-R0001, profile logic, agent claude', 'done --next claims the successor in the same call');
+  assert.match(result.out, /^acceptance: the bobber moves to the shore$/m);
+  assert.match(result.out, /^completes on: a passing project check/m);
+  assert.ok(!result.out.includes('tt start C-2'), 'no "next: ... tt start" hint when it was started already');
+  assert.equal((await call(chain.url, '/api/tasks/C-2/packet')).body.task.Status, 'In Progress');
+  writeCheck('RESULT: PASS (chain 2)\n');
+  const chained = JSON.parse(ok(ttChain(['done', 'second done', '--next', '--json'], { cwd: gameDir })).out);
+  assert.deepEqual([chained.taskId, chained.status, chained.autoAccepted, chained.started.taskId, chained.started.runId], ['C-2', 'Done', true, 'C-3', 'C-3-R0001']);
+  writeCheck('RESULT: PASS (chain 3)\n');
+  result = ok(ttChain(['done', 'third done', '--next'], { cwd: gameDir }));
+  assert.deepEqual(result.lines, [
+    'C-3 -> In Review (run C-3-R0001, verified; evidence: last-check.md)',
+    'then: independent review (tt show S-C; tt review C-3 approve|reject|block "notes" --as NAME)',
+    'next: not started - C-3 is In Review (independent review first)',
+  ]);
+  ok(ttChain(['review', 'C-3', 'approve', 'the chain works end to end', '--as', 'chain-reviewer'], { cwd: gameDir }));
+  ok(ttChain(['new', 'X-1', 'Standalone check', '--auth', 'checks', '--accept', 'it passes'], { cwd: gameDir }));
+  ok(ttChain(['start', 'X-1'], { cwd: gameDir }));
+  writeCheck('RESULT: PASS (standalone)\n');
+  result = ok(ttChain(['done', '--next'], { cwd: gameDir }));
+  assert.match(result.lines[1], /^next: nothing to start - All 4 executable task\(s\) are Done\.$/);
+
+  console.log('tt-story test passed: import invariant, checks in two calls (one with --next), evidence pre-check, GITREV, story rollup, evidence, single review, warnings and doctor.');
 }, async () => {
   for (const hub of hubs) { try { await hub.stop(); } catch { /* gone */ } }
   for (const instance of instances) await instance.dispose();
