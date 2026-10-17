@@ -54,8 +54,17 @@ function completionAuthority(task) {
 function completionAuthorityLabel(task) {
   const authority = completionAuthority(task);
   if (authority === 'IndependentReviewerAgent') return '独立 Reviewer Agent';
+  if (authority === 'RunEvidence') return '检查证据（通过即完成）';
   if (authority === 'DecisionOwner') return 'Decision Owner';
   return '不适用';
+}
+
+// A Done task accepted straight from a passing check (no review): the Hub wrote "auto-accepted: RunEvidence (...)" into Evidence.
+function autoAcceptedBadge(task) {
+  if (task.Status !== 'Done' || !String(task.Evidence || '').includes('auto-accepted: RunEvidence')) return null;
+  const badge = element('span', 'auto-accepted', '检查自动验收');
+  badge.title = '由 Run 中通过的检查结果自动验收，未经独立 Review；Story 的集成验收 Task 统一审查。';
+  return badge;
 }
 
 function completionAuthorityBadge(task) {
@@ -167,6 +176,7 @@ function openTask(taskId) {
   target.append(element('h2', null, `${task.TaskID} · ${task.Task}`));
   target.append(taskTypeBadge(task), statusBadge(task.Status));
   const authorityBadge = completionAuthorityBadge(task); if (authorityBadge) target.append(authorityBadge);
+  const acceptedBadge = autoAcceptedBadge(task); if (acceptedBadge) target.append(acceptedBadge);
   const metadata = [
     ['Type', taskType(task)], ['Milestone', task.Milestone], ['ParentID', task.ParentID || '无'], ['Decision owner role', task.OwnerRole], ['Completion authority', completionAuthorityLabel(task)], ['Priority', task.Priority],
     ['SpecRef', task.SpecRef], ['DependsOn', task.DependsOn || '无'], ['Blocker', task.Blocker || '无'],
@@ -305,6 +315,7 @@ function renderMilestoneTask(task, { storyChild = false, parentMilestone = '' } 
   const heading = element('div', 'milestone-task-heading');
   heading.append(renderTaskLink(task), taskTypeBadge(task), statusBadge(task.Status));
   const authorityBadge = completionAuthorityBadge(task); if (authorityBadge) heading.append(authorityBadge);
+  const acceptedBadge = autoAcceptedBadge(task); if (acceptedBadge) heading.append(acceptedBadge);
   row.append(heading);
   const metadata = [];
   if (storyChild && parentMilestone && task.Milestone && task.Milestone !== parentMilestone) metadata.push(`Milestone ${task.Milestone}`);
@@ -406,6 +417,26 @@ function renderOwnerActions() {
   }
 }
 
+// Review once per Story: Stories whose integration-acceptance Task is still open, and Stories whose checks Tasks no reviewer Task covers.
+function renderStoryReviews() {
+  const review = state.summary.storyReview || { open: [], gaps: [] };
+  const section = document.querySelector('#story-review-section');
+  const target = document.querySelector('#story-reviews'); target.replaceChildren();
+  section.hidden = !(review.open.length || review.gaps.length);
+  for (const entry of review.open) {
+    const story = state.records.find((task) => task.TaskID === entry.storyId);
+    const row = element('article', 'compact-item');
+    row.append(story ? renderTaskLink(story) : element('span', null, entry.storyId));
+    row.append(element('p', 'muted', `集成验收 ${entry.integrationTaskId}（${statusLabels[entry.integrationStatus] || entry.integrationStatus}）· 检查任务 ${entry.checksDone} / ${entry.checksTotal} 已完成`));
+    target.append(row);
+  }
+  for (const gap of review.gaps) {
+    const row = element('article', 'compact-item story-review-gap');
+    row.append(element('p', null, gap.message));
+    target.append(row);
+  }
+}
+
 function renderClaimableSessions() {
   const target = document.querySelector('#claimable-sessions'); target.replaceChildren();
   const claimable = state.records.filter((task) => task.Status === 'Ready' && taskType(task) !== 'Story');
@@ -449,6 +480,7 @@ function renderTable() {
       else if (index === 2) {
         const authorityBadge = completionAuthorityBadge(task);
         cell.append(authorityBadge || element('span', 'muted', value));
+        const acceptedBadge = autoAcceptedBadge(task); if (acceptedBadge) cell.append(' ', acceptedBadge);
       } else if (index === 5) cell.append(statusBadge(value));
       else cell.textContent = value;
       row.append(cell);
@@ -530,6 +562,7 @@ function render() {
   document.querySelector('#work-count').textContent = state.summary.currentWork.length;
   document.querySelector('#blocked-count').textContent = state.summary.blockers.length;
   renderOwnerActions();
+  renderStoryReviews();
   renderCompactList('#current-work', state.summary.currentWork, '当前没有 Agent 正在处理的任务。');
   renderCompactList('#blockers', state.summary.blockers, '当前没有受阻任务。');
   renderCompactList('#dependency-waits', state.summary.dependencyWaits, '当前没有自动排队的依赖等待。');

@@ -4,6 +4,7 @@
 // answered 403 for /app.js and /styles.css (the dashboard rendered unstyled).
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { request as rawRequest } from 'node:http';
 import { join } from 'node:path';
@@ -53,6 +54,16 @@ await runSuite('static-assets', async () => {
   for (const reference of references) {
     assert.equal((await call(hub.url, `/${reference}`)).status, 200, `referenced asset ${reference} must load`);
   }
+
+  // No browser in the suite: the dashboard script must at least parse, and it carries the RunEvidence label,
+  // the auto-accepted marker and the "Story awaiting its one independent review" panel (fed by /api/summary).
+  const syntax = spawnSync(process.execPath, ['--check', join(repoRoot, 'public', 'app.js')], { encoding: 'utf8' });
+  assert.equal(syntax.status, 0, `public/app.js does not parse: ${syntax.stderr}`);
+  const script = await readFile(join(repoRoot, 'public', 'app.js'), 'utf8');
+  for (const needle of ["authority === 'RunEvidence'", 'auto-accepted: RunEvidence', 'function renderStoryReviews', 'state.summary.storyReview']) {
+    assert.ok(script.includes(needle), `public/app.js must contain ${needle}`);
+  }
+  assert.ok(page.includes('id="story-review-section"') && page.includes('id="story-reviews"'), 'index.html must have the Story review panel');
 
   // Unknown file, directory-ish and device-name paths are 404, never a crash.
   for (const path of ['/missing.js', '/nested/missing.css', '/NUL', '/CON']) {
