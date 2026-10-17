@@ -8,9 +8,10 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { copyTree, createInstance, runSuite, skipNote } from './lib/test-support.mjs';
+import { copyTree, createInstance, removeDirectory, runSuite, skipNote, stage } from './lib/test-support.mjs';
 
 const BOM = String.fromCharCode(0xFEFF);
+stage(`creating the scratch folder under ${tmpdir()}`);
 const parent = mkdtempSync(join(tmpdir(), 'Hub discovery 发现 '));
 const instances = [];
 const cleanEnv = { ...process.env };
@@ -32,7 +33,9 @@ function hasProjectRootAbove(start) {
 
 await runSuite('discovery', async () => {
   // two instances next to a game folder named so that "<game>-Tracker" is instance A
+  stage('creating instance A');
   const a = await createInstance({ parent, name: 'Fish Game-Tracker', exactName: true, projectId: 'disco-a', projectName: 'Disco A' });
+  stage('creating instance B');
   const b = await createInstance({ parent, name: 'Other-Tracker', exactName: true, projectId: 'disco-b', projectName: 'Disco B' });
   instances.push(a, b);
   const game = join(parent, 'Fish Game');
@@ -43,7 +46,9 @@ await runSuite('discovery', async () => {
   // the skill as gd-skill installs it: a COPY, no link anywhere
   const skill = join(game, '.claude', 'skills', 'game-task-hub');
   mkdirSync(dirname(skill), { recursive: true });
+  stage('copying the skill into the game');
   copyTree(join(a.root, '.agents', 'skills', 'game-task-hub'), skill);
+  stage('skill copied; starting both servers');
   const tt = join(skill, 'scripts', 'tt.mjs');
   for (const path of [skill, join(skill, 'scripts'), tt]) assert.equal(lstatSync(path).isSymbolicLink(), false, `${path} is a plain copy`);
   assert.ok(!tt.startsWith(a.root) && !tt.startsWith(b.root), 'the copy is outside every instance');
@@ -55,6 +60,7 @@ await runSuite('discovery', async () => {
   const doctor = (cwd, env) => ok(run(tt, ['doctor'], { cwd, env })).out;
 
   // ---- 4. sibling <project>-Tracker, from any depth ---------------------------------------------------------------
+  stage('servers up; checking the discovery steps');
   assert.equal(urlOf(game), a.url, 'from the project root');
   assert.equal(urlOf(deep), a.url, 'from a nested folder');
   let report = doctor(deep);
@@ -156,6 +162,7 @@ await runSuite('discovery', async () => {
 
   console.log('discovery test passed: TT_DIR, tracker.json, .tt-dir, sibling -Tracker and the tt.mjs location, in that order, with a copied skill and no links; broken pointers explained by doctor.');
 }, async () => {
+  stage('cleaning up');
   for (const instance of instances) await instance.dispose();
-  try { rmSync(parent, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* a busy temp folder is not a test failure */ }
+  await removeDirectory(parent); // async fs.rm (JavaScript), never the synchronous recursive rmSync on a non-ASCII folder
 });

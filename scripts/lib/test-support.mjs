@@ -4,6 +4,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
+import { writeSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -16,6 +17,12 @@ import { copyTree } from './copy-tree.mjs';
 export { copyTree };
 
 export const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
+
+// A progress marker on stderr, written synchronously so it survives a native crash: when a suite dies with
+// no output (it happened once on a Windows runner), the last "[stage]" line in the digest says where.
+export function stage(name) {
+  try { writeSync(2, `[stage] ${name}\n`); } catch { /* stderr may be closed: a marker is never a failure */ }
+}
 
 export const header = ['TaskID', 'TaskType', 'ParentID', 'Milestone', 'Workstream', 'Task', 'SpecRef', 'DependsOn', 'OwnerRole', 'Status', 'Priority', 'Acceptance', 'CompletionAuthority', 'Blocker', 'Implementer', 'Evidence', 'Updated', 'ReviewClaim', 'Reviewer'];
 
@@ -140,8 +147,10 @@ export async function createInstance({ parent = tmpdir(), name = 'task-tracker-i
   const root = exactName ? join(parent, name) : await mkdtemp(join(parent, name));
   if (exactName) await mkdir(root);
   const skip = (source) => !/[\\/]scripts[\\/]test-[^\\/]*\.mjs$/.test(source);
+  stage(`createInstance: copying the template into ${root}`);
   for (const entry of ['server.mjs', 'public', 'scripts', 'templates', '.agents']) copyTree(join(repoRoot, entry), join(root, entry), { filter: skip });
   const listenPort = port ?? await getFreePort();
+  stage(`createInstance: init-instance on port ${listenPort}`);
   const init = spawnSync(process.execPath, [join(root, 'scripts', 'init-instance.mjs'), '--project-id', projectId, '--project-name', projectName, '--port', String(listenPort), ...(empty ? ['--empty'] : [])], { cwd: root, encoding: 'utf8' });
   if (init.status !== 0) throw new Error(`init-instance failed: ${init.stderr}`);
   const trackerDir = join(root, 'tracker');
