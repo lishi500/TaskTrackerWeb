@@ -196,7 +196,7 @@ ACK 后问题从默认看板隐藏但历史不删除；同一 key 重现时显�
 
 ## 跨平台注意事项（Windows / macOS / Linux）
 
-Hub 只依赖 Node ≥ 22，没有 PowerShell/sh 依赖。GitHub Actions（`.github/workflows/test.yml`）在 ubuntu、macos、windows 上各运行一遍 `node scripts/test-all.mjs`。随平台不同的行为集中在 `scripts/lib/platform.mjs`，测试可以注入平台（`TASK_HUB_TEST_PLATFORM`，只在 `NODE_ENV=test` 时生效），所以 POSIX 分支在 Windows 上也有单元测试；只有真实 macOS/Linux 才能证明的部分（文件系统、信号、进程行为）由 CI 承担。无法在当前系统运行的用例会打印 `SKIP: 原因`，`test-all.mjs` 在汇总里列出。
+Hub 只依赖 Node ≥ 22，没有 PowerShell/sh 依赖。GitHub Actions（`.github/workflows/test.yml`）在 ubuntu、macos、windows 上各运行一遍 `node scripts/test-all.mjs`。随平台不同的行为集中在 `scripts/lib/platform.mjs`，测试可以注入平台（`TASK_HUB_TEST_PLATFORM`，只在 `NODE_ENV=test` 时生效），所以 POSIX 分支在 Windows 上也有单元测试；只有真实 macOS/Linux 才能证明的部分（文件系统、信号、进程行为）由 CI 承担。无法在当前系统运行的用例会打印 `SKIP: 原因`，`test-all.mjs` 在汇总里列出。失败时 `test-all.mjs` 末尾给出摘要（失败的套件、第一条失败断言、该套件输出的最后 15 行），CI 里的 `scripts/ci-annotate.mjs` 把它变成 GitHub annotations 并附上机器描述（系统、用户是否管理员、临时目录是否 8.3 短路径、git 配置、能否创建目录符号链接、4300–4999 里可绑定的端口）；任务日志需要登录才能看，annotations 不需要：`GET /repos/<owner>/<repo>/check-runs/<job id>/annotations`。
 
 - **所有系统**：TaskID/RunID 忽略大小写必须唯一（`T-001` 与 `t-001` 在 Windows 和默认的 macOS 上是同一个目录，返回 409 `duplicate-id`），Windows 设备名在所有系统上都被拒绝，这样仓库可以在系统之间移动；锁文件的主机比较只看第一段主机名（macOS 会随网络在 `Mac.local` 与 `Mac.lan` 之间变化）；`SIGTERM`/`SIGINT` 让服务干净退出并删除 `.tracker-url`/`.tracker-pid`，强杀留下的旧文件会被下次启动覆盖。
 - **仅 Windows**：rename/读取/建锁遇到 `EPERM`/`EBUSY`/`EACCES` 会重试；macOS 和 Linux 上这些错误码是真正的权限错误，立即失败并提示检查目录权限。`link-game-skill` 在 Windows 用目录 junction，在 macOS/Linux 用符号链接。
@@ -240,6 +240,7 @@ node scripts/test-platform.mjs             # 可注入的平台分支：Windows 
 node scripts/test-run-evidence.mjs         # checks 完成、FAIL/缺证据被拒、serial lane 推进、Story 评审约束与 Story 摘要、配置、旧 CSV
 node scripts/test-tt-story.mjs             # checks 与 Story 评审端到端：导入约束、tt done、GITREV、tt show STORY、tt evidence
 node scripts/test-discovery.mjs            # tt 无链接发现实例：TT_DIR、tracker.json、.tt-dir、兄弟目录、tt.mjs 位置
+node scripts/test-ci-annotate.mjs          # CI 失败通道：摘要、annotation 转义与数量上限、套件输出不会变成工作流命令、workflow 接线（仅模板仓库）
 ```
 
 所有测试均使用临时 CSV/临时实例，不会写当前实例的 Tracker；类型/工具链测试验证旧 schema 的两步迁移、Story 执行防护/上下文、跨任务告警聚合、过期 ACK 拒绝与重现计数。交付上下文测试覆盖 Owner/Agent 交接、三种反馈处置、独立审查、Story 的派生完成/重开、正常依赖等待与历史标记不覆盖新 blocker。`scripts/lib/test-support.mjs` 是各测试共用的启动/临时实例辅助模块。

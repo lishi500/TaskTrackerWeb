@@ -16,12 +16,25 @@ jobs:
     steps:
       # Before checkout, so Windows does not rewrite line endings: the tests assume LF.
       - name: Keep line endings as committed
+        shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Syntax check
+        shell: bash
         run: node --check server.mjs
+      # bash on every OS (Git Bash on Windows) so the output can be kept in a file as well as in the log.
       - name: Tests
-        run: node scripts/test-all.mjs
+        shell: bash
+        run: |
+          set +e
+          node scripts/test-all.mjs 2>&1 | tee test-output.txt
+          exit "${PIPESTATUS[0]}"
+      # Job logs need a login to read; annotations do not:
+      #   GET /repos/<owner>/<repo>/check-runs/<job id>/annotations
+      - name: Failure annotations (public) and machine description
+        if: failure()
+        shell: bash
+        run: node scripts/ci-annotate.mjs test-output.txt
