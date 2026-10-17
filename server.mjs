@@ -724,7 +724,9 @@ function nextWork(records, runIds) {
   if (blocked.length) {
     const actionable = blocked.filter((record) => !isExpectedDependencyWait(records, record));
     const shown = (actionable.length ? actionable : blocked).slice(0, 3);
-    reasons.push(`${actionable.length ? 'Blocked' : 'Waiting on a predecessor'}: ${shown.map((record) => `${record.TaskID}${record.Blocker ? ` - ${record.Blocker}` : ''}`).join('; ')}.`);
+    reasons.push(actionable.length
+      ? `Blocked: ${shown.map((record) => `${record.TaskID}${record.Blocker ? ` - ${record.Blocker.replace(/[.\s]+$/, '')}` : ''}`).join('; ')}.`
+      : `Waiting on a predecessor: ${shown.map(({ TaskID }) => TaskID).join(', ')}.`);
   }
   if (!holders.length && !ownerWaits.length && !evaluations.length) {
     const backlog = executable.filter(({ Status }) => Status === 'Backlog').sort(byPriority);

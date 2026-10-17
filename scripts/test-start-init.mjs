@@ -10,7 +10,7 @@ import { createServer as createNetServer } from 'node:net';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { call, createInstance, getFreePort, runSuite, waitFor } from './lib/test-support.mjs';
+import { call, createInstance, getFreePort, repoRoot, runSuite, waitFor } from './lib/test-support.mjs';
 import { derivePort, nextPortInRange, parsePortNumber } from './lib/hub-port.mjs';
 
 const instances = [];
@@ -56,6 +56,13 @@ await runSuite('start-init', async () => {
     assert.ok(derived >= 4300 && derived <= 4999, `${id} -> ${derived}`);
     assert.equal(derived, 4300 + (createHash('sha256').update(id).digest().readUInt32BE(0) % 700));
   }
+  // tt.mjs must stay self-contained, so it carries its own copy of the derivation: keep the two identical.
+  const ttSource = readFileSync(join(repoRoot, '.agents', 'skills', 'game-task-hub', 'scripts', 'tt.mjs'), 'utf8');
+  const portSource = readFileSync(join(repoRoot, 'scripts', 'lib', 'hub-port.mjs'), 'utf8');
+  const digestExpression = "createHash('sha256').update(String(projectId).trim().toLowerCase()).digest()";
+  assert.ok(ttSource.includes(digestExpression) && ttSource.includes('4300 + (digest.readUInt32BE(0) % 700)'), 'tt.mjs derivePort must match hub-port.mjs');
+  assert.ok(portSource.includes(digestExpression) && portSource.includes('PORT_RANGE_MIN + (digest.readUInt32BE(0) % (PORT_RANGE_MAX - PORT_RANGE_MIN + 1))'));
+  assert.equal(derivePort('x'), 4300 + (createHash('sha256').update('x').digest().readUInt32BE(0) % 700));
   assert.equal(nextPortInRange(4999), 4300);
   assert.equal(nextPortInRange(4300), 4301);
   assert.throws(() => parsePortNumber('70000', 'PORT'), /between 1 and 65535/);

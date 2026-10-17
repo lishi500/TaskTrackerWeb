@@ -1,0 +1,717 @@
+#!/usr/bin/env node
+// tt - command-line client for the Game Task Hub (TaskTrackerWeb).
+// Zero dependencies, Node >= 22. Lives inside the skill so the skill is self-contained
+// and works through a directory junction: the tracker instance is found from this
+// file's real path (<instance>/.agents/skills/game-task-hub/scripts/tt.mjs).
+//
+// What it hides from the agent: server URL discovery and start-up, the Origin and
+// Content-Type headers, the global trackerRevision (re-read before every write, retried
+// on stale/locked/EPERM), identity fields, UTF-8 and shell quoting, run ids, artifact
+// naming, claim-then-decide for reviews. Run `tt help` for the command list.
+//
+// Environment: TT_AGENT (implementer name, default "claude"), TT_REVIEWER (fixed reviewer
+// name), TT_URL (explicit server URL), TT_DIR (explicit tracker instance folder).
+
+import { spawnSync } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, readFileSync, realpathSync, statSync, unlinkSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseTaskSet, planImport } from './taskset.mjs';
+
+const TT_VERSION = '1.4.0'; // must equal server.mjs toolVersion (test-tt.mjs checks)
+const AGENT = (process.env.TT_AGENT || 'claude').trim();
+const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
+
+// ---- Output, errors, exit ------------------------------------------------------
+class Exit extends Error {
+  constructor(code) { super(`exit ${code}`); this.code = code; }
+}
+
+let jsonMode = false;
+const emit = (lines, data) => {
+  if (jsonMode) console.log(JSON.stringify(data ?? { text: lines }));
+  else for (const line of [].concat(lines)) console.log(line);
+};
+
+// tt: <what failed> - <why> - try: <next command>   (stderr, exit 1)
+function fail(what, why, next, details = []) {
+  console.error(`tt: ${what}${why ? ` - ${why}` : ''}${next ? ` - try: ${next}` : ''}`);
+  for (const line of details) console.error(`  ${line}`);
+  throw new Exit(1);
+}
+
+const clip = (text, length) => {
+  const characters = Array.from(String(text ?? '').replace(/\s+/g, ' ').trim());
+  return characters.length > length ? `${characters.slice(0, length - 1).join('')}…` : characters.join('');
+};
+const normalizeName = (value) => String(value ?? '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+
+// ---- Instance and server discovery -----------------------------------------------
+function derivePort(projectId) { // identical to scripts/lib/hub-port.mjs (test-start-init.mjs checks)
+  const digest = createHash('sha256').update(String(projectId).trim().toLowerCase()).digest();
+  return 4300 + (digest.readUInt32BE(0) % 700);
+}
+
+let located;
+function instance() {
+  if (located) return located;
+  const here = realpathSync(fileURLToPath(import.meta.url)); // follows junctions
+  const root = process.env.TT_DIR ? resolve(process.env.TT_DIR) : resolve(dirname(here), '..', '..', '..', '..');
+  if (!existsSync(join(root, 'server.mjs')) || !existsSync(join(root, 'task-hub.config.json'))) {
+    fail('cannot find the tracker instance', `${root} has no server.mjs and task-hub.config.json (tt.mjs resolved to ${here})`, 'set TT_DIR to the <Game>-Tracker folder');
+  }
+  const config = JSON.parse(readFileSync(join(root, 'task-hub.config.json'), 'utf8').replace(/^﻿/, ''));
+  const trackerDir = dirname(resolve(root, config.instance?.tracker ?? 'tracker/task_tracker.csv'));
+  const port = config.instance?.port ?? derivePort(config.instance?.projectId || 'uninitialized');
+  located = { root, config, trackerDir, projectId: config.instance?.projectId ?? '', port, urlFile: join(trackerDir, '.tracker-url'), pidFile: join(trackerDir, '.tracker-pid') };
+  return located;
+}
+
+const readText = (path) => { try { return readFileSync(path, 'utf8').trim(); } catch { return ''; } };
+const isLoopbackUrl = (text) => /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(text);
+const normalizeUrl = (text) => String(text).trim().replace(/\/+$/, '').replace('//localhost', '//127.0.0.1'); // Node resolves localhost to ::1 first; the Hub accepts either
+
+async function probe(url) {
+  try {
+    const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(2000) });
+    const body = await response.json();
+    return body?.tool === 'task-hub' ? body : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let server; // { url, health }
+
+async function findServer() {
+  const where = instance();
+  const candidates = process.env.TT_URL ? [normalizeUrl(process.env.TT_URL)] : [];
+  if (!candidates.length) {
+    const recorded = readText(where.urlFile);
+    if (isLoopbackUrl(recorded)) candidates.push(recorded);
+    candidates.push(`http://127.0.0.1:${where.port}`);
+  }
+  for (const url of [...new Set(candidates)]) {
+    const health = await probe(url);
+    if (health && (process.env.TT_URL || health.projectId === where.projectId)) return { url, health };
+  }
+  return undefined;
+}
+
+function startDetached() {
+  const where = instance();
+  const result = spawnSync(process.execPath, [join(where.root, 'scripts', 'start.mjs'), '--detach'], { cwd: where.root, encoding: 'utf8', timeout: 30_000, windowsHide: true });
+  if (result.status !== 0) {
+    fail('cannot start the tracker server', clip(result.stderr || result.stdout || result.error?.message || 'no output', 400), 'node scripts/start.mjs (foreground shows the error), then tt doctor');
+  }
+  return result.stdout.trim().split(/\r?\n/)[0];
+}
+
+async function ensureUp() {
+  if (server) return server;
+  let found = await findServer();
+  if (!found) {
+    if (process.env.TT_URL) fail(`the server at TT_URL (${process.env.TT_URL}) does not answer`, 'tt does not start a server for an explicit URL', 'unset TT_URL, or start that server');
+    const url = startDetached();
+    found = { url, health: await probe(url) };
+    if (!found.health) fail('the server was started but does not answer', url, 'tt doctor');
+  }
+  if (found.health.toolVersion !== TT_VERSION) {
+    console.error(`tt: warning - server is v${found.health.toolVersion}, tt is v${TT_VERSION} - try: node scripts/sync-template.mjs --target <this tracker> --apply`);
+  }
+  server = found;
+  return server;
+}
+
+// ---- HTTP -------------------------------------------------------------------------
+class ApiError extends Error {
+  constructor(status, body) {
+    super(body?.error ?? `HTTP ${status}`);
+    this.status = status;
+    this.code = body?.code ?? '';
+    this.body = body;
+  }
+}
+
+async function http(method, path, body) {
+  const { url } = await ensureUp();
+  let response;
+  try {
+    response = await fetch(`${url}${path}`, {
+      method,
+      headers: method === 'GET' ? {} : { 'Content-Type': 'application/json', Origin: url },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    fail(`cannot reach the server at ${url}`, error.cause?.code ?? error.message, 'tt up');
+  }
+  const text = await response.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { error: text || `HTTP ${response.status}` }; }
+  return { status: response.status, json };
+}
+
+async function get(path) {
+  const { status, json } = await http('GET', path);
+  if (status >= 400) throw new ApiError(status, json);
+  return json;
+}
+
+const isTransient = ({ status, json }) => (status === 409 && ['revision-stale', 'locked'].includes(json?.code))
+  || (status === 500 && /EPERM|EBUSY|EACCES/.test(json?.error ?? ''));
+
+// POST with the current trackerRevision. The revision is re-read before every
+// attempt; a stale revision, a busy lock or a Windows EPERM/EBUSY on the file
+// replace is retried (6 attempts, backoff). Any other 4xx is final.
+async function write(path, body, { revision = true } = {}) {
+  let last;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    let payload = body;
+    if (revision) {
+      const health = await get('/api/health');
+      if (!health.trackerRevision) fail('the tracker is not usable', health.trackerError || 'no revision available', 'tt doctor');
+      payload = { trackerRevision: health.trackerRevision, ...body };
+    }
+    last = await http('POST', path, payload);
+    if (last.status < 400) return last.json;
+    if (!isTransient(last)) break;
+    await sleep(80 * 2 ** attempt + Math.floor(Math.random() * 40));
+  }
+  throw new ApiError(last.status, last.json);
+}
+
+// Map a server rejection to the next command worth trying.
+function hintFor(error, context) {
+  const message = error.message;
+  const id = context.id;
+  let match;
+  if (error.code === 'tracker-missing') return 'node scripts/init-instance.mjs --project-id ID --project-name "Name" --empty';
+  if ((match = /Serial lane is occupied by ([A-Za-z0-9._-]+)/.exec(message))) return `tt show ${match[1]} (finish or review it first; tt next says how)`;
+  if ((match = /Only Ready tasks can start a managed Run\. \S+ is '([^']+)'/.exec(message))) {
+    return { Backlog: `tt admit ${id}`, Blocked: `tt unblock ${id}`, 'In Progress': `tt done ${id}`, 'In Review': `tt review ${id} approve "notes"` }[match[1]] ?? `tt show ${id}`;
+  }
+  if (error.code === 'reviewer-not-independent') return `tt review ${id} <approve|reject|block> "notes" --as <a different name>`;
+  if (/has not claimed/.test(message)) return `tt show ${id}`;
+  if (/was not found/.test(message) && !/Run|Artifact/.test(message)) return 'tt ls';
+  if (error.code === 'unknown-dependency' || error.code === 'invalid-dependency') return 'tt ls (ids are listed in the first column)';
+  if (error.code === 'invalid-id') return 'use letters, digits and hyphens, for example T-001';
+  if (/no longer active|already has an active managed Run/.test(message)) return id ? `tt show ${id}` : 'tt status';
+  if (/already exists for Run/.test(message)) return 'use another artifact name';
+  if (/unfinished dependencies/.test(message)) return id ? `tt show ${id}` : 'tt ls';
+  if (error.code === 'locked') return 'wait a moment and retry; tt doctor reports stale locks';
+  return id ? `tt show ${id}` : 'tt status';
+}
+
+async function guarded(action, context, work) {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof ApiError) {
+      fail(`${action} failed`, `HTTP ${error.status}: ${clip(error.message, 320)}`, hintFor(error, context).trim());
+    }
+    throw error;
+  }
+}
+
+// ---- Argument parsing -------------------------------------------------------------
+const VALUE_FLAGS = new Set(['profile', 'scope', 'expect', 'outcome', 'blocker', 'owner-status', 'run', 'as', 'key', 'toolchain', 'op', 'detail', 'type', 'parent', 'deps', 'accept', 'spec', 'auth', 'prio', 'milestone', 'stream', 'status', 'limit', 'reason', 'evidence']);
+const BOOLEAN_FLAGS = new Set(['json', 'brief', 'dry-run', 'admit-first', 'no-evidence', 'help', 'version']);
+
+function parseArgs(argv) {
+  const positional = [];
+  const flags = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === '-h') { flags.help = true; continue; }
+    if (!argument.startsWith('--') || argument === '--') { positional.push(argument); continue; }
+    const [name, inline] = argument.slice(2).split(/=(.*)/s);
+    if (BOOLEAN_FLAGS.has(name)) { flags[name] = true; continue; }
+    if (!VALUE_FLAGS.has(name)) fail(`unknown option --${name}`, 'not a tt option', 'tt help');
+    const value = inline ?? argv[++index];
+    if (value === undefined) fail(`--${name} needs a value`, 'it was the last argument', 'tt help');
+    if (name === 'evidence') (flags.evidence ??= []).push(value);
+    else flags[name] = value;
+  }
+  return { positional, flags };
+}
+
+// "@file.md" reads the text from a file (handy where shell quoting of long text is fragile);
+// a leading "@" that is not an existing file stays literal.
+function textArg(value) {
+  if (typeof value === 'string' && value.startsWith('@') && value.length > 1 && existsSync(value.slice(1)) && statSync(value.slice(1)).isFile()) {
+    return readFileSync(value.slice(1), 'utf8').replace(/^﻿/, '').trim();
+  }
+  return value;
+}
+
+const needArgs = (command, positional, count, usage) => {
+  if (positional.length < count) fail(`${command} needs ${usage}`, `got ${positional.length} argument(s)`, `tt ${command} ${usage}`);
+};
+
+// ---- Shared reads --------------------------------------------------------------------
+async function packetOf(id) {
+  const result = await get(`/api/tasks/${encodeURIComponent(id)}/packet`);
+  return { task: result.task, packet: result.packet, runs: result.packet.existingRuns ?? [], revision: result.trackerRevision };
+}
+
+const activeRunOf = (runs) => [...runs].reverse().find((run) => run.status === 'In Progress');
+const isRunId = (value, id) => typeof value === 'string' && value.startsWith(`${id}-R`) && /-R\d+$/.test(value);
+
+async function nextLine() {
+  const result = await get('/api/next');
+  return result.next
+    ? `next: ${result.next.taskId} ${result.next.taskType} ${result.next.priority} ${result.next.status} "${clip(result.next.title, 60)}" - tt start ${result.next.taskId}`
+    : '';
+}
+
+// ---- Commands -------------------------------------------------------------------------
+const commands = {};
+
+commands.up = async () => {
+  const { url, health } = await ensureUp();
+  emit(url, { url, projectId: health.projectId, toolVersion: health.toolVersion, pid: health.pid });
+};
+
+commands.url = async () => {
+  const found = await findServer();
+  if (!found) fail('the server is not running', 'there is no URL to print', 'tt up');
+  emit(found.url, { url: found.url });
+};
+
+commands.down = async () => {
+  const where = instance();
+  const found = await findServer();
+  const pid = Number(readText(where.pidFile));
+  if (!found) {
+    for (const file of [where.urlFile, where.pidFile]) { try { unlinkSync(file); } catch { /* none */ } }
+    emit('not running', { running: false });
+    return;
+  }
+  if (!pid || found.health.pid !== pid) fail('refusing to stop the server', `the pid file (${pid || 'empty'}) does not match the running server (${found.health.pid})`, 'stop it from the terminal that started it');
+  process.kill(pid);
+  for (let attempt = 0; attempt < 50 && await probe(found.url); attempt += 1) await sleep(100);
+  for (const file of [where.urlFile, where.pidFile]) { try { unlinkSync(file); } catch { /* already removed by a clean exit */ } }
+  emit(`stopped (pid ${pid})`, { running: false, pid });
+};
+
+commands.status = async ({ flags }) => {
+  const { health } = await ensureUp();
+  const list = await get('/api/tasks?limit=2000');
+  const next = await get('/api/next');
+  const counts = {};
+  for (const task of list.tasks.filter(({ taskType }) => taskType !== 'Story')) counts[task.status] = (counts[task.status] ?? 0) + 1;
+  const stories = list.tasks.length - Object.values(counts).reduce((sum, value) => sum + value, 0);
+  const summary = Object.entries(counts).map(([status, count]) => `${status} ${count}`).join(' | ') || 'no tasks';
+  const nextText = next.next ? `${next.next.taskId} ${clip(next.next.title, 50)}` : `none - ${clip(next.reason, 160)}`;
+  if (flags.brief) {
+    emit(`${health.projectName}: ${summary}; next: ${nextText}`, { project: health.projectId, counts, next: next.next });
+    return;
+  }
+  const lines = [`${health.projectName} (${health.projectId})  ${(await ensureUp()).url}  rev ${String(health.trackerRevision).slice(0, 8)}  lane ${health.serialLane ? 'serial' : 'open'}`, `${summary}${stories ? `   (${stories} stories)` : ''}`];
+  const lane = list.tasks.filter((task) => ['In Progress', 'In Review'].includes(task.status));
+  if (lane.length) lines.push(`active: ${lane.map((task) => `${task.taskId} ${task.status}${task.activeRun ? ` (${task.activeRun})` : ''}`).join(', ')}`);
+  const waiting = list.tasks.filter((task) => ['Awaiting Owner', 'Awaiting Owner Gate', 'Awaiting Agent Evaluation'].includes(task.status));
+  if (waiting.length) lines.push(`owner: ${waiting.map((task) => `${task.taskId} ${task.status}`).join(', ')}`);
+  lines.push(`next: ${nextText}`);
+  emit(lines, { health, counts, next: next.next, reason: next.reason });
+};
+
+commands.ls = async ({ flags }) => {
+  const query = new URLSearchParams();
+  for (const [flag, parameter] of [['status', 'status'], ['milestone', 'milestone'], ['type', 'type'], ['parent', 'parent'], ['limit', 'limit']]) if (flags[flag]) query.set(parameter, flags[flag]);
+  const result = await guarded('ls', {}, () => get(`/api/tasks${query.size ? `?${query}` : ''}`));
+  const lines = result.tasks.map((task) => [task.taskId, task.taskType, task.status, task.dependsOn || '-', clip(task.title, 70)].join('\t'));
+  if (result.truncated) lines.push(`... ${result.total - result.count} more (use --limit or a filter)`);
+  if (!lines.length) lines.push('(no tasks match)');
+  emit(lines, result);
+};
+
+commands.show = async ({ positional }) => {
+  needArgs('show', positional, 1, 'ID');
+  const [id] = positional;
+  const result = await guarded(`show ${id}`, { id }, () => packetOf(id));
+  const { task, packet, runs } = result;
+  const lines = [`${task.TaskID}  ${task.TaskType}  ${task.Status}  ${task.Priority}  [${task.CompletionAuthority}]`, `title: ${clip(task.Task, 200)}`];
+  lines.push(`milestone: ${task.Milestone}${task.ParentID ? `   parent: ${task.ParentID}` : ''}${task.Implementer ? `   implementer: ${task.Implementer}` : ''}${task.ReviewClaim ? `   review: ${clip(task.ReviewClaim, 80)}` : ''}`);
+  lines.push(`acceptance: ${clip(task.Acceptance, 600)}`, `spec: ${clip(task.SpecRef, 200)}`);
+  if (task.Blocker) lines.push(`blocker: ${clip(task.Blocker, 300)}`);
+  lines.push(`deps: ${packet.dependencies.map((dependency) => `${dependency.taskId}=${dependency.status ?? 'MISSING'}`).join(', ') || '-'}`);
+  if (packet.reverseDependencies.length) lines.push(`needed by: ${packet.reverseDependencies.slice(0, 12).map((dependent) => `${dependent.taskId}=${dependent.status}`).join(', ')}`);
+  if (task.TaskType === 'Story') lines.push(`children: ${packet.context.children.map((child) => `${child.taskId}=${child.status}`).join(', ') || '-'}`);
+  lines.push(`runs: ${runs.map((run) => `${run.runId}=${run.status}(${run.agent})`).join(', ') || '-'}`);
+  if (packet.context.story) lines.push(`story: ${packet.context.story.taskId} ${clip(packet.context.story.goal, 80)} | ${clip(packet.context.story.acceptance, 200)}`);
+  const evidence = String(task.Evidence ?? '').split('\n').filter(Boolean).slice(-3);
+  if (evidence.length) lines.push('evidence (last 3):', ...evidence.map((line) => `  ${clip(line, 200)}`));
+  emit(lines.slice(0, 40), { task, packet });
+};
+
+commands.next = async () => {
+  const result = await get('/api/next');
+  if (!result.next) {
+    emit(`none: ${result.reason}`, result);
+    return;
+  }
+  const { next } = result;
+  emit([
+    [next.taskId, next.taskType, next.priority, next.status, clip(next.title, 100)].join('\t'),
+    `acceptance: ${clip(next.acceptance, 600)}`,
+    `spec: ${clip(next.specRef, 200)}`,
+    `then: tt start ${next.taskId}`,
+  ], result);
+};
+
+commands.new = async ({ positional, flags }) => {
+  needArgs('new', positional, 2, 'ID "title" --accept "..."');
+  const [id, title] = positional;
+  const type = flags.type ?? 'Task';
+  if (!['Task', 'Bug', 'Story'].includes(type)) fail(`--type ${type} is not valid`, 'use Task, Bug or Story', `tt new ${id} "${title}" --type Task --accept "..."`);
+  const accept = textArg(flags.accept);
+  if (!accept) fail('--accept is required', 'the acceptance is what the reviewer judges the work against', `tt new ${id} "${title}" --accept "what can be observed when it works"`);
+  const authority = type === 'Story' ? 'NotApplicable' : (flags.auth ?? 'reviewer') === 'owner' ? 'DecisionOwner' : 'IndependentReviewerAgent';
+  if (flags.auth && !['reviewer', 'owner'].includes(flags.auth)) fail(`--auth ${flags.auth} is not valid`, 'use reviewer or owner', `tt new ${id} "${title}" --auth owner --accept "..."`);
+  const parent = flags.parent ? (await guarded(`new ${id}`, { id }, () => packetOf(flags.parent))) : undefined;
+  const dependsOn = (flags.deps ?? '').split(/[;,\s]+/).filter(Boolean).join(';');
+  const milestone = flags.milestone ?? parent?.task.Milestone ?? 'M1';
+  const result = await guarded(`new ${id}`, { id }, () => write('/api/tasks', {
+    agent: AGENT,
+    reason: flags.reason ?? 'created with tt new',
+    newTask: {
+      taskId: id,
+      taskType: type,
+      parentId: type === 'Story' ? '' : flags.parent ?? '',
+      milestone,
+      workstream: flags.stream ?? parent?.task.Workstream ?? 'General',
+      task: textArg(title),
+      specRef: flags.spec ?? parent?.task.SpecRef ?? `docs/tasks/${milestone.toLowerCase()}.md#${id.toLowerCase()}`,
+      dependsOn,
+      ownerRole: type === 'Story' ? 'Delivery lead' : authority === 'DecisionOwner' ? 'Human decision owner' : 'Implementation agent',
+      priority: flags.prio ?? 'P1',
+      acceptance: accept,
+      completionAuthority: authority,
+    },
+  }));
+  emit(`created ${id} (${type}, ${result.task.Status})`, result);
+};
+
+const transition = (name, path, buildBody, describe) => async ({ positional, flags }) => {
+  needArgs(name, positional, name === 'block' ? 2 : 1, name === 'block' ? 'ID "what blocks it"' : 'ID');
+  const [id] = positional;
+  const result = await guarded(`${name} ${id}`, { id }, () => write(`/api/tasks/${encodeURIComponent(id)}/${path}`, buildBody(positional, flags)));
+  emit(describe(id, result), result);
+};
+
+commands.admit = transition('admit', 'admit', (_p, flags) => ({ agent: AGENT, targetStatus: 'Ready', reason: flags.reason ?? 'admitted with tt' }), (id, result) => `${id} -> ${result.task.Status}`);
+commands.park = transition('park', 'park', (_p, flags) => ({ agent: AGENT, reason: flags.reason ?? 'parked with tt' }), (id, result) => `${id} -> ${result.task.Status}`);
+commands.unblock = transition('unblock', 'unblock', (_p, flags) => ({ agent: AGENT, reason: flags.reason ?? 'dependencies are done (tt unblock)' }), (id, result) => `${id} -> ${result.task.Status}`);
+commands.block = transition('block', 'block', (positional, flags) => ({ agent: AGENT, blocker: textArg(positional[1]), evidence: flags.reason ?? textArg(positional[1]) }), (id, result) => `${id} -> ${result.task.Status} (${clip(result.task.Blocker, 80)})`);
+
+commands.start = async ({ positional, flags }) => {
+  needArgs('start', positional, 1, 'ID');
+  const [id] = positional;
+  const profile = flags.profile ?? 'logic';
+  await guarded(`start ${id}`, { id }, async () => {
+    const { task, runs, packet } = await packetOf(id);
+    const active = activeRunOf(runs);
+    if (task.Status === 'In Progress' && active) {
+      if (normalizeName(active.agent) !== normalizeName(AGENT)) fail(`${id} is already claimed by ${active.agent}`, `run ${active.runId} is active`, `tt show ${id}`);
+      emit(`${id} already in progress: run ${active.runId} (agent ${active.agent})`, { taskId: id, runId: active.runId, resumed: true });
+      return;
+    }
+    let admitted = false;
+    if (task.Status === 'Backlog') {
+      await write(`/api/tasks/${encodeURIComponent(id)}/admit`, { agent: AGENT, targetStatus: 'Ready', reason: 'admitted by tt start' });
+      admitted = true;
+    }
+    const result = await write('/api/runs/start', {
+      taskId: id,
+      agent: AGENT,
+      verificationProfile: profile,
+      scope: textArg(flags.scope) ?? clip(task.Task, 300),
+      expectedBehavior: textArg(flags.expect) ?? clip(packet.acceptance || task.Acceptance, 3900),
+    });
+    emit(`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, { taskId: id, runId: result.run.runId, profile, admitted, task: result.task });
+  });
+};
+
+commands.event = async ({ positional }) => {
+  needArgs('event', positional, 4, 'ID TYPE RESULT "message"');
+  const [id] = positional;
+  let rest = positional.slice(1);
+  let runId = isRunId(rest[0], id) ? rest.shift() : undefined;
+  if (rest.length < 3) fail('event needs TYPE RESULT "message"', `got ${rest.length} of 3`, `tt event ${id} note ok "what happened"`);
+  await guarded(`event ${id}`, { id }, async () => {
+    runId ??= activeRunOf((await packetOf(id)).runs)?.runId;
+    if (!runId) fail(`${id} has no active Run`, 'events attach to a running Run', `tt start ${id}`);
+    const [type, result, ...message] = rest;
+    await write(`/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/events`, { type, result, message: textArg(message.join(' ')) });
+    emit(`event recorded on ${runId}`, { taskId: id, runId });
+  });
+};
+
+const MAX_ARTIFACT_BYTES = 131_072;
+
+function readArtifactText(source) {
+  let buffer;
+  try {
+    buffer = source === '-' ? readFileSync(0) : readFileSync(source);
+  } catch (error) {
+    fail(`cannot read ${source}`, error.code === 'ENOENT' ? 'no such file' : error.message, 'check the path (relative to the current directory)');
+  }
+  if (buffer.includes(0)) fail(`${source} is not a text file`, 'artifacts are UTF-8 text', 'attach a text summary and reference the binary by its repository path');
+  if (buffer.length > MAX_ARTIFACT_BYTES) fail(`${source} is ${buffer.length} bytes`, `an artifact is limited to ${MAX_ARTIFACT_BYTES} bytes (128 KB)`, 'attach the relevant excerpt (for example the failing lines) and reference the full file by path');
+  return buffer.toString('utf8').replace(/^﻿/, '');
+}
+
+async function storeArtifact(id, runId, name, content) {
+  const path = `/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/artifacts`;
+  try {
+    await write(path, { name, content });
+    return name;
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 409 || !/already exists/.test(error.message)) throw error;
+    // Artifacts are immutable. Same content = a repeated `tt done`; different content gets a new name.
+    const existing = await fetch(`${(await ensureUp()).url}${path}/${name.split('/').map(encodeURIComponent).join('/')}`).then((response) => response.text()).catch(() => undefined);
+    if (existing === content) return name;
+    const dot = name.lastIndexOf('.');
+    const alternative = dot > 0 ? `${name.slice(0, dot)}-2${name.slice(dot)}` : `${name}-2`;
+    await write(path, { name: alternative, content });
+    return alternative;
+  }
+}
+
+commands.art = async ({ positional }) => {
+  needArgs('art', positional, 3, 'ID NAME FILE|-');
+  const [id] = positional;
+  const rest = positional.slice(1);
+  const explicitRun = isRunId(rest[0], id) ? rest.shift() : undefined;
+  if (rest.length < 2) fail('art needs NAME and FILE', 'FILE may be - to read stdin', `tt art ${id} evidence.md notes.md`);
+  const [name, file] = rest;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(name) || name.includes('..')) fail(`artifact name '${clip(name, 40)}' is not valid`, 'use letters, digits, dot, underscore, hyphen or slash', `tt art ${id} evidence.md ${file}`);
+  const content = readArtifactText(file);
+  await guarded(`art ${id}`, { id }, async () => {
+    const runId = explicitRun ?? activeRunOf((await packetOf(id)).runs)?.runId;
+    if (!runId) fail(`${id} has no active Run`, 'artifacts attach to a running Run', `tt start ${id}`);
+    const stored = await storeArtifact(id, runId, name, content);
+    emit(`stored ${stored} on ${runId} (${Buffer.byteLength(content)} bytes)`, { taskId: id, runId, name: stored });
+  });
+};
+
+// A readable, unique, server-safe artifact name for a local evidence file.
+function artifactNameFor(file, taken) {
+  const base = basename(file);
+  let name = base.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 100);
+  if (!/[A-Za-z0-9]/.test(name.replace(/\.[^.]*$/, ''))) name = `evidence-${taken.size + 1}${/\.[A-Za-z0-9]{1,8}$/.test(base) ? base.slice(base.lastIndexOf('.')) : '.txt'}`;
+  let candidate = name;
+  for (let copy = 2; taken.has(candidate); copy += 1) candidate = name.replace(/(\.[^.]*)?$/, `-${copy}$1`);
+  taken.add(candidate);
+  return candidate;
+}
+
+commands.done = async ({ positional, flags }) => {
+  needArgs('done', positional, 1, 'ID ["summary"]');
+  const [id] = positional;
+  const summaryArgument = positional[1] ? textArg(positional.slice(1).join(' ')) : '';
+  await guarded(`done ${id}`, { id }, async () => {
+    const { task, runs } = await packetOf(id);
+    if (task.Status !== 'In Progress') fail(`${id} is ${task.Status}, not In Progress`, 'only a task with an active Run can be closed', task.Status === 'Ready' || task.Status === 'Backlog' ? `tt start ${id}` : `tt show ${id}`);
+    const run = flags.run ? runs.find((candidate) => candidate.runId === flags.run) : activeRunOf(runs);
+    if (!run) fail(`${id} has no ${flags.run ? `Run ${flags.run}` : 'active Run'}`, 'nothing to close', `tt show ${id}`);
+    const outcome = flags.outcome ?? (task.CompletionAuthority === 'DecisionOwner' ? 'awaiting-human' : 'verified');
+    if (!['verified', 'blocked', 'incomplete', 'awaiting-human'].includes(outcome)) fail(`--outcome ${outcome} is not valid`, 'use verified, blocked, incomplete or awaiting-human', `tt done ${id} "summary" --outcome blocked --blocker "why"`);
+    if (outcome === 'blocked' && !flags.blocker) fail('a blocked Run needs --blocker', 'say what blocks it, concretely', `tt done ${id} --outcome blocked --blocker "what is missing"`);
+    if (['incomplete', 'awaiting-human'].includes(outcome) && !summaryArgument) fail(`${outcome} needs a summary`, outcome === 'incomplete' ? 'say what is still missing' : 'say what the owner has to decide', `tt done ${id} "summary" --outcome ${outcome}`);
+
+    // Evidence: explicit files, plus reports/last-check.md when it is newer than the Run.
+    const files = [...(flags.evidence ?? [])];
+    let staleCheck = false;
+    if (outcome === 'verified' && !flags['no-evidence']) {
+      const lastCheck = join(process.cwd(), 'reports', 'last-check.md');
+      if (existsSync(lastCheck) && !files.some((file) => resolve(file) === lastCheck)) {
+        if (statSync(lastCheck).mtimeMs > Date.parse(run.startedAt)) files.push(lastCheck);
+        else staleCheck = true;
+      }
+      if (!files.length) {
+        fail(`${id} cannot be closed as verified without evidence`, staleCheck ? 'reports/last-check.md is older than this Run - run the check again' : 'no --evidence file and no reports/last-check.md', `run the project check (it writes reports/last-check.md), or tt done ${id} "summary" --evidence FILE, or --no-evidence`);
+      }
+    }
+    const taken = new Set();
+    const stored = [];
+    for (const file of files) stored.push(await storeArtifact(id, run.runId, artifactNameFor(file, taken), readArtifactText(file)));
+
+    const summary = summaryArgument || (outcome === 'blocked' ? textArg(flags.blocker) : `Verified${stored.length ? `; evidence: ${stored.join(', ')}` : ''}.`);
+    const result = await write(`/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(run.runId)}/close`, {
+      outcome,
+      summary,
+      ...(flags.blocker ? { blocker: textArg(flags.blocker) } : {}),
+      ...(outcome === 'awaiting-human' ? { ownerStatus: flags['owner-status'] ?? 'Awaiting Owner' } : {}),
+    });
+    const evidenceText = stored.length ? `; evidence: ${stored.join(', ')}` : '';
+    emit(`${id} -> ${result.task.Status} (run ${run.runId}, ${outcome}${evidenceText})`, { taskId: id, runId: run.runId, status: result.task.Status, outcome, evidence: stored });
+  });
+};
+
+commands.review = async ({ positional, flags }) => {
+  needArgs('review', positional, 2, 'ID approve|reject|block "notes"');
+  const [id, verb] = positional;
+  const decision = { approve: 'approved', approved: 'approved', reject: 'rejected', rejected: 'rejected', block: 'blocked', blocked: 'blocked' }[String(verb).toLowerCase()];
+  if (!decision) fail(`'${verb}' is not a review decision`, 'use approve, reject or block', `tt review ${id} approve "what I verified"`);
+  const notes = textArg(positional.slice(2).join(' '));
+  if (!notes) fail('review notes are required', 'they are the audit record: say what you checked and what you found', `tt review ${id} ${verb} "what I verified"`);
+  const reviewer = (flags.as || process.env.TT_REVIEWER || `reviewer-${randomBytes(2).toString('hex')}`).trim();
+  await guarded(`review ${id}`, { id }, async () => {
+    const { task, runs } = await packetOf(id);
+    if (task.Status !== 'In Review') fail(`${id} is ${task.Status}, not In Review`, 'only a task whose Run was closed as verified can be reviewed', task.Status === 'In Progress' ? `tt done ${id}` : 'tt next');
+    const implementers = [task.Implementer, ...runs.filter((run) => run.status !== 'Abandoned').map((run) => run.agent)].filter(Boolean);
+    const clash = implementers.find((name) => normalizeName(name) === normalizeName(reviewer));
+    if (clash) fail(`reviewer '${reviewer}' is not independent of '${clash}'`, 'a reviewer must differ from every agent that implemented the task (case and spaces are ignored)', `tt review ${id} ${verb} "..." --as <another name>`);
+    const claimant = /^REVIEW-CLAIM: (.+) \d{4}-\d{2}-\d{2}T\S+$/.exec(task.ReviewClaim ?? '')?.[1];
+    if (claimant && normalizeName(claimant) !== normalizeName(reviewer)) fail(`${id} is already claimed by '${claimant}'`, 'only the claiming reviewer can decide', `tt review ${id} ${verb} "..." --as "${claimant}"`);
+    if (!task.ReviewClaim) await write(`/api/tasks/${encodeURIComponent(id)}/review`, { action: 'claim', reviewer });
+    const result = await write(`/api/tasks/${encodeURIComponent(id)}/review`, {
+      action: 'decision', reviewer, decision, notes,
+      ...(decision === 'blocked' ? { blocker: flags.blocker ? textArg(flags.blocker) : clip(notes, 500) } : {}),
+    });
+    const lines = [`${id} -> ${result.task.Status} (${decision} by ${reviewer})`];
+    const upcoming = decision === 'approved' ? await nextLine() : '';
+    if (upcoming) lines.push(upcoming);
+    emit(lines, { taskId: id, status: result.task.Status, decision, reviewer, next: upcoming || null });
+  });
+};
+
+commands.issue = async ({ positional, flags }) => {
+  needArgs('issue', positional, 2, 'ID "summary" --key K --toolchain T --op O');
+  const [id] = positional;
+  for (const required of ['key', 'toolchain', 'op']) if (!flags[required]) fail(`--${required} is required`, 'a toolchain issue is aggregated by its stable failure key', `tt issue ${id} "summary" --key godot.headless.import-timeout --toolchain godot --op import`);
+  await guarded(`issue ${id}`, { id }, async () => {
+    const runId = activeRunOf((await packetOf(id)).runs)?.runId;
+    const result = await write('/api/toolchain-issues', {
+      taskId: id, ...(runId ? { runId } : {}), failureKey: flags.key, reporter: AGENT, toolchain: flags.toolchain, operation: flags.op,
+      summary: textArg(positional.slice(1).join(' ')), ...(flags.detail ? { detail: textArg(flags.detail) } : {}),
+    }, { revision: false });
+    emit(`reported ${flags.key}: ${result.issue.totalReportCount} report(s), ${result.issue.unacknowledgedCount} unacknowledged`, result);
+  });
+};
+
+commands.import = async ({ positional, flags }) => {
+  needArgs('import', positional, 1, 'FILE');
+  const file = positional[0];
+  let source;
+  try { source = readFileSync(file, 'utf8'); } catch (error) { fail(`cannot read ${file}`, error.code === 'ENOENT' ? 'no such file' : error.message, 'tt import docs/tasks/<milestone>.md'); }
+  const docPath = (() => { const rel = relative(process.cwd(), resolve(file)).replaceAll('\\', '/'); return rel.startsWith('..') ? file.replaceAll('\\', '/') : rel; })();
+  const parsed = parseTaskSet(source, { docPath });
+  if (parsed.header.lane === 'prototype') {
+    fail(`${file} is a prototype-lane task set`, "Lane is 'prototype': it is a checklist for work that is not tracked in the Hub", `keep it as a checklist, or change the Lane line to 'slice' if it should be tracked`);
+  }
+  const existing = new Map((await guarded('import', {}, () => get('/api/tasks?limit=2000'))).tasks.map((task) => [task.taskId, task]));
+  const plan = planImport(parsed, existing, { defaultMilestone: flags.milestone ?? '' });
+  if (plan.errors.length) {
+    const shown = plan.errors.slice(0, 12).map((problem) => `line ${problem.line}: ${problem.message}`);
+    if (plan.errors.length > shown.length) shown.push(`... ${plan.errors.length - shown.length} more`);
+    fail(`import ${file}`, `${plan.errors.length} problem(s), nothing was written`, 'fix the file and run tt import again (existing ids are skipped, so re-running is safe)', shown);
+  }
+  const count = (kind) => plan.creates.filter((item) => item.kind === kind).length;
+  const tally = `${plan.creates.length} (${count('Story')} Story, ${count('Task')} Task, ${count('Bug')} Bug)`;
+  if (flags['dry-run']) {
+    emit([`dry-run ${file}: would create ${tally}, skip ${plan.skipped.length} existing`, ...(plan.creates.length ? [`would create: ${plan.creates.map((item) => item.id).join(' ')}`] : [])], { dryRun: true, creates: plan.creates, skipped: plan.skipped });
+    return;
+  }
+  const created = [];
+  for (const item of plan.creates) {
+    try {
+      await write('/api/tasks', { agent: AGENT, reason: `imported from ${docPath}`, newTask: item.payload });
+      created.push(item.id);
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      fail(`import stopped at ${item.id}`, `HTTP ${error.status}: ${clip(error.message, 300)}${created.length ? `; ${created.length} item(s) were created before it` : ''}`, 'fix the cause and run tt import again (existing ids are skipped)');
+    }
+  }
+  const lines = [created.length ? `imported ${file}: created ${tally}, skipped ${plan.skipped.length} existing` : `nothing to import from ${file}: all ${plan.skipped.length} item(s) already exist (existing tasks are never modified)`];
+  if (created.length) lines.push(`created: ${created.join(' ')}`);
+  let admitted = '';
+  if (flags['admit-first']) {
+    // First runnable executable task: not a Story, not already started, dependencies Done (or none).
+    const known = new Map([...existing]);
+    for (const item of plan.creates) known.set(item.id, { taskId: item.id, status: 'Backlog', taskType: item.kind });
+    const runnable = parsed.items.find((item) => item.kind !== 'Story' && known.get(item.id)?.status === 'Backlog'
+      && item.depends.every((dependency) => known.get(dependency)?.status === 'Done'));
+    if (!runnable) lines.push('admit-first: no runnable Backlog task (every task waits for a dependency)');
+    else {
+      try {
+        await write(`/api/tasks/${encodeURIComponent(runnable.id)}/admit`, { agent: AGENT, targetStatus: 'Ready', reason: 'first runnable task admitted by tt import --admit-first' });
+        admitted = runnable.id;
+        lines.push(`admitted: ${runnable.id} (Ready) - tt start ${runnable.id}`);
+      } catch (error) {
+        if (!(error instanceof ApiError)) throw error;
+        lines.push(`admit-first: ${runnable.id} was not admitted (${clip(error.message, 160)})`);
+      }
+    }
+  }
+  emit(lines, { created, skipped: plan.skipped, admitted });
+};
+
+commands.doctor = async () => {
+  const where = instance();
+  const lines = [];
+  const note = (level, text) => lines.push(`${level.padEnd(4)} ${text}`);
+  note(Number(process.versions.node.split('.')[0]) >= 22 ? 'ok' : 'FAIL', `node ${process.versions.node} (needs >= 22)`);
+  note('ok', `instance ${where.root} (project ${where.projectId || '?'}, port ${where.port})`);
+  const wasUp = Boolean(await findServer());
+  const { url, health } = await ensureUp();
+  note('ok', `server ${url} v${health.toolVersion} pid ${health.pid}${wasUp ? '' : ' (was down, started now)'}`);
+  note(health.ok ? 'ok' : 'FAIL', health.ok ? `tracker rev ${String(health.trackerRevision).slice(0, 8)}, dependency graph valid` : `tracker: ${clip(health.trackerError, 240)}`);
+  if (health.toolVersion !== TT_VERSION) note('warn', `tt is v${TT_VERSION} but the server is v${health.toolVersion} - sync the template`);
+  const recorded = readText(where.urlFile);
+  if (recorded !== url) note('warn', `tracker/.tracker-url says '${recorded || 'nothing'}' but the server answers at ${url}`);
+  const csvPath = join(where.trackerDir, 'task_tracker.csv');
+  if (existsSync(csvPath)) {
+    const head = readFileSync(csvPath).subarray(0, 4096).toString('utf8');
+    if (head.charCodeAt(0) === 0xFEFF) note('warn', 'the CSV starts with a UTF-8 BOM (read fine; the next Hub write removes it)');
+    if (head.includes('\r\n')) note('warn', 'the CSV has CRLF line endings (read fine; the next Hub write converts to LF)');
+  }
+  for (const lock of ['task_tracker.csv.lock', 'toolchain_issue_events.jsonl.lock']) {
+    const lockPath = join(where.trackerDir, lock);
+    if (!existsSync(lockPath)) continue;
+    let holder;
+    try { holder = JSON.parse(readFileSync(lockPath, 'utf8')); } catch { /* legacy or half-written */ }
+    const age = Math.round((Date.now() - (holder?.createdAt ? Date.parse(holder.createdAt) : statSync(lockPath).mtimeMs)) / 1000);
+    note('warn', `lock ${lock} held ${age}s${holder?.pid ? ` by pid ${holder.pid}` : ''}; a dead holder or a lock older than 120 s is replaced automatically on the next write`);
+  }
+  if (!lines.some((line) => line.startsWith('warn') || line.startsWith('FAIL'))) note('ok', 'no problems found');
+  emit(lines, { lines });
+};
+
+// ---- Dispatch ----------------------------------------------------------------------------
+const HELP = `tt ${TT_VERSION} - Game Task Hub CLI   (agent: ${AGENT}; --json prints raw JSON)
+  next                                      the task to work on, or why there is none
+  start ID [--profile logic|runtime|scene|package-config|build-export] [--scope "..."] [--expect "..."]
+  event ID [RUN] TYPE RESULT "message"      optional progress note on the active Run
+  art ID [RUN] NAME FILE|-                  attach text evidence (<= 128 KB)
+  done ID ["summary"] [--evidence FILE]... [--no-evidence] [--outcome verified|blocked|incomplete|awaiting-human] [--blocker "..."] [--owner-status "Awaiting Owner Gate"]
+  review ID approve|reject|block "notes" [--as NAME] [--blocker "..."]
+  show ID | ls [--status S] [--milestone M] [--type T] [--parent ID] [--limit N] | status [--brief]
+  import FILE [--dry-run] [--admit-first] [--milestone M]
+  new ID "title" --accept "..." [--type Task|Bug|Story] [--parent S] [--deps "A;B"] [--spec PATH] [--auth reviewer|owner] [--prio P1] [--milestone M] [--stream X]
+  admit ID | park ID | unblock ID | block ID "what blocks it" | issue ID "summary" --key K --toolchain T --op O [--detail "..."]
+  up | down | url | doctor                  "@file.md" as a text argument reads that file`;
+
+async function main() {
+  const { positional, flags } = parseArgs(process.argv.slice(2));
+  jsonMode = Boolean(flags.json);
+  if (flags.version) { console.log(`tt ${TT_VERSION}`); return; }
+  const [command, ...rest] = positional;
+  if (!command || command === 'help' || flags.help) { console.log(HELP); return; }
+  if (!commands[command]) fail(`unknown command '${command}'`, 'not a tt command', 'tt help');
+  await commands[command]({ positional: rest, flags });
+}
+
+try {
+  await main();
+} catch (error) {
+  if (error instanceof Exit) process.exitCode = error.code;
+  else {
+    console.error(`tt: internal error - ${error?.stack ?? error}`);
+    process.exitCode = 1;
+  }
+}
