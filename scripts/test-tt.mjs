@@ -135,10 +135,16 @@ await runSuite('tt', async () => {
   assert.match(tt(['show', 'NOPE-1']).err, /^tt: show NOPE-1 failed - HTTP 404: Task 'NOPE-1' was not found\. - try: tt ls/);
 
   // ---- start (admit-if-needed, idempotent, defaults), event, art ----------------------------------------
-  assert.match(tt(['start']).err, /^tt: start needs ID/);
   result = ok(tt(['start', 'T-001', '--profile', 'runtime']));
-  assert.equal(result.out.trim(), 'started T-001: run T-001-R0001, profile runtime, agent claude');
-  assert.equal(ok(tt(['start', 'T-001'])).out.trim(), 'T-001 already in progress: run T-001-R0001 (agent claude)', 'start is idempotent for the same agent');
+  assert.deepEqual(result.lines, [
+    'started T-001: run T-001-R0001, profile runtime, agent claude',
+    'acceptance: 按下 Space 后鱼钩沿抛物线飞出，落点出现水花。',
+    'spec: docs/tasks/m1.md#t-001',
+  ], 'start prints the contract so no separate show/next is needed');
+  assert.equal(ok(tt(['start', 'T-001'])).lines[0], 'T-001 already in progress: run T-001-R0001 (agent claude)', 'start is idempotent for the same agent');
+  result = tt(['start']);
+  assert.equal(result.status, 1, 'with nothing claimable, start without an id explains why');
+  assert.match(result.err, /^tt: there is nothing to start - T-001 is In Progress \(Run T-001-R0001, agent claude\): finish it with: tt done T-001 .* - try: tt next, or tt start ID/);
   result = tt(['start', 'T-001'], { env: { TT_AGENT: 'someone-else' } });
   assert.equal(result.status, 1);
   assert.match(result.err, /^tt: T-001 is already claimed by claude - run T-001-R0001 is active - try: tt show T-001/);
@@ -202,7 +208,9 @@ await runSuite('tt', async () => {
   assert.match(reviewed.Evidence, /REVIEW approved: reviewer-[0-9a-f]{4} .*; 核对了验收条件：抛物线与水花均符合/);
 
   // ---- second task: auto-attached reports/last-check.md, fixed reviewer name, --json ------------------------------------
-  ok(tt(['start', 'T-002']));
+  result = ok(tt(['start']));
+  assert.equal(result.lines[0], 'started T-002: run T-002-R0001, profile logic, agent claude', 'start without an id takes the next claimable task');
+  assert.match(result.lines[1], /^acceptance: 按住 Space 浮标向岸边移动/);
   await sleep(1_100);
   writeFileSync(checkFile, '# Check\n[PASS] parse\n[PASS] test (3 tests)\n');
   result = ok(tt(['done', 'T-002']));

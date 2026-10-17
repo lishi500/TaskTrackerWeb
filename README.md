@@ -52,7 +52,7 @@ Agent 不需要手写 HTTP。`tt`（零依赖、Node ≥ 22）位于 Skill 内 `
 
 ```text
 tt import docs/tasks/m1.md --admit-first          # 从任务集 Markdown 创建 Story/Task 并 admit 第一个可执行任务
-tt start T-001                                    # 必要时先 admit，再开启 Run
+tt start T-001                                    # 省略 ID 则领取下一个可领取任务；必要时先 admit，再开启 Run，并打印验收与 SpecRef
 tt event T-001 note ok "抛物线完成"                # 可选
 tt done T-001 "完成抛竿并验证" --evidence reports/last-check.md   # -> In Review
 tt review T-001 approve "核对了验收条件"            # 独立评审人；通过后打印下一个任务
@@ -65,7 +65,7 @@ tt review T-001 approve "核对了验收条件"            # 独立评审人；�
 | `import FILE [--dry-run] [--admit-first]` | 按任务集格式批量创建（幂等，已存在的 ID 跳过且不修改；循环依赖/未知依赖在写入前报错） |
 | `new ID "标题" --accept "…" [--type Task\|Bug\|Story] [--parent S] [--deps "A;B"] [--auth reviewer\|owner] [--prio P1] [--milestone M] [--stream X] [--spec PATH]` | 创建单个工作项（Backlog） |
 | `admit` · `park` · `block ID "原因"` · `unblock` | 状态流转 |
-| `start ID [--profile …] [--scope …] [--expect …]` | 领取（同一 Agent 重复执行是幂等的，打印已有 Run） |
+| `start [ID] [--profile …] [--scope …] [--expect …]` | 领取；省略 ID 时领取 `next` 给出的任务；必要时先 admit，并打印验收与 SpecRef（同一 Agent 重复执行是幂等的，打印已有 Run） |
 | `event ID [RUN] TYPE RESULT "说明"` · `art ID [RUN] NAME FILE\|-` | 事件与文本证据（≤ 128 KB，同名不同内容会自动改名） |
 | `done ID ["摘要"] [--evidence FILE]… [--no-evidence] [--outcome verified\|blocked\|incomplete\|awaiting-human] [--blocker …] [--owner-status …]` | 先存证据再关闭 Run；`reports/last-check.md` 比 Run 开始时间新时自动附加；`DecisionOwner` 任务默认 `awaiting-human` |
 | `review ID approve\|reject\|block "说明" [--as NAME]` | claim + decision 一步完成；评审名默认 `reviewer-xxxx`（或 `TT_REVIEWER`），与实现者重名（忽略大小写/空格）会被本地和服务器同时拒绝 |

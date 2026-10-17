@@ -9,8 +9,8 @@ The Hub owns task state; never edit `tracker/task_tracker.csv`, Run files or eve
 
 ## Standard flow (one task)
 ```text
-tt next                                       task + acceptance + spec, or why nothing is ready
-tt start T-001                                admits if needed, opens a Run (--profile logic|runtime|scene|package-config|build-export)
+tt start [T-001]                              no id = next claimable task; admits if needed, opens a Run, prints acceptance + spec
+                                              (--profile logic|runtime|scene|package-config|build-export)
 tt event T-001 note ok "finding"              optional; material observations only
 tt done T-001 "changed X, verified Y"         -> In Review; attaches reports/last-check.md when newer than the Run
 tt review T-001 approve|reject|block "notes"  independent reviewer only; approval prints the next task
@@ -20,7 +20,7 @@ tt review T-001 approve|reject|block "notes"  independent reviewer only; approva
 ## Commands
 | Need | Command |
 | --- | --- |
-| look | `tt status [--brief]`; `tt ls [--status S] [--milestone M] [--type T] [--parent ID]`; `tt show ID` |
+| look | `tt next` (what is ready, or why nothing is); `tt status [--brief]`; `tt ls [--status S] [--milestone M] [--type T] [--parent ID]`; `tt show ID` |
 | import a plan | `tt import docs/tasks/<milestone>.md [--dry-run] [--admit-first]` (existing ids skipped; safe to re-run) |
 | create one | `tt new ID "title" --accept "..." [--type Task\|Bug\|Story] [--parent S] [--deps "A;B"] [--auth reviewer\|owner] [--prio P1]` |
 | move | `tt admit ID`; `tt park ID`; `tt block ID "why"`; `tt unblock ID` |

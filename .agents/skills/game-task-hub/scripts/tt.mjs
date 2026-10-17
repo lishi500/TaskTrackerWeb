@@ -411,16 +411,24 @@ commands.block = transition('block', 'block', (positional, flags) => {
   return { agent: AGENT, blocker, evidence: flags.reason ?? blocker };
 }, (id, result) => `${id} -> ${result.task.Status} (${clip(result.task.Blocker, 80)})`);
 
+// start [ID]: no ID = the next claimable task (what `tt next` shows). Admits a Backlog task first,
+// opens the Run with defaults taken from the task, and prints the acceptance and spec so the agent
+// does not need a separate show/next call to read its contract.
 commands.start = async ({ positional, flags }) => {
-  needArgs('start', positional, 1, 'ID');
-  const [id] = positional;
+  let id = positional[0];
+  if (!id) {
+    const upcoming = await guarded('start', {}, () => get('/api/next'));
+    if (!upcoming.next) fail('there is nothing to start', clip(upcoming.reason, 300), 'tt next, or tt start ID to admit a specific Backlog task');
+    id = upcoming.next.taskId;
+  }
   const profile = flags.profile ?? 'logic';
   await guarded(`start ${id}`, { id }, async () => {
     const { task, runs, packet } = await packetOf(id);
+    const contract = [`acceptance: ${clip(task.Acceptance, 600)}`, `spec: ${clip(task.SpecRef, 200)}`];
     const active = activeRunOf(runs);
     if (task.Status === 'In Progress' && active) {
       if (normalizeName(active.agent) !== normalizeName(AGENT)) fail(`${id} is already claimed by ${active.agent}`, `run ${active.runId} is active`, `tt show ${id}`);
-      emit(`${id} already in progress: run ${active.runId} (agent ${active.agent})`, { taskId: id, runId: active.runId, resumed: true });
+      emit([`${id} already in progress: run ${active.runId} (agent ${active.agent})`, ...contract], { taskId: id, runId: active.runId, resumed: true, acceptance: task.Acceptance, specRef: task.SpecRef });
       return;
     }
     let admitted = false;
@@ -435,7 +443,8 @@ commands.start = async ({ positional, flags }) => {
       scope: textArg(flags.scope) ?? clip(task.Task, 300),
       expectedBehavior: textArg(flags.expect) ?? clip(packet.acceptance || task.Acceptance, 3900),
     });
-    emit(`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, { taskId: id, runId: result.run.runId, profile, admitted, task: result.task });
+    emit([`started ${id}: run ${result.run.runId}${admitted ? ' (admitted first)' : ''}, profile ${profile}, agent ${AGENT}`, ...contract],
+      { taskId: id, runId: result.run.runId, profile, admitted, acceptance: task.Acceptance, specRef: task.SpecRef, task: result.task });
   });
 };
 
@@ -720,7 +729,7 @@ commands.doctor = async () => {
 // ---- Dispatch ----------------------------------------------------------------------------
 const HELP = `tt ${TT_VERSION} - Game Task Hub CLI   (agent: ${AGENT}; --json prints raw JSON)
   next                                      the task to work on, or why there is none
-  start ID [--profile logic|runtime|scene|package-config|build-export] [--scope "..."] [--expect "..."]
+  start [ID] [--profile logic|runtime|scene|package-config|build-export] [--scope "..."] [--expect "..."]   no ID = the next claimable task; prints acceptance + spec
   event ID [RUN] TYPE RESULT "message"      optional progress note on the active Run
   art ID [RUN] NAME FILE|-                  attach text evidence (<= 128 KB)
   done ID ["summary"] [--evidence FILE]... [--no-evidence] [--outcome verified|blocked|incomplete|awaiting-human] [--blocker "..."] [--owner-status "Awaiting Owner Gate"]
